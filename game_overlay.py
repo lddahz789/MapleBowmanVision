@@ -239,11 +239,12 @@ class RuntimeOverlay:
             x, y, w, h = player_box
             canvas.create_rectangle(x, y, x + w, y + h, outline="#00e5ff", width=3)
             player_score = float(state.get("player_score", -1))
+            player_source = str(state.get("player_source", "玩家定位"))
             canvas.create_text(
                 x,
                 max(35, y - 20),
                 anchor="nw",
-                text=f"玩家姓名板 {player_score:.2f}" if player_score >= 0 else "玩家姓名板",
+                text=f"玩家·{player_source} {player_score:.2f}" if player_score >= 0 else f"玩家·{player_source}",
                 fill="#00e5ff",
                 font=font,
             )

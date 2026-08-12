@@ -105,8 +105,14 @@
     "monster_detection_scale": 0.5,
     "monster_hold_seconds": 0.35,
     "player_template_threshold": 0.7,
+    "player_head_threshold": 0.76,
+    "player_title_threshold": 0.7,
     "player_detection_scale": 0.5,
-    "player_hold_seconds": 0.5
+    "player_hold_seconds": 0.8,
+    "player_head_feet_offset": 0.07,
+    "player_title_feet_offset": 0.076,
+    "player_anchor_max_jump": 0.18,
+    "player_anchor_agreement": 0.07
   },
   "keys": {
     "attack": "shift",

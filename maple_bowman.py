@@ -42,6 +42,8 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.json"
 ASSET_DIR = ROOT / "assets" / "monsters"
 PLAYER_ASSET_DIR = ROOT / "assets" / "player"
+PLAYER_HEAD_ASSET_DIR = ROOT / "assets" / "player_head"
+PLAYER_TITLE_ASSET_DIR = ROOT / "assets" / "player_title"
 LOG_DIR = ROOT / "logs"
 
 user32 = ctypes.windll.user32
@@ -488,6 +490,15 @@ class Detection:
     name: str
 
 
+@dataclass(frozen=True)
+class PlayerAnchor:
+    """玩家统一定位锚点：box 顶边代表脚底高度，中心代表玩家水平位置。"""
+    box: tuple[int, int, int, int]
+    score: float
+    source: str
+    raw_box: tuple[int, int, int, int]
+
+
 def template_foreground_mask(image: np.ndarray) -> np.ndarray:
     """保留怪物的高饱和度颜色，尽量排除木板、墙面等模板背景。"""
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -724,6 +735,83 @@ def choose_player_detection(
             -item.score,
         ),
     )
+
+
+def player_anchor_from_detection(
+    detection: Detection,
+    source: str,
+    scene_height: int,
+    head_feet_offset: float,
+    title_feet_offset: float,
+) -> PlayerAnchor:
+    x, y, w, h = detection.box
+    if source == "姓名板":
+        feet_y = y
+    elif source == "头部":
+        feet_y = y + h + int(round(float(head_feet_offset) * scene_height))
+    elif source == "称号勋章":
+        feet_y = y - int(round(float(title_feet_offset) * scene_height))
+    else:
+        raise ValueError(f"未知玩家定位来源：{source}")
+    feet_y = max(0, min(scene_height - 1, feet_y))
+    return PlayerAnchor((x, feet_y, w, 1), detection.score, source, detection.box)
+
+
+def choose_fused_player_anchor(
+    groups: list[tuple[str, list[Detection]]],
+    previous: PlayerAnchor | None,
+    scene_width: int,
+    scene_height: int,
+    head_feet_offset: float,
+    title_feet_offset: float,
+    max_jump: float,
+    agreement_distance: float = 0.07,
+) -> PlayerAnchor | None:
+    """融合三路锚点：先看跨来源相互支持度，再看来源优先级和上帧距离。"""
+    previous_center = None
+    if previous is not None:
+        previous_center = (
+            previous.box[0] + previous.box[2] / 2.0,
+            previous.box[1],
+        )
+    max_distance = max(20.0, float(max_jump) * max(scene_width, scene_height))
+    source_rank = {"姓名板": 0, "头部": 1, "称号勋章": 2}
+    candidates: list[tuple[int, float, PlayerAnchor]] = []
+    for source, detections in groups:
+        for detection in detections:
+            anchor = player_anchor_from_detection(
+                detection,
+                source,
+                scene_height,
+                head_feet_offset,
+                title_feet_offset,
+            )
+            center = (anchor.box[0] + anchor.box[2] / 2.0, anchor.box[1])
+            distance = 0.0
+            if previous_center is not None:
+                distance = ((center[0] - previous_center[0]) ** 2 + (center[1] - previous_center[1]) ** 2) ** 0.5
+                if distance > max_distance:
+                    continue
+            candidates.append((source_rank.get(source, 9), distance, anchor))
+    if not candidates:
+        return None
+    agreement_pixels = max(16.0, float(agreement_distance) * max(scene_width, scene_height))
+    ranked: list[tuple[int, int, float, float, PlayerAnchor]] = []
+    for rank, distance, anchor in candidates:
+        center_x = anchor.box[0] + anchor.box[2] / 2.0
+        feet_y = anchor.box[1]
+        supporting_sources = {anchor.source}
+        for _other_rank, _other_distance, other in candidates:
+            if other.source == anchor.source:
+                continue
+            other_x = other.box[0] + other.box[2] / 2.0
+            other_y = other.box[1]
+            separation = ((center_x - other_x) ** 2 + (feet_y - other_y) ** 2) ** 0.5
+            if separation <= agreement_pixels:
+                supporting_sources.add(other.source)
+        ranked.append((-len(supporting_sources), rank, distance, -anchor.score, anchor))
+    ranked.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    return ranked[0][4]
 
 
 class SessionLog:
@@ -1060,6 +1148,47 @@ def capture_player_template(config_path: Path) -> None:
     print(f"玩家姓名板模板已保存：{path}")
 
 
+def capture_player_aux_template(config_path: Path, kind: str) -> None:
+    specs = {
+        "head": (
+            "紧贴框选自己的头部（头发和脸），不要包含身体、姓名板或其他玩家",
+            PLAYER_HEAD_ASSET_DIR,
+            "head",
+            "玩家头部",
+        ),
+        "title": (
+            "紧贴框选姓名板下方的称号勋章整行，不要包含姓名板、宠物或怪物",
+            PLAYER_TITLE_ASSET_DIR,
+            "title",
+            "玩家称号勋章",
+        ),
+    }
+    if kind not in specs:
+        raise ValueError(f"未知辅助模板类型：{kind}")
+    prompt, directory, prefix, label = specs[kind]
+    config = load_config(config_path)
+    window = find_game_window(config)
+    focus_game_window(window)
+    result = interactive_overlay(window, prompt, "rectangle")
+    if result.cancelled or result.rectangle is None:
+        raise RuntimeError(f"已取消{label}模板框选")
+    focus_game_window(window, settle_seconds=0.15)
+    with mss.MSS() as sct:
+        frame = capture_client(sct, window)
+    x, y, w, h = result.rectangle
+    image = frame[y : y + h, x : x + w]
+    alpha = player_template_alpha(image) if kind == "head" else nameplate_template_alpha(image)
+    bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
+    bgra[:, :, 3] = alpha
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{prefix}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
+    ok, encoded = cv2.imencode(".png", bgra)
+    if not ok:
+        raise RuntimeError(f"无法保存{label}模板图片")
+    encoded.tofile(path)
+    print(f"{label}模板已保存：{path}")
+
+
 def draw_roi(frame: np.ndarray, roi: dict[str, float], color: tuple[int, int, int]) -> None:
     x, y, w, h = roi_pixels(frame.shape, roi)
     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
@@ -1095,6 +1224,8 @@ class BowmanBot:
         self.keyboard = Keyboard()
         self.templates = load_templates()
         self.player_templates = load_templates(PLAYER_ASSET_DIR)
+        self.player_head_templates = load_templates(PLAYER_HEAD_ASSET_DIR)
+        self.player_title_templates = load_templates(PLAYER_TITLE_ASSET_DIR)
         self.log = SessionLog()
         self.armed = False
         self.state = "OBSERVER"
@@ -1119,7 +1250,7 @@ class BowmanBot:
         self.last_detection_name: str | None = None
         self.last_detection_at = 0.0
         self.last_detections: list[Detection] = []
-        self.last_player_box: tuple[int, int, int, int] | None = None
+        self.last_player_anchor: PlayerAnchor | None = None
         self.last_player_at = 0.0
         self.integrity_ok = True
 
@@ -1366,7 +1497,11 @@ class BowmanBot:
         vision = self.config["vision"]
         print(f"游戏窗口：{window.title}（{window.width}×{window.height}）")
         print(f"已载入怪物模板：{len(self.templates)} 个")
-        print(f"已载入玩家姓名板模板：{len(self.player_templates)} 个")
+        print(
+            "已载入玩家定位模板："
+            f"姓名板 {len(self.player_templates)} / 头部 {len(self.player_head_templates)} / "
+            f"称号勋章 {len(self.player_title_templates)}"
+        )
         if self.input_authorized and not self.integrity_ok:
             print("权限不足：助手权限低于游戏，输入会被 Windows 阻止。")
         print("F8 启动或暂停，F9 / Ctrl+Shift+Q 立即退出。按键输入：" + ("已允许。" if self.input_authorized else "未允许（观察模式）。"))
@@ -1375,6 +1510,8 @@ class BowmanBot:
             input_authorized=self.input_authorized,
             templates=len(self.templates),
             player_templates=len(self.player_templates),
+            player_head_templates=len(self.player_head_templates),
+            player_title_templates=len(self.player_title_templates),
         )
         hotkey_thread = threading.Thread(target=self.monitor_hotkeys, name="MapleHotkeys", daemon=True)
         hotkey_thread.start()
@@ -1445,17 +1582,62 @@ class BowmanBot:
                         max_detections=8,
                         structure_weight=0.55,
                     )
-                    player_detection = choose_player_detection(player_detections, self.last_player_box)
-                    if player_detection is not None:
-                        self.last_player_box = player_detection.box
+                    head_detections, head_score, _head_template_name = find_detections(
+                        combat_img,
+                        self.player_head_templates,
+                        float(vision.get("player_head_threshold", 0.76)),
+                        float(vision.get("player_detection_scale", 0.5)),
+                        max_per_template=8,
+                        nms_iou=0.35,
+                        max_detections=8,
+                        structure_weight=0.35,
+                    )
+                    title_detections, title_score, _title_template_name = find_detections(
+                        combat_img,
+                        self.player_title_templates,
+                        float(vision.get("player_title_threshold", 0.70)),
+                        float(vision.get("player_detection_scale", 0.5)),
+                        max_per_template=8,
+                        nms_iou=0.35,
+                        max_detections=8,
+                        structure_weight=0.55,
+                    )
+                    player_anchor = choose_fused_player_anchor(
+                        [
+                            ("姓名板", player_detections),
+                            ("头部", head_detections),
+                            ("称号勋章", title_detections),
+                        ],
+                        self.last_player_anchor,
+                        combat_img.shape[1],
+                        combat_img.shape[0],
+                        float(vision.get("player_head_feet_offset", 0.07)),
+                        float(vision.get("player_title_feet_offset", 0.076)),
+                        float(vision.get("player_anchor_max_jump", 0.18)),
+                        float(vision.get("player_anchor_agreement", 0.07)),
+                    )
+                    if player_anchor is not None:
+                        self.last_player_anchor = player_anchor
                         self.last_player_at = now
-                    player_hold = float(vision.get("player_hold_seconds", 0.5))
-                    if player_detection is not None:
-                        player_box = player_detection.box
+                    player_hold = float(vision.get("player_hold_seconds", 0.8))
+                    if player_anchor is not None:
+                        active_player_anchor = player_anchor
                     elif now - self.last_player_at <= player_hold:
-                        player_box = self.last_player_box
+                        active_player_anchor = self.last_player_anchor
                     else:
-                        player_box = None
+                        active_player_anchor = None
+                    player_box = active_player_anchor.box if active_player_anchor is not None else None
+                    player_source = active_player_anchor.source if active_player_anchor is not None else ""
+                    source_scores = {
+                        "姓名板": player_score,
+                        "头部": head_score,
+                        "称号勋章": title_score,
+                    }
+                    active_player_score = (
+                        active_player_anchor.score
+                        if active_player_anchor is not None
+                        else source_scores.get(player_source, -1.0)
+                    )
 
                     target = choose_nearest_target(
                         monsters,
@@ -1522,7 +1704,9 @@ class BowmanBot:
                         chase_screen_box = (cx, cy, chase_box[2], chase_box[3])
                     if player_box is not None:
                         px, py, pw, ph = player_box
-                        player_screen_box = (combat_rect[0] + px, combat_rect[1] + py, pw, ph)
+                        raw_player_box = active_player_anchor.raw_box if active_player_anchor is not None else player_box
+                        rx, ry, rw, rh = raw_player_box
+                        player_screen_box = (combat_rect[0] + rx, combat_rect[1] + ry, rw, rh)
                         horizontal = int(float(self.config["behavior"].get("bow_attack_range", 0.312)) * combat_rect[2])
                         vertical = int(float(self.config["behavior"].get("bow_vertical_tolerance", 0.12)) * combat_rect[3])
                         center_x = px + pw // 2
@@ -1565,7 +1749,8 @@ class BowmanBot:
                             "combat_roi": self.config["regions"]["combat"],
                             "marker_screen": marker_screen,
                             "player_box": player_screen_box,
-                            "player_score": player_score,
+                            "player_score": active_player_score,
+                            "player_source": player_source,
                             "attack_range_box": attack_range_box,
                             "monster_boxes": monster_boxes,
                             "monster_box": monster_box,
@@ -1621,6 +1806,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibrate", action="store_true", help="进行画面区域校准")
     parser.add_argument("--capture-template", action="store_true", help="采集怪物模板")
     parser.add_argument("--capture-player-template", action="store_true", help="采集玩家模板")
+    parser.add_argument("--capture-player-head", action="store_true", help="采集玩家头部模板")
+    parser.add_argument("--capture-player-title", action="store_true", help="采集玩家称号勋章模板")
     parser.add_argument("--list-windows", action="store_true", help="列出可见窗口")
     parser.add_argument("--enable-input", action="store_true", help="允许发送按键；仍需按 F8 才会启动")
     return parser.parse_args()
@@ -1643,6 +1830,12 @@ def main() -> int:
         return 0
     if args.capture_player_template:
         capture_player_template(config_path)
+        return 0
+    if args.capture_player_head:
+        capture_player_aux_template(config_path, "head")
+        return 0
+    if args.capture_player_title:
+        capture_player_aux_template(config_path, "title")
         return 0
     config = load_config(config_path)
     bot = BowmanBot(config, input_authorized=bool(args.enable_input))

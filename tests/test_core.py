@@ -141,6 +141,72 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(attack.name, "in-range.png")
         self.assertIsNone(chase)
 
+    def test_player_anchor_falls_back_from_nameplate_to_head_and_title(self):
+        nameplate = bot.Detection((200, 300, 80, 30), 0.8, "nameplate.png")
+        head = bot.Detection((208, 220, 64, 64), 0.9, "head.png")
+        title = bot.Detection((208, 335, 64, 25), 0.85, "title.png")
+        primary = bot.choose_fused_player_anchor(
+            [("姓名板", [nameplate]), ("头部", [head]), ("称号勋章", [title])],
+            None,
+            800,
+            500,
+            0.032,
+            0.07,
+            0.18,
+        )
+        self.assertEqual(primary.source, "姓名板")
+        from_head = bot.choose_fused_player_anchor(
+            [("姓名板", []), ("头部", [head]), ("称号勋章", [title])],
+            primary,
+            800,
+            500,
+            0.032,
+            0.07,
+            0.18,
+        )
+        self.assertEqual(from_head.source, "头部")
+        from_title = bot.choose_fused_player_anchor(
+            [("姓名板", []), ("头部", []), ("称号勋章", [title])],
+            from_head,
+            800,
+            500,
+            0.032,
+            0.07,
+            0.18,
+        )
+        self.assertEqual(from_title.source, "称号勋章")
+        self.assertLess(abs(primary.box[1] - from_head.box[1]), 20)
+        self.assertLess(abs(primary.box[1] - from_title.box[1]), 20)
+
+    def test_player_anchor_rejects_far_other_player(self):
+        previous = bot.PlayerAnchor((100, 200, 80, 1), 0.8, "姓名板", (100, 200, 80, 30))
+        other = bot.Detection((600, 200, 80, 30), 0.99, "other-nameplate.png")
+        anchor = bot.choose_fused_player_anchor(
+            [("姓名板", [other])], previous, 800, 500, 0.07, 0.076, 0.18
+        )
+        self.assertIsNone(anchor)
+
+    def test_two_aux_sources_outvote_wrong_nameplate(self):
+        wrong_nameplate = bot.Detection((420, 200, 80, 30), 0.99, "other-player.png")
+        own_head = bot.Detection((100, 100, 64, 64), 0.82, "own-head.png")
+        own_title = bot.Detection((100, 235, 64, 25), 0.86, "own-title.png")
+        anchor = bot.choose_fused_player_anchor(
+            [
+                ("姓名板", [wrong_nameplate]),
+                ("头部", [own_head]),
+                ("称号勋章", [own_title]),
+            ],
+            None,
+            800,
+            500,
+            0.07,
+            0.07,
+            0.8,
+            0.07,
+        )
+        self.assertEqual(anchor.source, "头部")
+        self.assertLess(anchor.box[0], 200)
+
     def test_chinese_text_rendering(self):
         image = np.zeros((60, 260, 3), dtype=np.uint8)
         rendered = bot.draw_chinese_texts(image, [("中文提示", (5, 5), (0, 255, 255), 20)])
