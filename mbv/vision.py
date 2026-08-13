@@ -259,7 +259,14 @@ def find_detections(
                 cv2.TM_CCORR_NORMED,
                 mask=mask,
             )
-            result = color_result * (1.0 - structure_weight) + edge_result * structure_weight
+            result = cv2.addWeighted(
+                color_result,
+                1.0 - structure_weight,
+                edge_result,
+                structure_weight,
+                0.0,
+                dst=color_result,
+            )
         else:
             result = color_result
         result = np.nan_to_num(result, copy=False, nan=-1.0, posinf=-1.0, neginf=-1.0)

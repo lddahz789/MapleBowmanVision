@@ -5,7 +5,7 @@ alwaysApply: true
 
 # MapleBowmanVision
 
-先读仓库根目录 `AGENTS.md` 和玩家手册 `README.md`。
+先读仓库根目录 `AGENTS.md` 和玩家手册 `README.md`。项目约束以 `AGENTS.md` 为准（本机 Codex 只读那份）；不要只在本文件加新规则。
 
 - 这是经典冒险岛怀旧服弓箭手视觉助手，不是 Artale 项目。不要搬符文、跑图、组队红条主定位，不要注入/读内存/抓包。
 - 业务只改 `mbv/`。`maple_bowman.py`、`game_overlay.py`、`control_panel.py` 是兼容入口。

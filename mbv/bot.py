@@ -14,6 +14,8 @@ from mbv.input import Keyboard, input_delivery, key_is_down, rising_edge
 from mbv.overlay import RuntimeOverlay
 from mbv.paths import PLAYER_ASSET_DIR, PLAYER_HEAD_ASSET_DIR, PLAYER_TITLE_ASSET_DIR
 from mbv.vision import (
+    Detection,
+    PlayerAnchor,
     SceneFeatures,
     _ordered_rect,
     attack_box_from_config,
@@ -61,6 +63,8 @@ STATE_LABELS = {
     "MARKER_LOST": "玩家标记丢失",
 }
 
+DEFAULT_PLAYER_AUXILIARY_INTERVAL_SECONDS = 0.5
+
 
 def runtime_limit_reached(
     started_at: float,
@@ -70,6 +74,34 @@ def runtime_limit_reached(
     """非正数表示不限制运行时长；正数按分钟计算截止时间。"""
     minutes = float(max_runtime_minutes)
     return minutes > 0.0 and now - started_at >= minutes * 60.0
+
+
+def should_run_player_auxiliary_detections(
+    previous_anchor: PlayerAnchor | None,
+    nameplate_anchor: PlayerAnchor | None,
+    now: float,
+    last_auxiliary_at: float,
+    interval_seconds: float,
+) -> bool:
+    """姓名板稳定跟踪时降频辅助检测；任何不确定情况都立即恢复三路检测。"""
+    if previous_anchor is None or nameplate_anchor is None:
+        return True
+    if previous_anchor.source != "姓名板":
+        return True
+    interval = max(0.0, float(interval_seconds))
+    return last_auxiliary_at <= 0.0 or now - last_auxiliary_at >= interval
+
+
+def player_anchor_within_hold(
+    anchor: PlayerAnchor | None,
+    last_seen_at: float,
+    now: float,
+    hold_seconds: float,
+) -> PlayerAnchor | None:
+    """仅把仍在保持窗口内的锚点作为下一帧定位先验。"""
+    if anchor is not None and now - last_seen_at <= float(hold_seconds):
+        return anchor
+    return None
 
 
 class BowmanBot:
@@ -111,6 +143,7 @@ class BowmanBot:
         self.last_detections: list[Detection] = []
         self.last_player_anchor: PlayerAnchor | None = None
         self.last_player_at = 0.0
+        self.last_player_auxiliary_at = 0.0
         self.integrity_ok = True
         self.vision_suspended = threading.Event()
         self.window: WindowInfo | None = None
@@ -270,6 +303,7 @@ class BowmanBot:
         self.player_templates = load_templates(PLAYER_ASSET_DIR)
         self.player_head_templates = load_templates(PLAYER_HEAD_ASSET_DIR)
         self.player_title_templates = load_templates(PLAYER_TITLE_ASSET_DIR)
+        self.last_player_auxiliary_at = 0.0
         self.log.write(
             "templates_reloaded",
             monsters=len(self.templates),
@@ -293,6 +327,7 @@ class BowmanBot:
                 if hwnd:
                     self.keyboard.bind_window(hwnd)
             self.config = config
+            self.last_player_auxiliary_at = 0.0
 
     def reload_from_disk(self, config_path: Path) -> None:
         self.apply_config(load_config(config_path))
@@ -530,6 +565,16 @@ class BowmanBot:
                     else:
                         monsters = detected_monsters
 
+                    player_hold = float(vision.get("player_hold_seconds", 0.8))
+                    previous_player_anchor = player_anchor_within_hold(
+                        self.last_player_anchor,
+                        self.last_player_at,
+                        now,
+                        player_hold,
+                    )
+                    if previous_player_anchor is None:
+                        self.last_player_anchor = None
+
                     player_detections, player_score, _player_template_name = find_detections(
                         scene,
                         self.player_templates,
@@ -540,33 +585,7 @@ class BowmanBot:
                         max_detections=8,
                         structure_weight=0.55,
                     )
-                    head_detections, head_score, _head_template_name = find_detections(
-                        scene,
-                        self.player_head_templates,
-                        float(vision.get("player_head_threshold", 0.76)),
-                        float(vision.get("player_detection_scale", 0.5)),
-                        max_per_template=8,
-                        nms_iou=0.35,
-                        max_detections=8,
-                        structure_weight=0.35,
-                    )
-                    title_detections, title_score, _title_template_name = find_detections(
-                        scene,
-                        self.player_title_templates,
-                        float(vision.get("player_title_threshold", 0.70)),
-                        float(vision.get("player_detection_scale", 0.5)),
-                        max_per_template=8,
-                        nms_iou=0.35,
-                        max_detections=8,
-                        structure_weight=0.55,
-                    )
-                    player_anchor = choose_fused_player_anchor(
-                        [
-                            ("姓名板", player_detections),
-                            ("头部", head_detections),
-                            ("称号勋章", title_detections),
-                        ],
-                        self.last_player_anchor,
+                    player_anchor_args = (
                         combat_img.shape[1],
                         combat_img.shape[0],
                         float(vision.get("player_head_feet_offset", 0.07)),
@@ -574,10 +593,61 @@ class BowmanBot:
                         float(vision.get("player_anchor_max_jump", 0.18)),
                         float(vision.get("player_anchor_agreement", 0.07)),
                     )
+                    nameplate_anchor = choose_fused_player_anchor(
+                        [("姓名板", player_detections)],
+                        previous_player_anchor,
+                        *player_anchor_args,
+                    )
+                    run_player_auxiliary = should_run_player_auxiliary_detections(
+                        previous_player_anchor,
+                        nameplate_anchor,
+                        now,
+                        self.last_player_auxiliary_at,
+                        float(
+                            vision.get(
+                                "player_auxiliary_interval_seconds",
+                                DEFAULT_PLAYER_AUXILIARY_INTERVAL_SECONDS,
+                            )
+                        ),
+                    )
+                    if run_player_auxiliary:
+                        head_detections, head_score, _head_template_name = find_detections(
+                            scene,
+                            self.player_head_templates,
+                            float(vision.get("player_head_threshold", 0.76)),
+                            float(vision.get("player_detection_scale", 0.5)),
+                            max_per_template=8,
+                            nms_iou=0.35,
+                            max_detections=8,
+                            structure_weight=0.35,
+                        )
+                        title_detections, title_score, _title_template_name = find_detections(
+                            scene,
+                            self.player_title_templates,
+                            float(vision.get("player_title_threshold", 0.70)),
+                            float(vision.get("player_detection_scale", 0.5)),
+                            max_per_template=8,
+                            nms_iou=0.35,
+                            max_detections=8,
+                            structure_weight=0.55,
+                        )
+                        self.last_player_auxiliary_at = now
+                        player_anchor = choose_fused_player_anchor(
+                            [
+                                ("姓名板", player_detections),
+                                ("头部", head_detections),
+                                ("称号勋章", title_detections),
+                            ],
+                            previous_player_anchor,
+                            *player_anchor_args,
+                        )
+                    else:
+                        head_score = -1.0
+                        title_score = -1.0
+                        player_anchor = nameplate_anchor
                     if player_anchor is not None:
                         self.last_player_anchor = player_anchor
                         self.last_player_at = now
-                    player_hold = float(vision.get("player_hold_seconds", 0.8))
                     if player_anchor is not None:
                         active_player_anchor = player_anchor
                     elif now - self.last_player_at <= player_hold:

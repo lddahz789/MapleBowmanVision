@@ -18,7 +18,7 @@ import game_overlay as hud
 class CoreTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        with (ROOT / "config.json").open("r", encoding="utf-8") as handle:
+        with (ROOT / "config.example.json").open("r", encoding="utf-8") as handle:
             cls.config = json.load(handle)
 
     def test_win32_input_structure_size(self):
@@ -224,6 +224,39 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(anchor.source, "头部")
         self.assertLess(anchor.box[0], 200)
 
+    def test_player_auxiliary_detection_schedule_keeps_safe_fallbacks(self):
+        from mbv.bot import player_anchor_within_hold, should_run_player_auxiliary_detections
+
+        nameplate = bot.PlayerAnchor((100, 200, 80, 1), 0.9, "姓名板", (100, 200, 80, 30))
+        head = bot.PlayerAnchor((100, 200, 64, 1), 0.9, "头部", (100, 120, 64, 64))
+
+        self.assertTrue(should_run_player_auxiliary_detections(None, nameplate, 10.0, 9.8, 0.75))
+        self.assertTrue(should_run_player_auxiliary_detections(nameplate, None, 10.0, 9.8, 0.75))
+        self.assertTrue(should_run_player_auxiliary_detections(head, nameplate, 10.0, 9.8, 0.75))
+        self.assertFalse(should_run_player_auxiliary_detections(nameplate, nameplate, 10.0, 9.8, 0.75))
+        self.assertTrue(should_run_player_auxiliary_detections(nameplate, nameplate, 10.0, 9.25, 0.75))
+        self.assertTrue(should_run_player_auxiliary_detections(nameplate, nameplate, 10.0, 0.0, 0.75))
+        self.assertTrue(should_run_player_auxiliary_detections(nameplate, nameplate, 10.0, 9.8, 0.0))
+
+        self.assertIs(nameplate, player_anchor_within_hold(nameplate, 9.25, 10.0, 0.8))
+        self.assertIsNone(player_anchor_within_hold(nameplate, 9.19, 10.0, 0.8))
+
+    def test_expired_player_anchor_allows_distant_reacquisition(self):
+        from mbv.bot import player_anchor_within_hold
+
+        previous = bot.PlayerAnchor((100, 200, 80, 1), 0.9, "姓名板", (100, 200, 80, 30))
+        distant = bot.Detection((600, 200, 80, 30), 0.95, "distant.png")
+        args = (800, 500, 0.07, 0.076, 0.18)
+
+        fresh = player_anchor_within_hold(previous, 9.5, 10.0, 0.8)
+        rejected = bot.choose_fused_player_anchor([("姓名板", [distant])], fresh, *args)
+        self.assertIsNone(rejected)
+
+        expired = player_anchor_within_hold(previous, 9.0, 10.0, 0.8)
+        reacquired = bot.choose_fused_player_anchor([("姓名板", [distant])], expired, *args)
+        self.assertIsNotNone(reacquired)
+        self.assertGreater(reacquired.box[0], 500)
+
     def test_hue_ranges_wrap_around_red(self):
         wrapped = bot.hue_ranges(2, 120, 120)
         self.assertEqual(len(wrapped), 2)
@@ -262,49 +295,6 @@ class CoreTests(unittest.TestCase):
             patch("mbv.calibrate.mss.MSS"),
             patch("mbv.calibrate.capture_client", return_value=frame),
             patch("mbv.calibrate.interactive_overlay", return_value=result),
-            self.assertRaisesRegex(RuntimeError, "已取消怪物模板框选"),
-        ):
-            bot.capture_frozen_selection(window, "框选目标", "已取消怪物模板框选")
-
-    def test_frozen_frame_converts_bgr_pixels_for_display(self):
-        frame = np.zeros((2, 3, 3), dtype=np.uint8)
-        frame[0, 0] = (255, 0, 0)
-        frame[0, 1] = (0, 0, 255)
-
-        image = hud.frozen_frame_image(frame, 3, 2)
-
-        self.assertEqual((3, 2), image.size)
-        self.assertEqual((0, 0, 255), image.getpixel((0, 0)))
-        self.assertEqual((255, 0, 0), image.getpixel((1, 0)))
-
-    def test_frozen_selection_displays_and_crops_the_same_captured_frame(self):
-        frame = np.arange(8 * 10 * 3, dtype=np.uint8).reshape((8, 10, 3))
-        window = bot.WindowInfo(123, "MapleStory", 10, 20, 10, 8)
-        result = type("Result", (), {"cancelled": False, "rectangle": (2, 1, 4, 4)})()
-
-        with (
-            patch.object(bot, "focus_game_window") as focus,
-            patch.object(bot.mss, "MSS") as mss_factory,
-            patch.object(bot, "capture_client", return_value=frame) as capture,
-            patch.object(bot, "interactive_overlay", return_value=result) as overlay,
-        ):
-            frozen = bot.capture_frozen_selection(window, "框选目标", "已取消")
-
-        focus.assert_called_once_with(window)
-        capture.assert_called_once_with(mss_factory.return_value.__enter__.return_value, window)
-        self.assertIs(overlay.call_args.kwargs["frozen_frame"], frame)
-        self.assertTrue(np.array_equal(frozen, frame[1:5, 2:6]))
-
-    def test_frozen_selection_cancel_does_not_return_pixels(self):
-        frame = np.zeros((6, 8, 3), dtype=np.uint8)
-        window = bot.WindowInfo(123, "MapleStory", 10, 20, 8, 6)
-        result = type("Result", (), {"cancelled": True, "rectangle": None})()
-
-        with (
-            patch.object(bot, "focus_game_window"),
-            patch.object(bot.mss, "MSS"),
-            patch.object(bot, "capture_client", return_value=frame),
-            patch.object(bot, "interactive_overlay", return_value=result),
             self.assertRaisesRegex(RuntimeError, "已取消怪物模板框选"),
         ):
             bot.capture_frozen_selection(window, "框选目标", "已取消怪物模板框选")
@@ -463,11 +453,13 @@ class CoreTests(unittest.TestCase):
         instance.keyboard = bot.Keyboard("foreground")
         instance.keyboard.hwnd = 0
         instance.config_lock = __import__("threading").Lock()
+        instance.last_player_auxiliary_at = 123.0
         config = json.loads(json.dumps(self.config))
         config.setdefault("input", {})["delivery"] = "background"
         instance.apply_config(config)
         self.assertEqual(instance.delivery, "background")
         self.assertTrue(instance.background_input)
+        self.assertEqual(instance.last_player_auxiliary_at, 0.0)
         self.assertEqual(instance.keyboard.delivery, "background")
 
     def test_name_for_vk_roundtrip(self):

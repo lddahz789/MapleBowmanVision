@@ -2,7 +2,9 @@
 
 给同事和 AI 用的项目说明。玩家操作见 [README.md](README.md)。
 
-改代码前先读本节约束，再打开对应 `mbv/` 文件。不要把逻辑堆回根目录的兼容入口。
+**Cursor 和本机 Codex 共用这份文件。** Codex 不会读 `.cursor/rules/`。新约束只写这里；`.cursor/rules/project.mdc` 只做指针，不要在那边单独加规则。
+
+改代码前先读本节约束，再打开对应 `mbv/` 文件。不要把逻辑堆回根目录的兼容入口。仓库是独立的 `MapleBowmanVision`，不要改旁边的 Artale 项目 `MapleStoryAutoLevelUp-Optimized`。
 
 ## 这是什么
 
@@ -23,6 +25,7 @@ Windows 上的 **经典冒险岛 / 怀旧服** 弓箭手视觉挂机原型。
 - 不要提交个人 `config.json`、`assets/**/*.png`、`logs/`。默认配置是 `config.example.json`。
 - 不要 `git commit`，除非用户明确要求。
 - **每次提交必须同时更新版本号和更新日志**（见下方「提交」）。
+- 本仓库 git 身份是 `lyn <lddahz789@126.com>`（仅 local config）。不要用公司姓名或公司邮箱提交。
 - 用户规则：回复用简体中文。
 
 ## 目录
@@ -111,6 +114,18 @@ Start.bat
 3. **和代码一起提交**：不要只提交代码、不改版本和日志；也不要单独先提版本再提功能。
 
 纯文档或注释的小改动也至少升补丁号，并写一行 changelog。提交说明里带上版本号，例如 `feat: 冻结帧采集 (0.2.0)`。
+
+已推送到 `origin/main` 的历史不要 rebase / amend / force-push。推送前先 `git fetch` 并 rebase 到 `origin/main`。
+
+## Cursor 与 Codex 并行
+
+两边会改同一份工作区。开始任务前先看 `git status` 和别人未提交的 diff，不要覆盖对方正在写的文件。
+
+- 先 `git pull --rebase`（或 fetch + rebase）再动手，避免和远程分叉。
+- 业务只改 `mbv/`。`mbv/panel.py` 直接从 `mbv.bot` / `mbv.calibrate` / `mbv.config` / `mbv.input` 导入，不要再 `import maple_bowman`。
+- 同一帧的多路 `find_detections` 必须共用一个 `SceneFeatures`。
+- 做完跑：`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`
+- 未要求不要 commit / push。
 
 ## 语言与风格
 
