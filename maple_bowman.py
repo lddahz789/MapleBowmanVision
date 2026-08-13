@@ -5,11 +5,13 @@ from mbv.bot import STATE_LABELS, BowmanBot, runtime_limit_reached
 from mbv.calibrate import (
     calibrate,
     capture_attack_range,
+    capture_target_range,
     capture_frozen_selection,
     capture_key_name,
     capture_monster_filter,
     capture_player_aux_template,
     capture_player_template,
+    capture_recognition_region,
     capture_template,
     hue_ranges,
 )
@@ -40,8 +42,10 @@ from mbv.vision import (
     load_templates,
     monster_template_category,
     monster_templates_for_category,
+    player_attack_anchor,
     player_marker,
     roi_pixels,
+    smooth_player_attack_anchor,
     suppress_monster_detections,
 )
 from mbv.win32 import process_integrity_level, user32

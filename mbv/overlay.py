@@ -311,7 +311,14 @@ class RuntimeOverlay:
         if attack_range:
             x, y, w, h = attack_range
             canvas.create_rectangle(x, y, x + w, y + h, outline="#ffe04a", width=1)
-            canvas.create_text(x + 3, y + 3, anchor="nw", text="弓箭有效索敌区", fill="#ffe04a", font=small)
+            canvas.create_text(
+                x + 3,
+                y + 3,
+                anchor="nw",
+                text=str(state.get("attack_range_label", "有效索敌区")),
+                fill="#ffe04a",
+                font=small,
+            )
 
         for candidate in state.get("monster_boxes", []):
             x, y, w, h = candidate

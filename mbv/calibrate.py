@@ -8,7 +8,7 @@ import cv2
 import mss
 import numpy as np
 
-from mbv.config import load_config, save_config
+from mbv.config import load_config, refresh_calibrated, save_config
 from mbv.input import VK
 from mbv.overlay import interactive_overlay
 from mbv.paths import PLAYER_ASSET_DIR, PLAYER_HEAD_ASSET_DIR, PLAYER_TITLE_ASSET_DIR
@@ -17,6 +17,7 @@ from mbv.vision import (
     attack_box_from_rectangle,
     normalize_facing,
     normalized_roi,
+    player_attack_anchor,
     roi_pixels,
     template_foreground_mask,
 )
@@ -53,9 +54,10 @@ def hsv_median_at(frame: np.ndarray, x: int, y: int, radius: int = 2) -> tuple[i
 
 
 def calibrate(config_path: Path, parent: Any = None) -> None:
+    """采集状态栏和小地图；战斗识别区由 capture_recognition_region 独立采集。"""
     config = load_config(config_path)
     window = find_game_window(config)
-    print(f"正在校准：{window.title}（{window.width}×{window.height}）")
+    print(f"正在校准状态栏与小地图：{window.title}（{window.width}×{window.height}）")
     print("提示会直接叠加在游戏画面上。拖动框选后按回车或空格确认。")
     focus_game_window(window)
     shape = (window.height, window.width, 3)
@@ -69,12 +71,10 @@ def calibrate(config_path: Path, parent: Any = None) -> None:
     config["regions"]["hp_bar"] = choose_rectangle("第 1 步：框选血条")
     config["regions"]["mp_bar"] = choose_rectangle("第 2 步：框选蓝条")
     config["regions"]["minimap"] = choose_rectangle("第 3 步：框选整个小地图内部画面")
-    print("第 4 步请框选整个可见游戏场景，不要只框角色当前所在的平台；排除底部状态栏即可。")
-    config["regions"]["combat"] = choose_rectangle("第 4 步：框选整个可见游戏场景（排除底部状态栏）")
     minimap_rect = roi_pixels(shape, config["regions"]["minimap"])
     point_result = interactive_overlay(
         window,
-        "第 5 步：点击自己的小地图标记中心",
+        "第 4 步：点击自己的小地图标记中心",
         "point",
         minimap_rect,
         parent=parent,
@@ -87,14 +87,75 @@ def calibrate(config_path: Path, parent: Any = None) -> None:
     px, py = point_result.point
     hue, saturation, value = hsv_median_at(frame, px, py)
     config["vision"]["player_hsv_ranges"] = hue_ranges(hue, saturation, value)
-    config["calibrated"] = True
-    config["calibration"] = {
-        "window_size": [window.width, window.height],
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "player_hsv_sample": [hue, saturation, value],
-    }
+    calibration = config.setdefault("calibration", {})
+    calibration.update(
+        {
+            "status_regions_complete": True,
+            "window_size": [window.width, window.height],
+            "status_timestamp": datetime.now().isoformat(timespec="seconds"),
+            "player_hsv_sample": [hue, saturation, value],
+        }
+    )
+    refresh_calibrated(config)
     save_config(config_path, config)
-    print(f"校准完成，配置已保存到：{config_path}")
+    print(f"状态栏与小地图校准完成，配置已保存到：{config_path}")
+
+
+def capture_recognition_region(config_path: Path, parent: Any = None) -> dict[str, float]:
+    """独立采集战斗识别区，并在区内记录策略可复用的平台中心锚点。"""
+    config = load_config(config_path)
+    window = find_game_window(config)
+    focus_game_window(window)
+    shape = (window.height, window.width, 3)
+    with mss.MSS() as sct:
+        frozen_frame = capture_client(sct, window)
+    region_result = interactive_overlay(
+        window,
+        "第 1 步：框选整个可见战斗识别区（排除底部状态栏）",
+        "rectangle",
+        parent=parent,
+        frozen_frame=frozen_frame,
+    )
+    if region_result.cancelled or region_result.rectangle is None:
+        raise RuntimeError("已取消识别区域采集")
+    combat_roi = normalized_roi(region_result.rectangle, shape)
+    combat_rect = roi_pixels(shape, combat_roi)
+    center_result = interactive_overlay(
+        window,
+        "第 2 步：点击当前平台的中心位置",
+        "point",
+        guide_rect=combat_rect,
+        parent=parent,
+        frozen_frame=frozen_frame,
+    )
+    if center_result.cancelled or center_result.point is None:
+        raise RuntimeError("已取消平台中心采集")
+    px, py = center_result.point
+    cx, cy, cw, ch = combat_rect
+    if not (cx <= px <= cx + cw and cy <= py <= cy + ch):
+        raise RuntimeError("平台中心必须位于战斗识别区域内")
+    platform_center = {
+        "x": round(max(0.0, min(1.0, (px - cx) / max(1, cw))), 6),
+        "y": round(max(0.0, min(1.0, (py - cy) / max(1, ch))), 6),
+    }
+    config["regions"]["combat"] = combat_roi
+    config.setdefault("recognition", {})["platform_center"] = platform_center
+    config["recognition"]["platform_center_captured"] = True
+    calibration = config.setdefault("calibration", {})
+    calibration.update(
+        {
+            "recognition_region_complete": True,
+            "window_size": [window.width, window.height],
+            "recognition_timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    refresh_calibrated(config)
+    save_config(config_path, config)
+    print(
+        f"识别区域与平台中心已保存：中心 x={platform_center['x']:.3f}, "
+        f"y={platform_center['y']:.3f}（相对识别区）"
+    )
+    return platform_center
 
 
 def capture_frozen_selection(
@@ -293,11 +354,12 @@ def capture_key_name(config: dict[str, Any], parent: Any = None) -> str:
     return result.key
 
 
-def capture_attack_range(
+def capture_target_range(
     config_path: Path,
     parent: Any = None,
     player_box: tuple[int, int, int, int] | None = None,
     raw_box: tuple[int, int, int, int] | None = None,
+    player_anchor: tuple[float, float] | None = None,
     facing: str | None = None,
 ) -> dict[str, float]:
     if player_box is None:
@@ -309,26 +371,31 @@ def capture_attack_range(
     combat_rect = roi_pixels(shape, config["regions"]["combat"])
     result = interactive_overlay(
         window,
-        "以角色中心和面向拖框，框多大就是攻击区多大，回车确认",
+        "以角色位置和面向拖框，框多大就是通用索敌区多大，回车确认",
         "rectangle",
         guide_rect=combat_rect,
         parent=parent,
     )
     if result.cancelled or result.rectangle is None:
-        raise RuntimeError("已取消攻击范围框选")
+        raise RuntimeError("已取消索敌范围框选")
     attack_box = attack_box_from_rectangle(
         result.rectangle,
         combat_rect,
         player_box,
         raw_box=raw_box,
         facing=facing,
+        player_anchor=player_anchor or player_attack_anchor(player_box, raw_box),
     )
-    config["behavior"]["bow_attack_box"] = attack_box
+    config.setdefault("targeting", {})["box"] = attack_box
     save_config(config_path, config)
     print(
-        "攻击范围已保存："
+        "通用索敌范围已保存："
         f"前 {attack_box['forward']:.4f}，后 {attack_box['back']:.4f}，"
         f"上 {attack_box['up']:.4f}，下 {attack_box['down']:.4f}"
         f"（相对角色中心，面向{normalize_facing(facing) if facing else '由框推断'}）"
     )
     return attack_box
+
+
+# 兼容旧 import；新代码统一使用通用命名。
+capture_attack_range = capture_target_range

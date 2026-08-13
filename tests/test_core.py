@@ -333,6 +333,21 @@ class CoreTests(unittest.TestCase):
         self.assertIsNotNone(reacquired)
         self.assertGreater(reacquired.box[0], 500)
 
+    def test_attack_anchor_height_is_stable_across_three_detection_sources(self):
+        player = (100, 220, 40, 1)
+        nameplate = (90, 230, 60, 15)
+        head = (100, 100, 40, 40)
+        title = (80, 300, 80, 20)
+        anchors = [bot.player_attack_anchor(player, raw) for raw in (nameplate, head, title)]
+        self.assertEqual(anchors, [(120.0, 220.0), (120.0, 220.0), (120.0, 220.0)])
+
+    def test_attack_anchor_uses_light_smoothing_and_snaps_on_large_move(self):
+        smoothed = bot.smooth_player_attack_anchor((100.0, 200.0), (108.0, 204.0), 0.25, 60.0)
+        self.assertEqual(smoothed, (102.0, 201.0))
+        snapped = bot.smooth_player_attack_anchor(smoothed, (220.0, 320.0), 0.25, 60.0)
+        self.assertEqual(snapped, (220.0, 320.0))
+        self.assertIsNone(bot.smooth_player_attack_anchor(snapped, None, 0.25, 60.0))
+
     def test_hue_ranges_wrap_around_red(self):
         wrapped = bot.hue_ranges(2, 120, 120)
         self.assertEqual(len(wrapped), 2)
@@ -355,6 +370,239 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(loaded["vision"]["monster_filter_threshold"], 0.84)
         self.assertEqual(loaded["vision"]["monster_filter_overlap"], 0.5)
         self.assertEqual(loaded["vision"]["active_monster_category"], "")
+
+    def test_old_config_migrates_once_to_bowman_dynamic_strategy(self):
+        legacy = json.loads(json.dumps(self.config))
+        legacy.pop("strategy", None)
+        legacy["behavior"]["bow_attack_box"] = {
+            "forward": 0.312,
+            "back": 0.08,
+            "up": 0.12,
+            "down": 0.12,
+        }
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            first = bot.load_config(path)
+            bot.save_config(path, first)
+            second = bot.load_config(path)
+        first_box = first["targeting"]["box"]
+        second_box = second["targeting"]["box"]
+        self.assertEqual(first["strategy"]["active"], "bowman_dynamic")
+        self.assertEqual(first_box, {"forward": 0.2808, "back": 0.072, "up": 0.144, "down": 0.144})
+        self.assertEqual(second_box, first_box)
+        self.assertNotIn("bow_attack_box", second["behavior"])
+
+    def test_strategy_scoped_attack_box_migrates_to_common_targeting_without_resizing(self):
+        transitional = json.loads(json.dumps(self.config))
+        transitional.pop("targeting", None)
+        transitional["strategy"]["options"]["bowman_dynamic"]["attack_box"] = {
+            "forward": 0.33,
+            "back": 0.11,
+            "up": 0.22,
+            "down": 0.07,
+        }
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(transitional), encoding="utf-8")
+            loaded = bot.load_config(path)
+        self.assertEqual(
+            loaded["targeting"]["box"],
+            {"forward": 0.33, "back": 0.11, "up": 0.22, "down": 0.07},
+        )
+
+    def test_strategy_registry_exposes_description_and_settings(self):
+        from mbv.strategies import list_strategies, missing_recognition_data
+
+        strategies = list_strategies()
+        self.assertEqual([item.display_name for item in strategies], ["弓箭手动态", "原地攻击"])
+        self.assertTrue(all(item.description for item in strategies))
+        bowman, stationary = strategies
+        self.assertIn("platform_center", bowman.required_recognition_data)
+        self.assertEqual(stationary.required_recognition_data, ())
+        self.assertEqual(missing_recognition_data(self.config, bowman), ("platform_center",))
+        self.assertEqual(missing_recognition_data(self.config, stationary), ())
+        ready = json.loads(json.dumps(self.config))
+        ready["recognition"]["platform_center_captured"] = True
+        self.assertEqual(missing_recognition_data(ready, bowman), ())
+
+    def test_stationary_attack_selects_in_range_target_without_chasing(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import TargetSelectionContext
+
+        strategy = get_strategy("stationary_attack")
+        near_left = bot.Detection((70, 100, 20, 20), 0.9, "left.png")
+        far_right = bot.Detection((220, 100, 20, 20), 0.9, "right.png")
+        selected = strategy.select_targets(
+            TargetSelectionContext(
+                detections=[far_right, near_left],
+                player_box=(100, 110, 40, 1),
+                player_raw_box=(100, 70, 40, 40),
+                player_anchor=(120.0, 110.0),
+                scene_width=400,
+                scene_height=240,
+                facing="right",
+                target_area={"forward": 0.4, "back": 0.2, "up": 0.2, "down": 0.2},
+                settings={},
+            )
+        )
+        self.assertIs(selected.target, near_left)
+        self.assertIsNone(selected.chase_target)
+
+    def test_stationary_attack_only_attacks_or_stops(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        strategy = get_strategy("stationary_attack")
+        common = dict(
+            marker=(0.8, 0.5),
+            player_box=(500, 100, 40, 1),
+            player_anchor=(520.0, 100.0),
+            chase_box=(800, 100, 20, 20),
+            combat_width=1000,
+            now=10.0,
+            last_target_seen=0.0,
+            last_pickup=0.0,
+            direction="right",
+            behavior=self.config["behavior"],
+            settings={},
+            recognition={"platform_center": {"x": 0.1, "y": 0.5}},
+        )
+        attack = strategy.decide(
+            StrategyActionContext(target_box=(400, 100, 20, 20), has_monster_candidates=True, **common)
+        )
+        wait = strategy.decide(
+            StrategyActionContext(target_box=None, has_monster_candidates=True, **common)
+        )
+        self.assertEqual((attack.action, attack.state), ("attack", "ATTACK"))
+        self.assertLess(attack.target_x, attack.player_x)
+        self.assertFalse(attack.face_each_attack)
+        self.assertEqual((wait.action, wait.state), ("stop", "TARGET_OUT_OF_RANGE"))
+
+    def test_stationary_attack_does_not_repeat_direction_tap_on_same_side(self):
+        from mbv import bot as runtime_bot
+
+        instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
+        instance.config = self.config
+        instance.keyboard = MagicMock()
+        instance.direction = None
+        instance.last_attack = 0.0
+        instance.log = MagicMock()
+
+        instance.face_and_attack(0.2, 0.5, 10.0, face_each_attack=False)
+        instance.face_and_attack(0.2, 0.5, 11.0, face_each_attack=False)
+
+        left_taps = [call for call in instance.keyboard.tap.call_args_list if call.args[0] == "left"]
+        attack_taps = [call for call in instance.keyboard.tap.call_args_list if call.args[0] == "shift"]
+        self.assertEqual(len(left_taps), 1)
+        self.assertEqual(len(attack_taps), 2)
+
+    def test_bowman_strategy_consumes_common_target_area(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import TargetSelectionContext
+
+        strategy = get_strategy("bowman_dynamic")
+        monster = bot.Detection((220, 100, 20, 20), 0.9, "monster.png")
+        common = {
+            "forward": 0.4,
+            "back": 0.05,
+            "up": 0.2,
+            "down": 0.2,
+        }
+        selected = strategy.select_targets(
+            TargetSelectionContext(
+                detections=[monster],
+                player_box=(100, 110, 40, 1),
+                player_raw_box=(100, 70, 40, 40),
+                player_anchor=(120.0, 110.0),
+                scene_width=400,
+                scene_height=240,
+                facing="right",
+                target_area=common,
+                settings=self.config["strategy"]["options"]["bowman_dynamic"],
+            )
+        )
+        self.assertIsNotNone(selected.target)
+        self.assertNotIn("attack_box", strategy.default_settings)
+
+    def test_bowman_dynamic_returns_to_platform_center_before_attacking(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        strategy = get_strategy("bowman_dynamic")
+        settings = json.loads(json.dumps(self.config["strategy"]["options"]["bowman_dynamic"]))
+        settings["platform_center_tolerance"] = 0.1
+        context = StrategyActionContext(
+            marker=(0.8, 0.5),
+            player_box=(880, 100, 40, 1),
+            player_anchor=(900.0, 100.0),
+            target_box=(920, 100, 20, 20),
+            chase_box=None,
+            combat_width=1000,
+            has_monster_candidates=True,
+            now=10.0,
+            last_target_seen=9.0,
+            last_pickup=0.0,
+            direction="right",
+            behavior=self.config["behavior"],
+            settings=settings,
+            recognition={"platform_center": {"x": 0.5, "y": 0.6}},
+        )
+        decision = strategy.decide(context)
+        self.assertEqual(decision.action, "move")
+        self.assertEqual(decision.direction, "left")
+        self.assertEqual(decision.state, "RETURN_CENTER_LEFT")
+
+    def test_bowman_dynamic_attacks_when_inside_center_safe_radius(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        strategy = get_strategy("bowman_dynamic")
+        context = StrategyActionContext(
+            marker=(0.5, 0.5),
+            player_box=(500, 100, 40, 1),
+            player_anchor=(520.0, 100.0),
+            target_box=(600, 100, 20, 20),
+            chase_box=None,
+            combat_width=1000,
+            has_monster_candidates=True,
+            now=10.0,
+            last_target_seen=9.0,
+            last_pickup=0.0,
+            direction="right",
+            behavior=self.config["behavior"],
+            settings=self.config["strategy"]["options"]["bowman_dynamic"],
+            recognition={"platform_center": {"x": 0.5, "y": 0.6}},
+        )
+        decision = strategy.decide(context)
+        self.assertEqual(decision.action, "attack")
+        self.assertTrue(decision.target_seen)
+
+    def test_recognition_region_capture_saves_normalized_platform_center(self):
+        from mbv import calibrate as runtime_calibrate
+
+        region = type("Result", (), {"cancelled": False, "rectangle": (100, 50, 800, 400)})()
+        center = type("Result", (), {"cancelled": False, "point": (500, 250)})()
+        window = bot.WindowInfo(123, "MapleStory", 0, 0, 1000, 500)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(self.config), encoding="utf-8")
+            with (
+                patch.object(runtime_calibrate, "find_game_window", return_value=window),
+                patch.object(runtime_calibrate, "focus_game_window"),
+                patch.object(runtime_calibrate, "mss"),
+                patch.object(runtime_calibrate, "capture_client", return_value=np.zeros((500, 1000, 3), dtype=np.uint8)),
+                patch.object(runtime_calibrate, "interactive_overlay", side_effect=[region, center]) as overlay,
+            ):
+                captured = runtime_calibrate.capture_recognition_region(path)
+            saved = bot.load_config(path)
+        self.assertEqual(captured, {"x": 0.5, "y": 0.5})
+        self.assertIs(
+            overlay.call_args_list[0].kwargs["frozen_frame"],
+            overlay.call_args_list[1].kwargs["frozen_frame"],
+        )
+        self.assertTrue(saved["recognition"]["platform_center_captured"])
+        self.assertTrue(saved["calibration"]["recognition_region_complete"])
 
     def test_captured_monster_filter_keeps_full_rectangle_mask(self):
         from mbv import calibrate as runtime_calibrate
@@ -388,6 +636,82 @@ class CoreTests(unittest.TestCase):
             preview = template_preview_image(path, (40, 40))
         self.assertEqual(preview.size, (40, 20))
         self.assertEqual(preview.mode, "RGB")
+
+    def test_strategy_numeric_stepper_changes_values_without_keyboard_focus(self):
+        from mbv.panel import adjusted_numeric_text
+
+        self.assertEqual(adjusted_numeric_text("0.2808", 0.01, 0.0, 1.0), "0.2908")
+        self.assertEqual(adjusted_numeric_text("0.005", -0.01, 0.0, 1.0), "0")
+        self.assertEqual(adjusted_numeric_text("0.5", 0.01, 0.0, 0.5), "0.5")
+
+    def test_targeting_numeric_preview_is_persisted_immediately(self):
+        from mbv.panel import ControlPanel
+        from mbv.strategies import get_strategy
+
+        strategy = get_strategy("bowman_dynamic")
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(self.config), encoding="utf-8")
+            instance = ControlPanel.__new__(ControlPanel)
+            instance.config_path = path
+            instance.bot = MagicMock()
+            instance.bot.strategy = strategy
+            instance._selected_strategy = lambda: strategy
+
+            instance._preview_targeting_setting("box.forward", "0.35")
+
+            loaded = bot.load_config(path)
+        self.assertEqual(
+            loaded["targeting"]["box"]["forward"],
+            0.35,
+        )
+        instance.bot.preview_targeting_setting.assert_called_once_with("box.forward", 0.35)
+
+    def test_running_panel_persists_common_and_strategy_settings_before_restart(self):
+        from mbv.panel import ControlPanel
+
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(self.config), encoding="utf-8")
+            with patch.object(ControlPanel, "_run_bot", lambda _self: None):
+                panel = ControlPanel(path, enable_input=False)
+            panel.bot.armed = True
+            changes = {
+                "behavior.attack_interval_seconds": "0.31",
+                "targeting.box.forward": "0.41",
+                "strategy.options.bowman_dynamic.platform_center_tolerance": "0.21",
+            }
+            for key, value in changes.items():
+                entry = (
+                    panel._entries.get(key)
+                    or panel._targeting_entries.get(key)
+                    or panel._strategy_entries.get(key)
+                )
+                entry.delete(0, "end")
+                entry.insert(0, value)
+            panel.hp_threshold_percent.set(42)
+            panel.mp_threshold_percent.set(33)
+            panel.fallback_patrol.set(True)
+            panel.pickup_lost.set(True)
+
+            self.assertTrue(
+                panel._persist_settings(apply_runtime=False, notify=False, show_error=False)
+            )
+            self.assertTrue(panel.bot.armed)
+            reloaded = bot.load_config(path)
+            panel.overlay.close()
+            panel.root.destroy()
+
+        self.assertEqual(reloaded["behavior"]["attack_interval_seconds"], 0.31)
+        self.assertEqual(reloaded["targeting"]["box"]["forward"], 0.41)
+        self.assertEqual(
+            reloaded["strategy"]["options"]["bowman_dynamic"]["platform_center_tolerance"],
+            0.21,
+        )
+        self.assertEqual(reloaded["behavior"]["hp_threshold"], 0.42)
+        self.assertEqual(reloaded["behavior"]["mp_threshold"], 0.33)
+        self.assertTrue(reloaded["behavior"]["fallback_patrol"])
+        self.assertTrue(reloaded["behavior"]["pickup_after_target_lost"])
 
     def test_frozen_selection_displays_and_crops_the_same_captured_frame(self):
         frame = np.arange(8 * 10 * 3, dtype=np.uint8).reshape((8, 10, 3))
@@ -629,6 +953,27 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(instance.f8_requested.is_set())
         instance.keyboard.release_all.assert_called_once_with()
 
+    def test_targeting_setting_preview_updates_runtime_without_disarming(self):
+        import threading
+        from mbv.strategies import active_strategy
+
+        instance = bot.BowmanBot.__new__(bot.BowmanBot)
+        instance.config = json.loads(json.dumps(self.config))
+        instance.strategy = active_strategy(instance.config)
+        instance.action_lock = threading.RLock()
+        instance.config_lock = threading.Lock()
+        instance.log = MagicMock()
+        instance.armed = True
+
+        instance.preview_targeting_setting("box.forward", 0.35)
+
+        self.assertEqual(
+            instance.config["targeting"]["box"]["forward"],
+            0.35,
+        )
+        self.assertTrue(instance.armed)
+        instance.log.write.assert_called_once()
+
     def test_suspend_vision_clears_pending_toggle_and_releases_input(self):
         import threading
 
@@ -668,6 +1013,21 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(box["forward"], round(180 / 400, 6))
         self.assertEqual(box["up"], round(40 / 300, 6))
         self.assertEqual(box["down"], round(30 / 300, 6))
+
+    def test_attack_box_capture_can_share_smoothed_runtime_anchor(self):
+        combat = (10, 20, 400, 300)
+        player = (100, 180, 40, 1)
+        rectangle = (110, 120, 200, 90)
+        box = bot.attack_box_from_rectangle(
+            rectangle,
+            combat,
+            player,
+            raw_box=(100, 60, 40, 40),
+            facing="right",
+            player_anchor=(120.0, 180.0),
+        )
+        self.assertEqual(box["up"], round(80 / 300, 6))
+        self.assertEqual(box["down"], round(10 / 300, 6))
 
     def test_attack_box_from_rectangle_requires_player(self):
         with self.assertRaises(TypeError):

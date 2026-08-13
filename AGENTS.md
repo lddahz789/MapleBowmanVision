@@ -38,6 +38,7 @@ Start.bat            # 唯一日常入口；UAC 后进入输入待命，不自�
 Setup.bat / setup_env.py
 config.example.json
 CHANGELOG.md
+STRATEGIES.md       # 职业策略接口、配置与协作扩展规范
 mbv/
   paths.py           # ROOT、assets、logs
   template_store.py  # 怪物分类、过滤项与可恢复删除
@@ -46,10 +47,11 @@ mbv/
   input.py           # Keyboard、VK、SendInput/PostMessage
   window.py          # 找窗口、客户区截图
   vision.py          # ROI、血蓝、模板、玩家融合、攻击框
-  calibrate.py       # 校准、冻结帧采集、框选攻击范围
+  calibrate.py       # 状态区/识别区独立校准、冻结帧采集、框选策略索敌范围
   overlay.py         # HUD、交互框选、F7/面板 Debug 框显隐
   panel.py           # Tk 控制面板
   bot.py             # BowmanBot 主循环
+  strategies/<职业>/ # 按职业子包拆分的目标选择与行动决策
   cli.py             # argparse、main/run
 tests/test_core.py
 assets/{monsters,player,player_head,player_title}/
@@ -62,7 +64,7 @@ assets/{monsters,player,player_head,player_title}/
 1. `cli.main` → 默认 `panel.run_control_panel`；`--overlay-only` 则只开 HUD。
 2. 面板线程跑 `BowmanBot.run`：`mss` 截客户区 → 裁 HP/MP/小地图/战斗区。
 3. 玩家：姓名板模板优先，失败则头部、称号；多路互相校验，避免锁别人。`PlayerAnchor.box` 顶边是脚底高度，水平中心是角色 X；攻击框锚在检测框几何中心（`raw_box` 优先）。
-4. 怪物：战斗区模板匹配。在 `bow_attack_box` 还原出的矩形内选最近目标；框外同高度带则 chase。
+4. 怪物：战斗区模板匹配；当前职业策略在同一批检测结果中决定攻击、追踪或回平台中心。
 5. `input.delivery=background`：始终 `SendInput` 扫描码；失焦时额外 Post/Send 消息，且不要先松开扫描码。`foreground`：仅 SendInput，失焦停机。
 6. 挂机需要管理员完整性 ≥ 游戏（UAC）。`Start.bat` 启动时提权并授权输入，但只进入待命；必须再点“启动挂机”或按 F8 才会发键。
 
@@ -70,11 +72,15 @@ assets/{monsters,player,player_head,player_title}/
 
 - **校准 UI**：框选和点色只用 `interactive_overlay`，不要加回 `cv2.imshow` / OpenCV 鼠标回调。
 - **同帧检测复用**：`BowmanBot.run` 每帧建一个 `SceneFeatures`，四路 `find_detections` 共用；模板特征按缩放比例缓存在 `Template` 上。新增检测请传同一个 `SceneFeatures`，不要重复传原始帧。
+- **稳定战斗锚点**：姓名板/头部/称号的原始框只提供水平中心，高度必须用 `PlayerAnchor.box` 的统一脚底 Y；HUD、选敌和攻击范围采集共用 `last_attack_anchor`。轻量 EMA 只平滑小抖动，大幅移动立即跳转。
 - **冻结帧采集**：`capture_frozen_selection` 先截图，把帧传给 `interactive_overlay(..., frozen_frame=)`，裁切同一帧。不要改回「先框再截第二张图」。
-- **攻击框**：`bow_attack_box.{forward,back,up,down}` 是相对角色中心、占战斗区宽高的比例，随 `bot.direction` 左右翻转。不要再做成 `max(左,右)` 对称修正。旧配置只有 `bow_attack_range` / `bow_vertical_tolerance` 时，`attack_box_from_config` 会合成对称框。
+- **职业策略**：策略只放 `mbv/strategies/`，必须实现注册元数据、目标选择和动作决策；不得在 `mbv/bot.py` 增加按职业分支。完整规范见 `STRATEGIES.md`。
+- **通用索敌区**：所有职业策略共享 `targeting.box.{forward,back,up,down}`，相对稳定战斗锚点并随朝向翻转。不得把索敌框放回某个职业的策略设置；旧策略/`behavior.bow_attack_box` 只用于一次性兼容迁移。
+- **独立校准**：`calibrate` 只采状态栏和小地图；`capture_recognition_region` 用同一冻结帧独立采战斗识别区和平台中心。平台中心坐标相对战斗区归一化。
 - **Debug 框 / F7**：`BowmanBot.set_calibration_overlay_visible` / `toggle_calibration_overlay`；HUD 用 `overlay_draw_plan`。与采集时 `overlay.hide()` 独立。
 - **面板不抢焦点**：`prevent_window_activate` 只设 `WS_EX_NOACTIVATE`。
-- **配置**：`load_config` 要求 `version == 1`，并补 `input.delivery`、`behavior.bow_attack_box`。
+- **配置持久化**：挂机配置的鼠标控件要自动写入个人 `config.json`；`ControlPanel.quit/_destroy` 退出前再调用统一 `_persist_settings`。新增策略参数不能只改运行内存或 Entry。
+- **配置**：`load_config` 要求 `version == 1`，并补输入、识别锚点和 `strategy`；旧弓箭框迁移只能缩放一次。
 
 ## 怎么跑
 
@@ -102,7 +108,8 @@ Start.bat
 | 校准、采模板、冻结帧 | `mbv/calibrate.py`、`mbv/overlay.py` |
 | HUD 颜色、Debug 框、F7 | `mbv/overlay.py`、`mbv/bot.py`、`mbv/panel.py` |
 | 面板按钮、配置项 | `mbv/panel.py` |
-| 走位/攻击/补药状态机 | `mbv/bot.py` |
+| 公共安全、补药、动作执行 | `mbv/bot.py` |
+| 职业目标选择、回位、攻击/巡逻决策 | `mbv/strategies/`、`STRATEGIES.md` |
 | 启动参数 | `mbv/cli.py` |
 
 ## 提交（必须带版本号和更新日志）

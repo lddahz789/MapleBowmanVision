@@ -13,6 +13,7 @@ from mbv.calibrate import (
     capture_monster_filter,
     capture_player_aux_template,
     capture_player_template,
+    capture_recognition_region,
     capture_template,
 )
 from mbv.config import load_config
@@ -52,7 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser = ChineseArgumentParser(description="冒险岛弓箭手纯视觉固定地图原型", add_help=False)
     parser.add_argument("-h", "--help", action="help", help="显示这段帮助信息并退出")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="配置文件路径")
-    parser.add_argument("--calibrate", action="store_true", help="进行画面区域校准")
+    parser.add_argument("--calibrate", action="store_true", help="校准状态栏与小地图")
+    parser.add_argument("--capture-recognition-region", action="store_true", help="采集战斗识别区与平台中心")
     parser.add_argument("--capture-template", action="store_true", help="采集怪物模板")
     parser.add_argument("--capture-monster-filter", action="store_true", help="采集怪物过滤项")
     parser.add_argument("--monster-category", default="", help="怪物模板采集分类；留空为未分类")
@@ -76,6 +78,9 @@ def main() -> int:
         return 2
     if args.calibrate:
         calibrate(config_path)
+        return 0
+    if args.capture_recognition_region:
+        capture_recognition_region(config_path)
         return 0
     if args.capture_template:
         capture_template(config_path, category=args.monster_category)

@@ -413,6 +413,39 @@ def player_anchor_center(
     return px + pw / 2.0, py + ph / 2.0
 
 
+def player_attack_anchor(
+    player_box: tuple[int, int, int, int],
+    raw_box: tuple[int, int, int, int] | None = None,
+) -> tuple[float, float]:
+    """稳定战斗锚点：原始检测框只提供 X，三路统一后的脚底锚点提供 Y。"""
+    px, feet_y, pw, _ph = player_box
+    if raw_box is not None:
+        rx, _ry, rw, _rh = raw_box
+        return rx + rw / 2.0, float(feet_y)
+    return px + pw / 2.0, float(feet_y)
+
+
+def smooth_player_attack_anchor(
+    previous: tuple[float, float] | None,
+    current: tuple[float, float] | None,
+    alpha: float = 0.25,
+    snap_distance: float = 60.0,
+) -> tuple[float, float] | None:
+    """小抖动做 EMA；明显换层、传送或重新定位时直接跳到新锚点。"""
+    if current is None:
+        return None
+    if previous is None:
+        return current
+    distance = ((current[0] - previous[0]) ** 2 + (current[1] - previous[1]) ** 2) ** 0.5
+    if distance >= max(1.0, float(snap_distance)):
+        return current
+    weight = max(0.0, min(1.0, float(alpha)))
+    return (
+        previous[0] + (current[0] - previous[0]) * weight,
+        previous[1] + (current[1] - previous[1]) * weight,
+    )
+
+
 def attack_box_from_config(behavior: dict[str, Any]) -> dict[str, float]:
     box = behavior.get("bow_attack_box")
     if isinstance(box, dict):
@@ -492,11 +525,12 @@ def choose_nearest_target(
     attack_box: dict[str, float],
     facing: str | None = "right",
     raw_box: tuple[int, int, int, int] | None = None,
+    player_anchor: tuple[float, float] | None = None,
 ) -> Detection | None:
     """只在框选的攻击区内，选择离玩家水平距离最近的怪物。"""
     if player_box is None:
         return None
-    player_x, player_y = player_anchor_center(player_box, raw_box)
+    player_x, player_y = player_anchor or player_anchor_center(player_box, raw_box)
     rect = attack_rect_from_player((player_x, player_y), scene_width, scene_height, attack_box, facing)
     return _choose_nearest_eligible(
         detections,
@@ -513,11 +547,12 @@ def choose_nearest_same_level_target(
     scene_height: int,
     attack_box: dict[str, float],
     raw_box: tuple[int, int, int, int] | None = None,
+    player_anchor: tuple[float, float] | None = None,
 ) -> Detection | None:
     """高度仍用框选的上/下范围，水平不限制，供追踪移动使用。"""
     if player_box is None:
         return None
-    player_x, player_y = player_anchor_center(player_box, raw_box)
+    player_x, player_y = player_anchor or player_anchor_center(player_box, raw_box)
     _left, top, _right, bottom = _ordered_rect(
         *attack_rect_from_player((player_x, player_y), scene_width, scene_height, attack_box, "right")
     )
@@ -535,13 +570,14 @@ def attack_box_from_rectangle(
     player_box: tuple[int, int, int, int],
     raw_box: tuple[int, int, int, int] | None = None,
     facing: str | None = None,
+    player_anchor: tuple[float, float] | None = None,
 ) -> dict[str, float]:
     """把客户区矩形原样换成相对角色中心的前/后/上/下，不做对称或取最大修正。"""
     rx, ry, rw, rh = rectangle
     cx, cy, cw, ch = combat_rect
     left, top = float(rx), float(ry)
     right, bottom = float(rx + rw), float(ry + rh)
-    local_x, local_y = player_anchor_center(player_box, raw_box)
+    local_x, local_y = player_anchor or player_anchor_center(player_box, raw_box)
     player_x = cx + local_x
     player_y = cy + local_y
     width = max(1.0, float(cw))

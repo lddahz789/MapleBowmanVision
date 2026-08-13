@@ -24,6 +24,14 @@
     "minimap": {"x": 0.0, "y": 0.05, "w": 0.12, "h": 0.16},
     "combat": {"x": 0.0, "y": 0.05, "w": 1.0, "h": 0.9}
   },
+  "recognition": {
+    "platform_center": {"x": 0.5, "y": 0.5},
+    "platform_center_captured": false
+  },
+  "calibration": {
+    "status_regions_complete": false,
+    "recognition_region_complete": false
+  },
   "vision": {
     "hp_hsv_ranges": [
       {"lower": [0, 80, 60], "upper": [12, 255, 255]},
@@ -52,7 +60,9 @@
     "player_head_feet_offset": 0.07,
     "player_title_feet_offset": 0.076,
     "player_anchor_max_jump": 0.18,
-    "player_anchor_agreement": 0.07
+    "player_anchor_agreement": 0.07,
+    "player_anchor_smoothing_alpha": 0.25,
+    "player_anchor_smoothing_snap": 0.08
   },
   "keys": {
     "attack": "shift",
@@ -65,6 +75,23 @@
   "input": {
     "delivery": "background"
   },
+  "targeting": {
+    "box": {
+      "forward": 0.2808,
+      "back": 0.072,
+      "up": 0.144,
+      "down": 0.144
+    }
+  },
+  "strategy": {
+    "active": "bowman_dynamic",
+    "options": {
+      "bowman_dynamic": {
+        "platform_center_tolerance": 0.12
+      },
+      "stationary_attack": {}
+    }
+  },
   "behavior": {
     "hp_threshold": 0.35,
     "mp_threshold": 0.25,
@@ -72,12 +99,6 @@
     "attack_interval_seconds": 0.24,
     "face_tap_seconds": 0.025,
     "attack_dead_zone": 0.015,
-    "bow_attack_box": {
-      "forward": 0.312,
-      "back": 0.08,
-      "up": 0.12,
-      "down": 0.12
-    },
     "target_lost_patrol_delay_seconds": 1.4,
     "patrol_left": 0.16,
     "patrol_right": 0.84,

@@ -19,24 +19,24 @@ from mbv.paths import (
     PLAYER_HEAD_ASSET_DIR,
     PLAYER_TITLE_ASSET_DIR,
 )
+from mbv.strategies import active_strategy, missing_recognition_data, strategy_settings
+from mbv.strategies.base import StrategyActionContext, TargetSelectionContext
 from mbv.vision import (
     Detection,
     PlayerAnchor,
     SceneFeatures,
     _ordered_rect,
-    attack_box_from_config,
     attack_rect_from_player,
     bar_fill,
     choose_fused_player_anchor,
-    choose_nearest_same_level_target,
-    choose_nearest_target,
     crop,
     find_detections,
     load_templates,
     monster_template_category,
     monster_templates_for_category,
-    player_anchor_center,
+    player_attack_anchor,
     player_marker,
+    smooth_player_attack_anchor,
     suppress_monster_detections,
 )
 from mbv.win32 import (
@@ -69,6 +69,8 @@ STATE_LABELS = {
     "MP_POTION": "正在使用回蓝药",
     "PICKUP": "正在拾取",
     "MARKER_LOST": "玩家标记丢失",
+    "RETURN_CENTER_LEFT": "向左返回平台中心",
+    "RETURN_CENTER_RIGHT": "向右返回平台中心",
 }
 
 DEFAULT_PLAYER_AUXILIARY_INTERVAL_SECONDS = 0.5
@@ -115,6 +117,7 @@ def player_anchor_within_hold(
 class BowmanBot:
     def __init__(self, config: dict[str, Any], input_authorized: bool) -> None:
         self.config = config
+        self.strategy = active_strategy(config)
         self.input_authorized = input_authorized
         self.delivery = input_delivery(config)
         self.background_input = self.delivery == "background"
@@ -158,6 +161,7 @@ class BowmanBot:
         self.last_detection_at = 0.0
         self.last_detections: list[Detection] = []
         self.last_player_anchor: PlayerAnchor | None = None
+        self.last_attack_anchor: tuple[float, float] | None = None
         self.last_player_at = 0.0
         self.last_player_auxiliary_at = 0.0
         self.integrity_ok = True
@@ -262,7 +266,10 @@ class BowmanBot:
             self.notify("当前进程没有按键授权，请从唯一入口 Start.bat 启动。", 6.0)
             return
         if not self.config.get("calibrated"):
-            self.notify("尚未完成校准，请在控制面板点击「画面校准」。")
+            self.notify("校准未完成，请依次采集「状态栏与小地图」和「识别区域与平台中心」。")
+            return
+        if missing_recognition_data(self.config, self.strategy):
+            self.notify(f"策略“{self.strategy.display_name}”需要先采集识别区域与平台中心。", 6.0)
             return
         if not self.player_templates:
             self.notify("尚未采集玩家姓名板模板，请在控制面板点击「采集姓名板」。", 8.0)
@@ -346,6 +353,7 @@ class BowmanBot:
         self.last_detection_score = -1.0
         self.last_detection_name = None
         self.last_detection_at = 0.0
+        self.last_attack_anchor = None
         self.last_player_auxiliary_at = 0.0
         self.log.write(
             "templates_reloaded",
@@ -374,6 +382,7 @@ class BowmanBot:
                     if hwnd:
                         self.keyboard.bind_window(hwnd)
                 self.config = config
+                self.strategy = active_strategy(config)
                 self.active_monster_category = str(
                     config["vision"].get("active_monster_category", "")
                 ).strip()
@@ -382,6 +391,60 @@ class BowmanBot:
     def reload_from_disk(self, config_path: Path) -> None:
         self.apply_config(load_config(config_path))
         self.reload_templates()
+
+    def preview_strategy_setting(self, path: str, value: float) -> None:
+        """实时预览策略数值，不暂停挂机；持久化仍由面板“保存配置”完成。"""
+        parts = str(path).split(".")
+        if not parts or any(not part for part in parts):
+            raise ValueError("策略参数路径无效")
+        with self.action_lock:
+            with self.config_lock:
+                cursor: dict[str, Any] = strategy_settings(self.config)
+                for part in parts[:-1]:
+                    child = cursor.get(part)
+                    if not isinstance(child, dict):
+                        raise KeyError(f"策略参数路径不存在：{path}")
+                    cursor = child
+                if parts[-1] not in cursor:
+                    raise KeyError(f"策略参数不存在：{path}")
+                cursor[parts[-1]] = float(value)
+        self.log.write("strategy_setting_preview", strategy=self.strategy.key, path=path, value=float(value))
+
+    def preview_targeting_setting(self, path: str, value: float) -> None:
+        """实时预览公共索敌区参数，不暂停挂机。"""
+        parts = str(path).split(".")
+        if not parts or any(not part for part in parts):
+            raise ValueError("索敌区参数路径无效")
+        with self.action_lock:
+            with self.config_lock:
+                cursor: dict[str, Any] = self.config["targeting"]
+                for part in parts[:-1]:
+                    child = cursor.get(part)
+                    if not isinstance(child, dict):
+                        raise KeyError(f"索敌区参数路径不存在：{path}")
+                    cursor = child
+                if parts[-1] not in cursor:
+                    raise KeyError(f"索敌区参数不存在：{path}")
+                cursor[parts[-1]] = float(value)
+        self.log.write("targeting_setting_preview", path=path, value=float(value))
+
+    def preview_config_setting(self, path: str, value: Any) -> None:
+        """实时更新不需要重建输入器的普通配置项。"""
+        parts = str(path).split(".")
+        if not parts or any(not part for part in parts):
+            raise ValueError("配置参数路径无效")
+        with self.action_lock:
+            with self.config_lock:
+                cursor: dict[str, Any] = self.config
+                for part in parts[:-1]:
+                    child = cursor.get(part)
+                    if not isinstance(child, dict):
+                        raise KeyError(f"配置参数路径不存在：{path}")
+                    cursor = child
+                if parts[-1] not in cursor:
+                    raise KeyError(f"配置参数不存在：{path}")
+                cursor[parts[-1]] = value
+        self.log.write("config_setting_preview", path=path, value=value)
 
     def move(self, direction: str) -> None:
         keys = self.config["keys"]
@@ -396,7 +459,13 @@ class BowmanBot:
         self.keyboard.up(keys["left"])
         self.keyboard.up(keys["right"])
 
-    def face_and_attack(self, target_x: float, player_x: float, now: float) -> None:
+    def face_and_attack(
+        self,
+        target_x: float,
+        player_x: float,
+        now: float,
+        face_each_attack: bool = True,
+    ) -> None:
         behavior = self.config["behavior"]
         keys = self.config["keys"]
         self.stop_move()
@@ -404,11 +473,12 @@ class BowmanBot:
         dead = float(behavior["attack_dead_zone"])
         if abs(target_x - player_x) <= dead and self.direction is not None:
             desired = self.direction
-        self.direction = desired
         self.state = f"ATTACK_{desired.upper()}"
         if now - self.last_attack >= float(behavior["attack_interval_seconds"]):
-            # 每一箭前都重新点按目标方向，避免内部方向状态与游戏实际朝向脱节。
-            self.keyboard.tap(keys[desired], float(behavior["face_tap_seconds"]))
+            # 动态策略每次攻击都校准朝向；原地策略只在换边时点按，避免连续攻击造成漂移。
+            if face_each_attack or self.direction != desired:
+                self.keyboard.tap(keys[desired], float(behavior["face_tap_seconds"]))
+                self.direction = desired
             self.keyboard.tap(keys["attack"])
             self.last_attack = now
             self.log.write(
@@ -498,46 +568,46 @@ class BowmanBot:
             self.state = "MP_POTION"
             self.log.write("mp_potion", fill=round(mp, 3))
             return
-        if player_box is None:
-            self.stop_move()
-            self.state = "PLAYER_SCREEN_LOST"
-            return
-        if target_box is not None:
+        decision = self.strategy.decide(
+            StrategyActionContext(
+                marker=marker,
+                player_box=player_box,
+                player_anchor=self.last_attack_anchor,
+                target_box=target_box,
+                chase_box=chase_box,
+                combat_width=combat_width,
+                has_monster_candidates=has_monster_candidates,
+                now=now,
+                last_target_seen=self.last_target_seen,
+                last_pickup=self.last_pickup,
+                direction=self.direction,
+                behavior=behavior,
+                settings=strategy_settings(self.config),
+                recognition=self.config["recognition"],
+            )
+        )
+        if decision.target_seen:
             self.last_target_seen = now
-            target_x = (target_box[0] + target_box[2] / 2) / max(1, combat_width)
-            player_x = (player_box[0] + player_box[2] / 2) / max(1, combat_width)
-            self.face_and_attack(target_x, player_x, now)
-            return
-        if chase_box is not None:
-            self.last_target_seen = now
-            target_x = (chase_box[0] + chase_box[2] / 2) / max(1, combat_width)
-            player_x = (player_box[0] + player_box[2] / 2) / max(1, combat_width)
-            self.chase_target(target_x, player_x)
-            return
-        if has_monster_candidates:
+        if decision.action == "attack":
+            self.face_and_attack(
+                float(decision.target_x),
+                float(decision.player_x),
+                now,
+                face_each_attack=decision.face_each_attack,
+            )
+        elif decision.action == "chase":
+            self.chase_target(float(decision.target_x), float(decision.player_x))
+        elif decision.action == "move":
+            self.move(str(decision.direction))
+            self.state = decision.state
+        elif decision.action == "pickup":
             self.stop_move()
-            self.state = "TARGET_OUT_OF_RANGE"
-            return
-        target_lost_for = now - self.last_target_seen
-        if bool(behavior["pickup_after_target_lost"]) and 0.25 < target_lost_for < 0.8 and now - self.last_pickup > 1.0:
             self.keyboard.tap(keys["pickup"])
             self.last_pickup = now
-            self.state = "PICKUP"
-            return
-        if not bool(behavior["fallback_patrol"]) or target_lost_for < float(behavior["target_lost_patrol_delay_seconds"]):
+            self.state = decision.state
+        else:
             self.stop_move()
-            self.state = "SCANNING"
-            return
-        if marker is None:
-            self.stop_move()
-            self.state = "MARKER_LOST"
-            return
-        x = marker[0]
-        if x <= float(behavior["patrol_left"]):
-            self.direction = "right"
-        elif x >= float(behavior["patrol_right"]):
-            self.direction = "left"
-        self.move(self.direction or "right")
+            self.state = decision.state
 
     def run(self, overlay: RuntimeOverlay) -> None:
         window = find_game_window(self.config)
@@ -800,28 +870,36 @@ class BowmanBot:
                         else source_scores.get(player_source, -1.0)
                     )
 
-                    attack_box = attack_box_from_config(self.config["behavior"])
                     player_raw_box = active_player_anchor.raw_box if active_player_anchor is not None else None
-                    facing = self.direction or "right"
-                    target = choose_nearest_target(
-                        monsters,
-                        player_box,
-                        combat_img.shape[1],
-                        combat_img.shape[0],
-                        attack_box,
-                        facing=facing,
-                        raw_box=player_raw_box,
+                    instant_attack_anchor = (
+                        player_attack_anchor(player_box, player_raw_box)
+                        if player_box is not None
+                        else None
                     )
-                    chase_target = None
-                    if target is None:
-                        chase_target = choose_nearest_same_level_target(
-                            monsters,
-                            player_box,
-                            combat_img.shape[1],
-                            combat_img.shape[0],
-                            attack_box,
-                            raw_box=player_raw_box,
+                    self.last_attack_anchor = smooth_player_attack_anchor(
+                        self.last_attack_anchor,
+                        instant_attack_anchor,
+                        float(vision.get("player_anchor_smoothing_alpha", 0.25)),
+                        float(vision.get("player_anchor_smoothing_snap", 0.08))
+                        * max(combat_img.shape[1], combat_img.shape[0]),
+                    )
+                    facing = self.direction or "right"
+                    target_selection = self.strategy.select_targets(
+                        TargetSelectionContext(
+                            detections=monsters,
+                            player_box=player_box,
+                            player_raw_box=player_raw_box,
+                            player_anchor=self.last_attack_anchor,
+                            scene_width=combat_img.shape[1],
+                            scene_height=combat_img.shape[0],
+                            facing=facing,
+                            target_area=self.config["targeting"]["box"],
+                            settings=strategy_settings(self.config),
                         )
+                    )
+                    target = target_selection.target
+                    chase_target = target_selection.chase_target
+                    attack_box = self.config["targeting"]["box"]
                     box = target.box if target is not None else None
                     chase_box = chase_target.box if chase_target is not None else None
                     selected_target = target if target is not None else chase_target
@@ -871,22 +949,26 @@ class BowmanBot:
                         raw_player_box = active_player_anchor.raw_box if active_player_anchor is not None else player_box
                         rx, ry, rw, rh = raw_player_box
                         player_screen_box = (combat_rect[0] + rx, combat_rect[1] + ry, rw, rh)
-                        center_x, center_y = player_anchor_center(player_box, raw_player_box)
-                        range_left, range_top, range_right, range_bottom = _ordered_rect(
-                            *attack_rect_from_player(
-                                (center_x, center_y),
-                                combat_img.shape[1],
-                                combat_img.shape[0],
-                                attack_box,
-                                facing,
+                        center_x, center_y = self.last_attack_anchor or player_attack_anchor(
+                            player_box,
+                            raw_player_box,
+                        )
+                        if attack_box is not None:
+                            range_left, range_top, range_right, range_bottom = _ordered_rect(
+                                *attack_rect_from_player(
+                                    (center_x, center_y),
+                                    combat_img.shape[1],
+                                    combat_img.shape[0],
+                                    attack_box,
+                                    facing,
+                                )
                             )
-                        )
-                        attack_range_box = (
-                            combat_rect[0] + int(round(range_left)),
-                            combat_rect[1] + int(round(range_top)),
-                            int(round(range_right - range_left)),
-                            int(round(range_bottom - range_top)),
-                        )
+                            attack_range_box = (
+                                combat_rect[0] + int(round(range_left)),
+                                combat_rect[1] + int(round(range_top)),
+                                int(round(range_right - range_left)),
+                                int(round(range_bottom - range_top)),
+                            )
                     state_label = STATE_LABELS.get(self.state, self.state)
                     if not self.player_templates:
                         banner = "缺少玩家姓名板模板｜请在控制面板采集姓名板"
@@ -924,6 +1006,7 @@ class BowmanBot:
                             "player_score": active_player_score,
                             "player_source": player_source,
                             "attack_range_box": attack_range_box,
+                            "attack_range_label": "有效索敌区",
                             "monster_boxes": monster_boxes,
                             "monster_box": monster_box,
                             "chase_box": chase_screen_box,

@@ -13,16 +13,18 @@ from PIL import Image, ImageTk
 from mbv.bot import STATE_LABELS, BowmanBot
 from mbv.calibrate import (
     calibrate,
-    capture_attack_range,
+    capture_target_range,
     capture_key_name,
     capture_monster_filter,
     capture_player_aux_template,
     capture_player_template,
+    capture_recognition_region,
     capture_template,
 )
 from mbv.config import load_config, save_config, template_counts
 from mbv.input import input_delivery, vk_for
 from mbv.overlay import RuntimeOverlay, _exclude_from_capture, _top_level_hwnd, prevent_window_activate
+from mbv.strategies import active_strategy, get_strategy, list_strategies
 from mbv.template_store import (
     UNCATEGORIZED_LABEL,
     create_monster_category,
@@ -58,6 +60,20 @@ def template_preview_image(path: Path, max_size: tuple[int, int] = (280, 260)) -
     return background.convert("RGB")
 
 
+def adjusted_numeric_text(
+    raw: str,
+    delta: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> str:
+    value = float(raw.strip()) + float(delta)
+    if minimum is not None:
+        value = max(float(minimum), value)
+    if maximum is not None:
+        value = min(float(maximum), value)
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
 def is_elevated() -> bool:
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
@@ -88,6 +104,9 @@ class ControlPanel:
         self.overlay.set_exit_handler(self.quit)
         self.worker_errors: list[BaseException] = []
         self.busy = False
+        self._loading_settings = True
+        self._autosave_after_id: str | None = None
+        self._autosave_reconfigure = False
 
         self.status = tk.StringVar(value="正在连接游戏窗口…")
         self.counts = tk.StringVar(value="")
@@ -100,11 +119,18 @@ class ControlPanel:
         self.delivery = tk.BooleanVar(value=input_delivery(config) == "background")
         self.fallback_patrol = tk.BooleanVar(value=bool(config["behavior"].get("fallback_patrol")))
         self.pickup_lost = tk.BooleanVar(value=bool(config["behavior"].get("pickup_after_target_lost")))
+        selected_strategy = active_strategy(config)
+        self.strategy_name = tk.StringVar(value=selected_strategy.display_name)
+        self.strategy_description = tk.StringVar(value=selected_strategy.description)
+        self._strategy_lookup = {item.display_name: item.key for item in list_strategies()}
         self._entries: dict[str, tk.Entry] = {}
+        self._targeting_entries: dict[str, tk.Entry] = {}
+        self._strategy_entries: dict[str, tk.Entry] = {}
 
         self._build()
         self._refresh_counts()
         self._load_entries(config)
+        self._loading_settings = False
 
         self.worker = threading.Thread(target=self._run_bot, name="MapleVisionWorker", daemon=False)
         self.worker.start()
@@ -174,7 +200,8 @@ class ControlPanel:
 
         self._section("采集")
         capture = self._last_body
-        self._row_button(capture, "画面校准", self._calibrate)
+        self._row_button(capture, "校准状态栏与小地图", self._calibrate)
+        self._row_button(capture, "采集识别区域与平台中心", self._capture_recognition_region)
         category_row = tk.Frame(capture, bg=PANEL)
         category_row.pack(fill="x", padx=8, pady=(5, 2))
         tk.Label(
@@ -255,6 +282,7 @@ class ControlPanel:
             run,
             text="后台按键（始终扫描码；面板不抢游戏焦点）",
             variable=self.delivery,
+            command=lambda: self._schedule_settings_save(reconfigure=True),
             bg=PANEL,
             fg=FG,
             selectcolor=ENTRY_BG,
@@ -266,29 +294,107 @@ class ControlPanel:
 
         self._section("挂机配置")
         settings = self._last_body
+        tk.Label(
+            settings,
+            text="通用索敌区",
+            bg=PANEL,
+            fg=FG,
+            font=FONT_SECTION,
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=(3, 2))
+        for path, label in (
+            ("box.forward", "索敌区前方"),
+            ("box.back", "索敌区后方"),
+            ("box.up", "索敌区上方"),
+            ("box.down", "索敌区下方"),
+        ):
+            self._labeled_entry(
+                settings,
+                f"targeting.{path}",
+                label,
+                entries=self._targeting_entries,
+                adjust_step=0.01,
+                minimum=0.0,
+                maximum=1.0,
+                on_adjust=lambda text, field_path=path: self._preview_targeting_setting(field_path, text),
+            )
+        self.capture_target_area_button = self._row_button(
+            settings,
+            "框选通用索敌范围",
+            self._capture_target_range,
+        )
+        tk.Label(
+            settings,
+            text="职业策略",
+            bg=PANEL,
+            fg=FG,
+            font=FONT_SECTION,
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=(8, 2))
+        strategy_row = tk.Frame(settings, bg=PANEL)
+        strategy_row.pack(fill="x", padx=8, pady=(3, 2))
+        tk.Label(
+            strategy_row,
+            text="职业策略",
+            bg=PANEL,
+            fg=MUTED,
+            font=FONT_SMALL,
+            width=18,
+            anchor="w",
+        ).pack(side="left")
+        self.strategy_combo = ttk.Combobox(
+            strategy_row,
+            textvariable=self.strategy_name,
+            state="readonly",
+            values=list(self._strategy_lookup),
+            font=FONT,
+        )
+        self.strategy_combo.pack(side="left", fill="x", expand=True)
+        self.strategy_combo.bind("<<ComboboxSelected>>", self._strategy_changed)
+        tk.Label(
+            settings,
+            textvariable=self.strategy_description,
+            bg=PANEL,
+            fg=MUTED,
+            font=FONT_SMALL,
+            wraplength=330,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=(2, 5))
+        self.strategy_settings_body = tk.Frame(settings, bg=PANEL)
+        self.strategy_settings_body.pack(fill="x")
         fields = [
-            ("keys.attack", "攻击键"),
-            ("keys.pickup", "拾取键"),
-            ("keys.hp_potion", "HP 药键"),
-            ("keys.mp_potion", "MP 药键"),
-            ("behavior.bow_attack_box.forward", "攻击区前方"),
-            ("behavior.bow_attack_box.back", "攻击区后方"),
-            ("behavior.bow_attack_box.up", "攻击区上方"),
-            ("behavior.bow_attack_box.down", "攻击区下方"),
-            ("behavior.attack_interval_seconds", "攻击间隔秒"),
-            ("behavior.max_runtime_minutes", "最长运行分钟，0=不限"),
-            ("vision.monster_template_threshold", "怪物识别阈值"),
-            ("vision.monster_filter_threshold", "过滤项识别阈值"),
+            ("keys.attack", "攻击键", None, None, None),
+            ("keys.pickup", "拾取键", None, None, None),
+            ("keys.hp_potion", "HP 药键", None, None, None),
+            ("keys.mp_potion", "MP 药键", None, None, None),
+            ("behavior.attack_interval_seconds", "攻击间隔秒", 0.01, 0.01, 10.0),
+            ("behavior.max_runtime_minutes", "最长运行分钟，0=不限", 1.0, 0.0, 10080.0),
+            ("vision.monster_template_threshold", "怪物识别阈值", 0.01, 0.0, 1.0),
+            ("vision.monster_filter_threshold", "过滤项识别阈值", 0.01, 0.0, 1.0),
         ]
-        for key, label in fields:
-            self._labeled_entry(settings, key, label, capture=key.startswith("keys."))
+        for key, label, step, minimum, maximum in fields:
+            self._labeled_entry(
+                settings,
+                key,
+                label,
+                capture=key.startswith("keys."),
+                adjust_step=step,
+                minimum=minimum,
+                maximum=maximum,
+                on_adjust=(
+                    None
+                    if step is None
+                    else lambda text, field_path=key: self._preview_common_setting(field_path, text)
+                ),
+            )
         self._threshold_control(settings, self.hp_threshold_percent, "HP 自动喝药阈值")
         self._threshold_control(settings, self.mp_threshold_percent, "MP 自动喝药阈值")
-        self._row_button(settings, "框选攻击范围", self._capture_attack_range)
         tk.Checkbutton(
             settings,
             text="没有目标时左右巡逻",
             variable=self.fallback_patrol,
+            command=self._schedule_settings_save,
             bg=PANEL,
             fg=FG,
             selectcolor=ENTRY_BG,
@@ -301,6 +407,7 @@ class ControlPanel:
             settings,
             text="目标丢失后拾取一次",
             variable=self.pickup_lost,
+            command=self._schedule_settings_save,
             bg=PANEL,
             fg=FG,
             selectcolor=ENTRY_BG,
@@ -314,7 +421,8 @@ class ControlPanel:
             self._content,
             text="F7 显隐 Debug 框｜F8 启动/暂停｜F9 或 Ctrl+Shift+Q 退出。采集时请把游戏露出来。"
             "按键点「采集」或点输入框后，在游戏画面上按下要绑定的键。"
-            "攻击范围可点「框选攻击范围」按角色中心和面向拖框，框多大就是攻击区多大。"
+            "先分别采集状态栏/小地图和识别区域/平台中心。策略说明及专属参数会随下拉选项切换。"
+            "通用索敌区供所有职业策略共享，可按角色位置和面向拖框。"
             "改完其它项后点「保存配置」。",
             bg=BG,
             fg=MUTED,
@@ -348,10 +456,29 @@ class ControlPanel:
         button.pack(fill="x", padx=8, pady=3, ipady=3)
         return button
 
-    def _labeled_entry(self, parent: tk.Misc, key: str, label: str, capture: bool = False) -> None:
+    def _labeled_entry(
+        self,
+        parent: tk.Misc,
+        key: str,
+        label: str,
+        capture: bool = False,
+        entries: dict[str, tk.Entry] | None = None,
+        adjust_step: float | None = None,
+        minimum: float | None = None,
+        maximum: float | None = None,
+        on_adjust: Callable[[str], None] | None = None,
+    ) -> None:
         row = tk.Frame(parent, bg=PANEL)
         row.pack(fill="x", padx=8, pady=2)
         tk.Label(row, text=label, bg=PANEL, fg=MUTED, font=FONT_SMALL, width=18, anchor="w").pack(side="left")
+        entry = tk.Entry(
+            row,
+            bg=ENTRY_BG,
+            fg=FG,
+            insertbackground=FG,
+            relief="flat",
+            font=FONT,
+        )
         if capture:
             tk.Button(
                 row,
@@ -366,18 +493,53 @@ class ControlPanel:
                 cursor="hand2",
                 width=6,
             ).pack(side="right", padx=(4, 0))
-        entry = tk.Entry(
-            row,
-            bg=ENTRY_BG,
-            fg=FG,
-            insertbackground=FG,
-            relief="flat",
-            font=FONT,
-        )
+        if adjust_step is not None:
+            def adjust(delta: float) -> None:
+                previous = entry.get()
+                try:
+                    text = adjusted_numeric_text(previous, delta, minimum, maximum)
+                except ValueError:
+                    messagebox.showerror("参数格式错误", f"“{label}”不是有效数字", parent=self.root)
+                    return
+                try:
+                    if on_adjust is not None:
+                        on_adjust(text)
+                except Exception as exc:
+                    messagebox.showerror("保存策略参数失败", str(exc), parent=self.root)
+                    return
+                entry.delete(0, "end")
+                entry.insert(0, text)
+
+            tk.Button(
+                row,
+                text="+",
+                command=lambda: adjust(float(adjust_step)),
+                bg=BUTTON_BG,
+                fg=FG,
+                activebackground=BUTTON_ACTIVE,
+                activeforeground=FG,
+                relief="flat",
+                font=FONT_SMALL,
+                takefocus=False,
+                width=3,
+            ).pack(side="right", padx=(2, 0))
+            tk.Button(
+                row,
+                text="−",
+                command=lambda: adjust(-float(adjust_step)),
+                bg=BUTTON_BG,
+                fg=FG,
+                activebackground=BUTTON_ACTIVE,
+                activeforeground=FG,
+                relief="flat",
+                font=FONT_SMALL,
+                takefocus=False,
+                width=3,
+            ).pack(side="right", padx=(4, 0))
         entry.pack(side="left", fill="x", expand=True, ipady=3)
         if capture:
             entry.bind("<Button-1>", lambda _event: self._capture_key(key))
-        self._entries[key] = entry
+        (self._entries if entries is None else entries)[key] = entry
 
     def _threshold_control(self, parent: tk.Misc, variable: tk.IntVar, label: str) -> None:
         wrap = tk.Frame(parent, bg=PANEL)
@@ -390,6 +552,7 @@ class ControlPanel:
 
         def refresh(*_args: Any) -> None:
             value_label.configure(text=f"{int(variable.get())}%")
+            self._schedule_settings_save()
 
         def adjust(delta: int) -> None:
             variable.set(max(0, min(100, int(variable.get()) + delta)))
@@ -454,24 +617,131 @@ class ControlPanel:
         return value
 
     def _load_entries(self, config: dict[str, Any]) -> None:
-        for key, entry in self._entries.items():
-            value = self._nested(config, key)
-            entry.delete(0, "end")
-            entry.insert(0, str(value))
-        self.delivery.set(input_delivery(config) == "background")
-        self.hp_threshold_percent.set(int(round(float(config["behavior"]["hp_threshold"]) * 100)))
-        self.mp_threshold_percent.set(int(round(float(config["behavior"]["mp_threshold"]) * 100)))
-        self.fallback_patrol.set(bool(config["behavior"].get("fallback_patrol")))
-        self.pickup_lost.set(bool(config["behavior"].get("pickup_after_target_lost")))
+        previous_loading = self._loading_settings
+        self._loading_settings = True
+        try:
+            strategy = active_strategy(config)
+            self.strategy_name.set(strategy.display_name)
+            self._render_strategy_settings(config)
+            for key, entry in self._entries.items():
+                value = self._nested(config, key)
+                entry.delete(0, "end")
+                entry.insert(0, str(value))
+            for key, entry in self._strategy_entries.items():
+                value = self._nested(config, key)
+                entry.delete(0, "end")
+                entry.insert(0, str(value))
+            for key, entry in self._targeting_entries.items():
+                value = self._nested(config, key)
+                entry.delete(0, "end")
+                entry.insert(0, str(value))
+            self.delivery.set(input_delivery(config) == "background")
+            self.hp_threshold_percent.set(int(round(float(config["behavior"]["hp_threshold"]) * 100)))
+            self.mp_threshold_percent.set(int(round(float(config["behavior"]["mp_threshold"]) * 100)))
+            self.fallback_patrol.set(bool(config["behavior"].get("fallback_patrol")))
+            self.pickup_lost.set(bool(config["behavior"].get("pickup_after_target_lost")))
+        finally:
+            self._loading_settings = previous_loading
+
+    def _selected_strategy(self):
+        key = self._strategy_lookup.get(self.strategy_name.get())
+        if key is None:
+            raise RuntimeError("请选择职业策略")
+        return get_strategy(key)
+
+    def _render_strategy_settings(self, config: dict[str, Any]) -> None:
+        for child in self.strategy_settings_body.winfo_children():
+            child.destroy()
+        self._strategy_entries.clear()
+        strategy = self._selected_strategy()
+        self.strategy_description.set(strategy.description)
+        prefix = f"strategy.options.{strategy.key}."
+        for field in strategy.setting_fields:
+            self._labeled_entry(
+                self.strategy_settings_body,
+                prefix + field.path,
+                field.label,
+                entries=self._strategy_entries,
+                adjust_step=field.step,
+                minimum=field.minimum,
+                maximum=field.maximum,
+                on_adjust=lambda text, path=field.path: self._preview_strategy_setting(path, text),
+            )
+
+    def _strategy_changed(self, _event: tk.Event | None = None) -> None:
+        try:
+            config = load_config(self.config_path)
+            strategy = self._selected_strategy()
+            config["strategy"]["active"] = strategy.key
+            save_config(self.config_path, config)
+            self.bot.apply_config(config)
+            self._render_strategy_settings(config)
+            for key, entry in self._strategy_entries.items():
+                entry.delete(0, "end")
+                entry.insert(0, str(self._nested(config, key)))
+        except Exception as exc:
+            messagebox.showerror("切换职业策略失败", str(exc), parent=self.root)
+
+    def _preview_strategy_setting(self, path: str, text: str) -> None:
+        strategy = self._selected_strategy()
+        value = float(text)
+        config = load_config(self.config_path)
+        self._nested(config, f"strategy.options.{strategy.key}.{path}", value)
+        # 微调按钮是无焦点控件；每次点击直接持久化，避免用户重启后丢失。
+        save_config(self.config_path, config)
+        if strategy.key == self.bot.strategy.key:
+            self.bot.preview_strategy_setting(path, value)
+
+    def _preview_targeting_setting(self, path: str, text: str) -> None:
+        value = float(text)
+        config = load_config(self.config_path)
+        self._nested(config, f"targeting.{path}", value)
+        save_config(self.config_path, config)
+        self.bot.preview_targeting_setting(path, value)
+
+    def _preview_common_setting(self, path: str, text: str) -> None:
+        config = load_config(self.config_path)
+        current = self._nested(config, path)
+        value: Any = float(text)
+        if isinstance(current, int) and path.endswith("minutes"):
+            value = int(float(text))
+        self._nested(config, path, value)
+        save_config(self.config_path, config)
+        self.bot.preview_config_setting(path, value)
+
+    def _schedule_settings_save(self, reconfigure: bool = False) -> None:
+        if self._loading_settings:
+            return
+        self._autosave_reconfigure = self._autosave_reconfigure or bool(reconfigure)
+        if self._autosave_after_id is not None:
+            try:
+                self.root.after_cancel(self._autosave_after_id)
+            except tk.TclError:
+                pass
+        self._autosave_after_id = self.root.after(
+            180,
+            self._run_scheduled_settings_save,
+        )
+
+    def _run_scheduled_settings_save(self) -> None:
+        reconfigure = self._autosave_reconfigure
+        self._autosave_after_id = None
+        self._autosave_reconfigure = False
+        self._persist_settings(apply_runtime=reconfigure, notify=False, show_error=True)
 
     def _refresh_counts(self) -> None:
         selected_category = self._refresh_monster_categories()
         if selected_category != self.bot.active_monster_category:
             self._activate_monster_category(selected_category, notify=False)
         counts = template_counts()
-        calibrated = "已校准" if load_config(self.config_path).get("calibrated") else "未校准"
+        config = load_config(self.config_path)
+        calibration = config.get("calibration", {})
+        status_ready = "状态区✓" if calibration.get("status_regions_complete") else "状态区待采"
+        recognition_ready = "识别区✓" if calibration.get("recognition_region_complete") else "识别区待采"
+        center_ready = "平台中心✓" if config["recognition"].get("platform_center_captured") else "平台中心默认值"
         self.counts.set(
-            f"{calibrated}｜怪物 {counts['monster']}（{counts['category']} 类）｜过滤 {counts['filter']}｜"
+            f"{status_ready}｜{recognition_ready}｜{center_ready}｜怪物 {counts['monster']}（{counts['category']} 类）｜"
+            f"过滤 {counts['filter']}｜"
             f"姓名板 {counts['player']}｜"
             f"头部 {counts['head']}｜称号 {counts['title']}"
         )
@@ -889,7 +1159,13 @@ class ControlPanel:
             self.busy = False
 
     def _calibrate(self) -> None:
-        self._run_tool("画面校准", lambda: calibrate(self.config_path, parent=self.root))
+        self._run_tool("状态栏与小地图校准", lambda: calibrate(self.config_path, parent=self.root))
+
+    def _capture_recognition_region(self) -> None:
+        self._run_tool(
+            "识别区域与平台中心采集",
+            lambda: capture_recognition_region(self.config_path, parent=self.root),
+        )
 
     def _capture(self, kind: str) -> None:
         if kind == "monster":
@@ -921,22 +1197,26 @@ class ControlPanel:
 
         self._run_tool("按键采集", action)
 
-    def _capture_attack_range(self) -> None:
+    def _capture_target_range(self) -> None:
         player_box = None
         raw_box = None
         anchor = self.bot.last_player_anchor
         if anchor is not None:
             player_box = anchor.box
             raw_box = anchor.raw_box
-        self._run_tool(
-            "攻击范围框选",
-            lambda: capture_attack_range(
+        def action() -> None:
+            capture_target_range(
                 self.config_path,
                 parent=self.root,
                 player_box=player_box,
                 raw_box=raw_box,
+                player_anchor=self.bot.last_attack_anchor,
                 facing=self.bot.direction,
-            ),
+            )
+
+        self._run_tool(
+            "通用索敌范围框选",
+            action,
         )
 
     def _toggle_arm(self) -> None:
@@ -964,7 +1244,23 @@ class ControlPanel:
         self.bot.set_calibration_overlay_visible(bool(self.debug_boxes.get()))
 
     def _save_settings(self) -> None:
+        self._persist_settings(apply_runtime=True, notify=True, show_error=True)
+
+    def _persist_settings(
+        self,
+        *,
+        apply_runtime: bool,
+        notify: bool,
+        show_error: bool,
+    ) -> bool:
         try:
+            if self._autosave_after_id is not None:
+                try:
+                    self.root.after_cancel(self._autosave_after_id)
+                except tk.TclError:
+                    pass
+                self._autosave_after_id = None
+                self._autosave_reconfigure = False
             config = load_config(self.config_path)
             for key, entry in self._entries.items():
                 raw = entry.get().strip()
@@ -978,6 +1274,18 @@ class ControlPanel:
                     if key.startswith("keys."):
                         vk_for(value)
                 self._nested(config, key, value)
+            strategy = self._selected_strategy()
+            config["strategy"]["active"] = strategy.key
+            for key, entry in self._strategy_entries.items():
+                raw = entry.get().strip()
+                current = self._nested(config, key)
+                value = float(raw) if isinstance(current, (int, float)) and not isinstance(current, bool) else raw
+                self._nested(config, key, value)
+            for key, entry in self._targeting_entries.items():
+                raw = entry.get().strip()
+                current = self._nested(config, key)
+                value = float(raw) if isinstance(current, (int, float)) and not isinstance(current, bool) else raw
+                self._nested(config, key, value)
             config.setdefault("input", {})
             config["input"]["delivery"] = "background" if self.delivery.get() else "foreground"
             config["behavior"]["fallback_patrol"] = bool(self.fallback_patrol.get())
@@ -986,17 +1294,34 @@ class ControlPanel:
             config["behavior"]["mp_threshold"] = max(0, min(100, int(self.mp_threshold_percent.get()))) / 100.0
             input_delivery(config)
             save_config(self.config_path, config)
-            self.bot.apply_config(config)
-            self.bot.notify("配置已保存", 3.0)
+            if apply_runtime:
+                self.bot.apply_config(config)
+            else:
+                # 常规参数可无停机刷新；输入投递切换由 apply_runtime 路径重建键盘。
+                for key in (
+                    "behavior.hp_threshold",
+                    "behavior.mp_threshold",
+                    "behavior.fallback_patrol",
+                    "behavior.pickup_after_target_lost",
+                ):
+                    self.bot.preview_config_setting(key, self._nested(config, key))
+            if notify:
+                self.bot.notify("配置已保存", 3.0)
+            return True
         except Exception as exc:
-            messagebox.showerror("冒险岛弓箭手", f"保存失败：{exc}")
+            if show_error:
+                messagebox.showerror("冒险岛弓箭手", f"保存失败：{exc}")
+            return False
 
     def quit(self) -> None:
+        if not self._persist_settings(apply_runtime=False, notify=False, show_error=True):
+            return
         self.bot.request_exit()
         self.overlay.close()
         self.root.after(200, self._destroy)
 
     def _destroy(self) -> None:
+        self._persist_settings(apply_runtime=False, notify=False, show_error=False)
         try:
             self.root.destroy()
         except tk.TclError:
