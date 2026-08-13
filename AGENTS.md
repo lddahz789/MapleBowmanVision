@@ -67,6 +67,7 @@ assets/{monsters,player,player_head,player_title}/
 ## 关键行为细节
 
 - **校准 UI**：框选和点色只用 `interactive_overlay`，不要加回 `cv2.imshow` / OpenCV 鼠标回调。
+- **同帧检测复用**：`BowmanBot.run` 每帧建一个 `SceneFeatures`，四路 `find_detections` 共用；模板特征按缩放比例缓存在 `Template` 上。新增检测请传同一个 `SceneFeatures`，不要重复传原始帧。
 - **冻结帧采集**：`capture_frozen_selection` 先截图，把帧传给 `interactive_overlay(..., frozen_frame=)`，裁切同一帧。不要改回「先框再截第二张图」。
 - **攻击框**：`bow_attack_box.{forward,back,up,down}` 是相对角色中心、占战斗区宽高的比例，随 `bot.direction` 左右翻转。不要再做成 `max(左,右)` 对称修正。旧配置只有 `bow_attack_range` / `bow_vertical_tolerance` 时，`attack_box_from_config` 会合成对称框。
 - **F7**：`BowmanBot.toggle_calibration_overlay`；HUD 用 `overlay_draw_plan`。与采集时 `overlay.hide()` 独立。

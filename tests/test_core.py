@@ -69,6 +69,30 @@ class CoreTests(unittest.TestCase):
         self.assertGreaterEqual(score, 0.99)
         self.assertEqual(name, "test.png")
 
+    def test_scene_features_cache_matches_direct_detection(self):
+        from mbv.vision import SceneFeatures
+
+        rng = np.random.default_rng(23)
+        template_image = rng.integers(0, 256, (16, 12, 3), dtype=np.uint8)
+        scene = np.zeros((120, 200, 3), dtype=np.uint8)
+        scene[40:56, 60:72] = template_image
+        template = bot.Template("cache.png", template_image)
+
+        direct, direct_score, _ = bot.find_detections(scene, [template], 0.9, 1.0, structure_weight=0.4)
+        shared = SceneFeatures(scene)
+        first, first_score, _ = bot.find_detections(shared, [template], 0.9, 1.0, structure_weight=0.4)
+        second, second_score, _ = bot.find_detections(shared, [template], 0.9, 1.0, structure_weight=0.4)
+        self.assertEqual([item.box for item in direct], [item.box for item in first])
+        self.assertEqual([item.box for item in first], [item.box for item in second])
+        self.assertAlmostEqual(direct_score, first_score, places=6)
+        self.assertAlmostEqual(first_score, second_score, places=6)
+        self.assertTrue(direct)
+
+        scaled_direct, scaled_score, _ = bot.find_detections(scene, [template], 0.7, 0.5, structure_weight=0.35)
+        scaled_shared, shared_score, _ = bot.find_detections(shared, [template], 0.7, 0.5, structure_weight=0.35)
+        self.assertEqual([item.box for item in scaled_direct], [item.box for item in scaled_shared])
+        self.assertAlmostEqual(scaled_score, shared_score, places=6)
+
     def test_multiple_template_detections(self):
         rng = np.random.default_rng(11)
         template_image = rng.integers(0, 256, (14, 12, 3), dtype=np.uint8)

@@ -14,6 +14,7 @@ from mbv.input import Keyboard, input_delivery, key_is_down, rising_edge
 from mbv.overlay import RuntimeOverlay
 from mbv.paths import PLAYER_ASSET_DIR, PLAYER_HEAD_ASSET_DIR, PLAYER_TITLE_ASSET_DIR
 from mbv.vision import (
+    SceneFeatures,
     _ordered_rect,
     attack_box_from_config,
     attack_rect_from_player,
@@ -509,8 +510,10 @@ class BowmanBot:
                     if marker is not None:
                         self.marker = marker
                         self.marker_last_seen = now
+                    # 四路模板检测共用同一份场景特征，避免每帧重复缩放、颜色转换和 Canny。
+                    scene = SceneFeatures(combat_img)
                     detected_monsters, detected_score, detected_name = find_detections(
-                        combat_img,
+                        scene,
                         self.templates,
                         float(vision["monster_template_threshold"]),
                         float(vision.get("monster_detection_scale", 1.0)),
@@ -528,7 +531,7 @@ class BowmanBot:
                         monsters = detected_monsters
 
                     player_detections, player_score, _player_template_name = find_detections(
-                        combat_img,
+                        scene,
                         self.player_templates,
                         float(vision.get("player_template_threshold", 0.76)),
                         float(vision.get("player_detection_scale", 0.5)),
@@ -538,7 +541,7 @@ class BowmanBot:
                         structure_weight=0.55,
                     )
                     head_detections, head_score, _head_template_name = find_detections(
-                        combat_img,
+                        scene,
                         self.player_head_templates,
                         float(vision.get("player_head_threshold", 0.76)),
                         float(vision.get("player_detection_scale", 0.5)),
@@ -548,7 +551,7 @@ class BowmanBot:
                         structure_weight=0.35,
                     )
                     title_detections, title_score, _title_template_name = find_detections(
-                        combat_img,
+                        scene,
                         self.player_title_templates,
                         float(vision.get("player_title_threshold", 0.70)),
                         float(vision.get("player_detection_scale", 0.5)),

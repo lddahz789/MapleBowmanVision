@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -88,6 +88,31 @@ class Template:
     name: str
     image: np.ndarray
     foreground_mask: np.ndarray | None = None
+    _feature_cache: dict[float, tuple[np.ndarray, np.ndarray, np.ndarray]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    _edge_cache: dict[float, np.ndarray] = field(default_factory=dict, repr=False, compare=False)
+
+    def scaled_features(self, scale: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """模板是静态的：按缩放比例缓存 (图像, 前景蒙版, 颜色对立通道)。"""
+        cached = self._feature_cache.get(scale)
+        if cached is None:
+            image = self.image
+            mask = self.foreground_mask if self.foreground_mask is not None else template_foreground_mask(image)
+            if scale < 0.999:
+                image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+            cached = (image, mask, opponent_colors(image))
+            self._feature_cache[scale] = cached
+        return cached
+
+    def scaled_edges(self, scale: float) -> np.ndarray:
+        edges = self._edge_cache.get(scale)
+        if edges is None:
+            image, _mask, _opponent = self.scaled_features(scale)
+            edges = cv2.Canny(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), 55, 140)
+            self._edge_cache[scale] = edges
+        return edges
 
 
 @dataclass(frozen=True)
@@ -145,6 +170,40 @@ def load_templates(directory: Path = ASSET_DIR) -> list[Template]:
     return templates
 
 
+class SceneFeatures:
+    """同一帧的场景特征按缩放比例缓存，供多组模板检测复用，避免重复 resize / 颜色转换 / Canny。"""
+
+    def __init__(self, scene: np.ndarray) -> None:
+        self.scene = scene
+        self._scaled: dict[float, np.ndarray] = {}
+        self._opponent: dict[float, np.ndarray] = {}
+        self._edges: dict[float, np.ndarray] = {}
+
+    def scaled(self, scale: float) -> np.ndarray:
+        cached = self._scaled.get(scale)
+        if cached is None:
+            if scale < 0.999:
+                cached = cv2.resize(self.scene, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            else:
+                cached = self.scene
+            self._scaled[scale] = cached
+        return cached
+
+    def opponent(self, scale: float) -> np.ndarray:
+        cached = self._opponent.get(scale)
+        if cached is None:
+            cached = opponent_colors(self.scaled(scale))
+            self._opponent[scale] = cached
+        return cached
+
+    def edges(self, scale: float) -> np.ndarray:
+        cached = self._edges.get(scale)
+        if cached is None:
+            cached = cv2.Canny(cv2.cvtColor(self.scaled(scale), cv2.COLOR_BGR2GRAY), 55, 140)
+            self._edges[scale] = cached
+        return cached
+
+
 def box_iou(first: tuple[int, int, int, int], second: tuple[int, int, int, int]) -> float:
     ax, ay, aw, ah = first
     bx, by, bw, bh = second
@@ -160,7 +219,7 @@ def box_iou(first: tuple[int, int, int, int], second: tuple[int, int, int, int])
 
 
 def find_detections(
-    scene: np.ndarray,
+    scene: np.ndarray | SceneFeatures,
     templates: list[Template],
     threshold: float,
     detection_scale: float = 1.0,
@@ -169,31 +228,24 @@ def find_detections(
     max_detections: int = 24,
     structure_weight: float = 0.0,
 ) -> tuple[list[Detection], float, str | None]:
-    """返回画面中的全部模板目标，并通过 NMS 合并同一目标的重复框。"""
+    """返回画面中的全部模板目标，并通过 NMS 合并同一目标的重复框。
+
+    scene 可传 SceneFeatures，让同一帧的多组检测（怪物、姓名板、头部、称号）复用场景特征。
+    """
+    features = scene if isinstance(scene, SceneFeatures) else SceneFeatures(scene)
     scale = max(0.4, min(1.0, float(detection_scale)))
-    source = scene
-    if scale < 0.999:
-        source = cv2.resize(scene, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    source_opponent = opponent_colors(source)
+    source = features.scaled(scale)
+    source_opponent = features.opponent(scale)
     structure_weight = max(0.0, min(0.9, float(structure_weight)))
-    source_edges = None
-    if structure_weight > 0:
-        source_edges = cv2.Canny(cv2.cvtColor(source, cv2.COLOR_BGR2GRAY), 55, 140)
+    source_edges = features.edges(scale) if structure_weight > 0 else None
     best_score = -1.0
     best_name = None
     candidates: list[Detection] = []
     for template in templates:
-        image = template.image
-        mask = template.foreground_mask
-        if mask is None:
-            mask = template_foreground_mask(image)
-        if scale < 0.999:
-            image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-            mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+        image, mask, template_opponent = template.scaled_features(scale)
         th, tw = image.shape[:2]
         if th > source.shape[0] or tw > source.shape[1] or th < 4 or tw < 4:
             continue
-        template_opponent = opponent_colors(image)
         color_result = cv2.matchTemplate(
             source_opponent,
             template_opponent,
@@ -201,17 +253,16 @@ def find_detections(
             mask=mask,
         )
         if structure_weight > 0 and source_edges is not None:
-            template_edges = cv2.Canny(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), 55, 140)
             edge_result = cv2.matchTemplate(
                 source_edges,
-                template_edges,
+                template.scaled_edges(scale),
                 cv2.TM_CCORR_NORMED,
                 mask=mask,
             )
             result = color_result * (1.0 - structure_weight) + edge_result * structure_weight
         else:
             result = color_result
-        result = np.nan_to_num(result, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        result = np.nan_to_num(result, copy=False, nan=-1.0, posinf=-1.0, neginf=-1.0)
         _min_value, max_value, _min_pos, max_pos = cv2.minMaxLoc(result)
         if float(max_value) > best_score:
             best_score = float(max_value)

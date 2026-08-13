@@ -9,8 +9,21 @@ import tkinter as tk
 from tkinter import messagebox
 from typing import Any, Callable
 
-import maple_bowman as bot
+from mbv.bot import STATE_LABELS, BowmanBot
+from mbv.calibrate import (
+    calibrate,
+    capture_attack_range,
+    capture_key_name,
+    capture_player_aux_template,
+    capture_player_template,
+    capture_template,
+)
+from mbv.config import load_config, save_config, template_counts
+from mbv.input import input_delivery, vk_for
 from mbv.overlay import RuntimeOverlay, _exclude_from_capture, _top_level_hwnd, prevent_window_activate
+from mbv.paths import ROOT
+
+ENTRY_SCRIPT = ROOT / "maple_bowman.py"
 
 
 BG = "#1b1b1b"
@@ -36,7 +49,7 @@ def is_elevated() -> bool:
 
 
 def relaunch_elevated(config_path: Path) -> bool:
-    script = Path(bot.__file__).resolve()
+    script = ENTRY_SCRIPT.resolve()
     params = f'"{script}" --enable-input --config "{config_path}"'
     code = int(
         ctypes.windll.shell32.ShellExecuteW(
@@ -68,8 +81,8 @@ class ControlPanel:
         _exclude_from_capture(panel_hwnd)
         prevent_window_activate(panel_hwnd)
 
-        config = bot.load_config(config_path)
-        self.bot = bot.BowmanBot(config, input_authorized=enable_input)
+        config = load_config(config_path)
+        self.bot = BowmanBot(config, input_authorized=enable_input)
         self.overlay = RuntimeOverlay(self.root)
         self.overlay.set_exit_handler(self.quit)
         self.worker_errors: list[BaseException] = []
@@ -77,7 +90,7 @@ class ControlPanel:
 
         self.status = tk.StringVar(value="正在连接游戏窗口…")
         self.counts = tk.StringVar(value="")
-        self.delivery = tk.BooleanVar(value=bot.input_delivery(config) == "background")
+        self.delivery = tk.BooleanVar(value=input_delivery(config) == "background")
         self.fallback_patrol = tk.BooleanVar(value=bool(config["behavior"].get("fallback_patrol")))
         self.pickup_lost = tk.BooleanVar(value=bool(config["behavior"].get("pickup_after_target_lost")))
         self._entries: dict[str, tk.Entry] = {}
@@ -309,13 +322,13 @@ class ControlPanel:
             value = self._nested(config, key)
             entry.delete(0, "end")
             entry.insert(0, str(value))
-        self.delivery.set(bot.input_delivery(config) == "background")
+        self.delivery.set(input_delivery(config) == "background")
         self.fallback_patrol.set(bool(config["behavior"].get("fallback_patrol")))
         self.pickup_lost.set(bool(config["behavior"].get("pickup_after_target_lost")))
 
     def _refresh_counts(self) -> None:
-        counts = bot.template_counts()
-        calibrated = "已校准" if bot.load_config(self.config_path).get("calibrated") else "未校准"
+        counts = template_counts()
+        calibrated = "已校准" if load_config(self.config_path).get("calibrated") else "未校准"
         self.counts.set(
             f"{calibrated}｜怪物 {counts['monster']}｜姓名板 {counts['player']}｜"
             f"头部 {counts['head']}｜称号 {counts['title']}"
@@ -325,7 +338,7 @@ class ControlPanel:
         if self.worker_errors:
             return
         armed = self.bot.armed
-        state = bot.STATE_LABELS.get(self.bot.state, self.bot.state)
+        state = STATE_LABELS.get(self.bot.state, self.bot.state)
         hp = self.bot.ui_hp
         mp = self.bot.ui_mp
         if armed:
@@ -358,7 +371,7 @@ class ControlPanel:
             action()
             self.bot.reload_from_disk(self.config_path)
             self._refresh_counts()
-            self._load_entries(bot.load_config(self.config_path))
+            self._load_entries(load_config(self.config_path))
             self.bot.notify(f"{title}完成", 4.0)
         except Exception as exc:
             message = str(exc)
@@ -374,25 +387,25 @@ class ControlPanel:
             self.root.focus_force()
 
     def _calibrate(self) -> None:
-        self._run_tool("画面校准", lambda: bot.calibrate(self.config_path, parent=self.root))
+        self._run_tool("画面校准", lambda: calibrate(self.config_path, parent=self.root))
 
     def _capture(self, kind: str) -> None:
         if kind == "monster":
-            self._run_tool("怪物采集", lambda: bot.capture_template(self.config_path, parent=self.root))
+            self._run_tool("怪物采集", lambda: capture_template(self.config_path, parent=self.root))
         elif kind == "player":
-            self._run_tool("姓名板采集", lambda: bot.capture_player_template(self.config_path, parent=self.root))
+            self._run_tool("姓名板采集", lambda: capture_player_template(self.config_path, parent=self.root))
         else:
             self._run_tool(
                 "模板采集",
-                lambda: bot.capture_player_aux_template(self.config_path, kind, parent=self.root),
+                lambda: capture_player_aux_template(self.config_path, kind, parent=self.root),
             )
 
     def _capture_key(self, dotted: str) -> None:
         def action() -> None:
-            name = bot.capture_key_name(bot.load_config(self.config_path), parent=self.root)
-            config = bot.load_config(self.config_path)
+            name = capture_key_name(load_config(self.config_path), parent=self.root)
+            config = load_config(self.config_path)
             self._nested(config, dotted, name)
-            bot.save_config(self.config_path, config)
+            save_config(self.config_path, config)
 
         self._run_tool("按键采集", action)
 
@@ -405,7 +418,7 @@ class ControlPanel:
             raw_box = anchor.raw_box
         self._run_tool(
             "攻击范围框选",
-            lambda: bot.capture_attack_range(
+            lambda: capture_attack_range(
                 self.config_path,
                 parent=self.root,
                 player_box=player_box,
@@ -436,7 +449,7 @@ class ControlPanel:
 
     def _save_settings(self) -> None:
         try:
-            config = bot.load_config(self.config_path)
+            config = load_config(self.config_path)
             for key, entry in self._entries.items():
                 raw = entry.get().strip()
                 current = self._nested(config, key)
@@ -447,14 +460,14 @@ class ControlPanel:
                 else:
                     value = raw.lower()
                     if key.startswith("keys."):
-                        bot.vk_for(value)
+                        vk_for(value)
                 self._nested(config, key, value)
             config.setdefault("input", {})
             config["input"]["delivery"] = "background" if self.delivery.get() else "foreground"
             config["behavior"]["fallback_patrol"] = bool(self.fallback_patrol.get())
             config["behavior"]["pickup_after_target_lost"] = bool(self.pickup_lost.get())
-            bot.input_delivery(config)
-            bot.save_config(self.config_path, config)
+            input_delivery(config)
+            save_config(self.config_path, config)
             self.bot.apply_config(config)
             self.bot.notify("配置已保存", 3.0)
         except Exception as exc:
