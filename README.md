@@ -24,9 +24,9 @@
 2. 以窗口模式打开游戏，保证窗口标题含 `MapleStory` 或 `冒险岛`。
 3. 运行 `Start-Calibrate.bat`，依次框选血条、蓝条、小地图内部区域和主战斗区。
 4. 在小地图画面中点击自己的玩家标记中心。
-5. 找到当前地图一只无遮挡怪物，运行 `Capture-Monster-Template.bat` 框选它。建议保存 3～6 个不同动作帧。
-6. 运行 `Capture-Player-Template.bat`，紧贴框选自己姓名板的第一行蓝色板（包含名字和两端装饰），不要包含角色、宠物或怪物。姓名板不随攻击动作和朝向改变，通常采集 1～2 张即可。
-7. 分别运行 `Capture-Player-Head-Template.bat` 和 `Capture-Player-Title-Template.bat`，采集自己的头部以及姓名板下方称号勋章。换发型或称号后重新采集对应模板。
+5. 找到当前地图一只无遮挡怪物，运行 `Capture-Monster-Template.bat`。工具会立即冻结当前游戏画面，请在这张静态帧上框选怪物；建议分别触发并保存 3～6 个不同动作帧。
+6. 运行 `Capture-Player-Template.bat`。工具会进入静态帧框选；紧贴框选自己姓名板的第一行蓝色板（包含名字和两端装饰），不要包含角色、宠物或怪物。姓名板不随攻击动作和朝向改变，通常采集 1～2 张即可。
+7. 分别运行 `Capture-Player-Head-Template.bat` 和 `Capture-Player-Title-Template.bat`，在各自冻结的静态帧中采集自己的头部以及姓名板下方称号勋章。换发型或称号后重新采集对应模板。
 8. 运行 `Start-Observer.bat`。确认：青色框落在姓名板、头部或称号上，标签会显示当前定位来源；紫色细框是怪物候选；绿色粗框是最终目标；黄色框是当前弓箭有效索敌区。
 9. 关闭观察模式，运行 `Start-Bot.bat`，在 Windows UAC 提示中选择“是”，然后按 F8。再次按 F8 暂停，点击右上角按钮或按 `Ctrl+Shift+Q` 退出。
 

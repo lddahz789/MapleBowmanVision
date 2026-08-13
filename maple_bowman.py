@@ -1045,18 +1045,42 @@ def calibrate(config_path: Path) -> None:
     print(f"校准完成，配置已保存到：{config_path}")
 
 
+def capture_frozen_selection(
+    window: WindowInfo,
+    title: str,
+    cancel_message: str,
+) -> np.ndarray:
+    """截图一次并在该静态帧上框选，保证显示内容与保存内容完全一致。"""
+    focus_game_window(window)
+    with mss.MSS() as sct:
+        frame = capture_client(sct, window)
+    result = interactive_overlay(
+        window,
+        title,
+        "rectangle",
+        frozen_frame=frame,
+    )
+    if result.cancelled or result.rectangle is None:
+        raise RuntimeError(cancel_message)
+    x, y, w, h = result.rectangle
+    frame_height, frame_width = frame.shape[:2]
+    left = max(0, x)
+    top = max(0, y)
+    right = min(frame_width, x + w)
+    bottom = min(frame_height, y + h)
+    if right - left < 4 or bottom - top < 4:
+        raise RuntimeError("静态帧框选区域过小，请重新采集")
+    return frame[top:bottom, left:right].copy()
+
+
 def capture_template(config_path: Path) -> None:
     config = load_config(config_path)
     window = find_game_window(config)
-    focus_game_window(window)
-    result = interactive_overlay(window, "框选一只清晰可见、没有遮挡的怪物", "rectangle")
-    if result.cancelled or result.rectangle is None:
-        raise RuntimeError("已取消怪物模板框选")
-    focus_game_window(window, settle_seconds=0.15)
-    with mss.MSS() as sct:
-        frame = capture_client(sct, window)
-    x, y, w, h = result.rectangle
-    image = frame[y : y + h, x : x + w]
+    image = capture_frozen_selection(
+        window,
+        "框选一只清晰可见、没有遮挡的怪物",
+        "已取消怪物模板框选",
+    )
     ASSET_DIR.mkdir(parents=True, exist_ok=True)
     path = ASSET_DIR / f"monster-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
     ok, encoded = cv2.imencode(".png", image)
@@ -1123,19 +1147,11 @@ def nameplate_template_alpha(image: np.ndarray) -> np.ndarray:
 def capture_player_template(config_path: Path) -> None:
     config = load_config(config_path)
     window = find_game_window(config)
-    focus_game_window(window)
-    result = interactive_overlay(
+    image = capture_frozen_selection(
         window,
         "紧贴框选自己姓名板的第一行蓝色板（含名字），不要包含角色、宠物或怪物",
-        "rectangle",
+        "已取消玩家模板框选",
     )
-    if result.cancelled or result.rectangle is None:
-        raise RuntimeError("已取消玩家模板框选")
-    focus_game_window(window, settle_seconds=0.15)
-    with mss.MSS() as sct:
-        frame = capture_client(sct, window)
-    x, y, w, h = result.rectangle
-    image = frame[y : y + h, x : x + w]
     alpha = nameplate_template_alpha(image)
     bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
     bgra[:, :, 3] = alpha
@@ -1168,15 +1184,7 @@ def capture_player_aux_template(config_path: Path, kind: str) -> None:
     prompt, directory, prefix, label = specs[kind]
     config = load_config(config_path)
     window = find_game_window(config)
-    focus_game_window(window)
-    result = interactive_overlay(window, prompt, "rectangle")
-    if result.cancelled or result.rectangle is None:
-        raise RuntimeError(f"已取消{label}模板框选")
-    focus_game_window(window, settle_seconds=0.15)
-    with mss.MSS() as sct:
-        frame = capture_client(sct, window)
-    x, y, w, h = result.rectangle
-    image = frame[y : y + h, x : x + w]
+    image = capture_frozen_selection(window, prompt, f"已取消{label}模板框选")
     alpha = player_template_alpha(image) if kind == "head" else nameplate_template_alpha(image)
     bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
     bgra[:, :, 3] = alpha

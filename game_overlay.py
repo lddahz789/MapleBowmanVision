@@ -9,6 +9,8 @@ import time
 import tkinter as tk
 from typing import Any, Callable
 
+from PIL import Image, ImageTk
+
 
 user32 = ctypes.windll.user32
 
@@ -52,6 +54,21 @@ def _rect(roi: dict[str, float], width: int, height: int) -> tuple[int, int, int
         int(round(float(roi["w"]) * width)),
         int(round(float(roi["h"]) * height)),
     )
+
+
+def frozen_frame_image(frame: Any, width: int, height: int) -> Image.Image:
+    """将 OpenCV BGR 帧转换成叠加层使用的 RGB 静态画面。"""
+    frame_height, frame_width = frame.shape[:2]
+    image = Image.frombytes(
+        "RGB",
+        (frame_width, frame_height),
+        frame.tobytes(),
+        "raw",
+        "BGR",
+    )
+    if (frame_width, frame_height) != (width, height):
+        image = image.resize((width, height), Image.Resampling.BILINEAR)
+    return image
 
 
 class RuntimeOverlay:
@@ -310,8 +327,9 @@ def interactive_overlay(
     title: str,
     mode: str,
     guide_rect: tuple[int, int, int, int] | None = None,
+    frozen_frame: Any | None = None,
 ) -> InteractiveResult:
-    """直接覆盖游戏进行矩形框选或单点选择。"""
+    """直接覆盖游戏进行框选；传入 frozen_frame 时显示该静态游戏帧。"""
     # Windows 会把透明色键像素当成鼠标穿透区。因此交互框选使用两个窗口：
     # 几乎不可见的 capture_root 铺满客户区并接收鼠标，visual_root 只绘制提示和选框。
     root = tk.Tk()
@@ -339,6 +357,11 @@ def interactive_overlay(
     visual_root.geometry(f"{window.width}x{window.height}+{window.left}+{window.top}")
     canvas = tk.Canvas(visual_root, bg=TRANSPARENT, highlightthickness=0, bd=0)
     canvas.pack(fill="both", expand=True)
+
+    frozen_photo: ImageTk.PhotoImage | None = None
+    if frozen_frame is not None:
+        frozen_image = frozen_frame_image(frozen_frame, window.width, window.height)
+        frozen_photo = ImageTk.PhotoImage(frozen_image, master=visual_root)
 
     root.update_idletasks()
     visual_root.update_idletasks()
@@ -377,8 +400,13 @@ def interactive_overlay(
 
     def redraw() -> None:
         canvas.delete("all")
+        if frozen_photo is not None:
+            canvas.create_image(0, 0, anchor="nw", image=frozen_photo)
         canvas.create_rectangle(0, 0, window.width, 42, fill="#151515", outline="")
-        suffix = "整个游戏区域都可拖框｜回车确认｜R 重选｜Esc 取消" if mode == "rectangle" else "点击目标中心｜回车确认｜R 重选｜Esc 取消"
+        if mode == "rectangle":
+            suffix = "静态帧｜拖动框选｜回车确认｜R 重选｜Esc 取消" if frozen_photo is not None else "整个游戏区域都可拖框｜回车确认｜R 重选｜Esc 取消"
+        else:
+            suffix = "点击目标中心｜回车确认｜R 重选｜Esc 取消"
         canvas.create_text(10, 21, anchor="w", text=f"{title}｜{suffix}", fill="#fff04a", font=("Microsoft YaHei UI", 16, "bold"))
         if guide_rect:
             x, y, w, h = guide_rect

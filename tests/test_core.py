@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -11,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import maple_bowman as bot
+import game_overlay as hud
 
 
 class CoreTests(unittest.TestCase):
@@ -212,6 +214,49 @@ class CoreTests(unittest.TestCase):
         rendered = bot.draw_chinese_texts(image, [("中文提示", (5, 5), (0, 255, 255), 20)])
         self.assertEqual(rendered.shape, image.shape)
         self.assertGreater(int(rendered.sum()), 0)
+
+    def test_frozen_selection_displays_and_crops_the_same_captured_frame(self):
+        frame = np.arange(8 * 10 * 3, dtype=np.uint8).reshape((8, 10, 3))
+        window = bot.WindowInfo(123, "MapleStory", 10, 20, 10, 8)
+        result = type("Result", (), {"cancelled": False, "rectangle": (2, 1, 4, 4)})()
+
+        with (
+            patch.object(bot, "focus_game_window") as focus,
+            patch.object(bot.mss, "MSS") as mss_factory,
+            patch.object(bot, "capture_client", return_value=frame) as capture,
+            patch.object(bot, "interactive_overlay", return_value=result) as overlay,
+        ):
+            frozen = bot.capture_frozen_selection(window, "框选目标", "已取消")
+
+        focus.assert_called_once_with(window)
+        capture.assert_called_once_with(mss_factory.return_value.__enter__.return_value, window)
+        self.assertIs(overlay.call_args.kwargs["frozen_frame"], frame)
+        self.assertTrue(np.array_equal(frozen, frame[1:5, 2:6]))
+
+    def test_frozen_selection_cancel_does_not_return_pixels(self):
+        frame = np.zeros((6, 8, 3), dtype=np.uint8)
+        window = bot.WindowInfo(123, "MapleStory", 10, 20, 8, 6)
+        result = type("Result", (), {"cancelled": True, "rectangle": None})()
+
+        with (
+            patch.object(bot, "focus_game_window"),
+            patch.object(bot.mss, "MSS"),
+            patch.object(bot, "capture_client", return_value=frame),
+            patch.object(bot, "interactive_overlay", return_value=result),
+            self.assertRaisesRegex(RuntimeError, "已取消怪物模板框选"),
+        ):
+            bot.capture_frozen_selection(window, "框选目标", "已取消怪物模板框选")
+
+    def test_frozen_frame_converts_bgr_pixels_for_display(self):
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        frame[0, 0] = (255, 0, 0)
+        frame[0, 1] = (0, 0, 255)
+
+        image = hud.frozen_frame_image(frame, 3, 2)
+
+        self.assertEqual((3, 2), image.size)
+        self.assertEqual((0, 0, 255), image.getpixel((0, 0)))
+        self.assertEqual((255, 0, 0), image.getpixel((1, 0)))
 
     def test_zero_runtime_limit_is_unlimited(self):
         self.assertFalse(bot.runtime_limit_reached(100.0, 100000.0, 0))
