@@ -213,6 +213,21 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(rendered.shape, image.shape)
         self.assertGreater(int(rendered.sum()), 0)
 
+    def test_zero_runtime_limit_is_unlimited(self):
+        self.assertFalse(bot.runtime_limit_reached(100.0, 100000.0, 0))
+
+    def test_negative_runtime_limit_is_unlimited(self):
+        self.assertFalse(bot.runtime_limit_reached(100.0, 100000.0, -1))
+
+    def test_positive_runtime_limit_expires_at_boundary(self):
+        self.assertEqual(
+            [False, True],
+            [
+                bot.runtime_limit_reached(100.0, 159.999, 1),
+                bot.runtime_limit_reached(100.0, 160.0, 1),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

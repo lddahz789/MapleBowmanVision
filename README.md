@@ -62,7 +62,7 @@
 - `behavior.hp_threshold` / `mp_threshold`：补药阈值。
 - `behavior.fallback_patrol`：没有识别到怪物时是否左右巡逻。多层地图容易走下平台，默认关闭；只在确认当前平台边界后开启。
 - `behavior.pickup_after_target_lost`：目标消失后是否按一次拾取，默认关闭。
-- `behavior.max_runtime_minutes`：单次最长运行时间，默认 20 分钟。
+- `behavior.max_runtime_minutes`：单次最长运行时间；`0` 或负数表示无限制，默认 `0`（无限制）。
 
 ## 当前限制
 

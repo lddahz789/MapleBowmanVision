@@ -1212,6 +1212,17 @@ STATE_LABELS = {
     "MARKER_LOST": "玩家标记丢失",
 }
 
+
+def runtime_limit_reached(
+    started_at: float,
+    now: float,
+    max_runtime_minutes: float,
+) -> bool:
+    """非正数表示不限制运行时长；正数按分钟计算截止时间。"""
+    minutes = float(max_runtime_minutes)
+    return minutes > 0.0 and now - started_at >= minutes * 60.0
+
+
 PREVIEW_INTERNAL_NAME = "MBV-Preview"
 PREVIEW_TITLE_OBSERVER = "冒险岛弓箭手视觉助手——观察模式"
 PREVIEW_TITLE_INPUT = "冒险岛弓箭手视觉助手——输入模式"
@@ -1423,8 +1434,11 @@ class BowmanBot:
             return
         behavior = self.config["behavior"]
         keys = self.config["keys"]
-        max_seconds = float(behavior["max_runtime_minutes"]) * 60.0
-        if now - self.started_at >= max_seconds:
+        if runtime_limit_reached(
+            self.started_at,
+            now,
+            float(behavior.get("max_runtime_minutes", 0)),
+        ):
             self.disarm("已达到单次最长运行时间")
             return
         if marker is None and now - self.marker_last_seen >= float(behavior["max_marker_lost_seconds"]):

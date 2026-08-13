@@ -137,7 +137,7 @@
     "fallback_patrol": false,
     "pickup_after_target_lost": false,
     "max_marker_lost_seconds": 3.0,
-    "max_runtime_minutes": 20
+    "max_runtime_minutes": 0
   },
   "calibration": {
     "window_size": [
