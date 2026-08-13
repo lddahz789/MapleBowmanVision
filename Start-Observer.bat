@@ -1,12 +1,3 @@
 @echo off
-chcp 65001 >nul
-setlocal
-cd /d "%~dp0"
-if not exist ".venv\Scripts\python.exe" (
-  python batch_messages.py need_setup
-  python batch_messages.py close_window
-  pause >nul
-  exit /b 1
-)
-start "" ".venv\Scripts\pythonw.exe" maple_bowman.py
-exit /b 0
+REM Start.bat 的别名，避免两份启动脚本各自漂移。
+call "%~dp0Start.bat"

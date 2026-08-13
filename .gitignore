@@ -7,6 +7,13 @@ __pycache__/
 logs/
 diagnostics/
 
+# Personal calibration and captured templates
+config.json
+assets/monsters/*.png
+assets/player/*.png
+assets/player_head/*.png
+assets/player_title/*.png
+
 # Editor and OS files
 .vscode/
 .idea/

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "calibrated": true,
+  "calibrated": false,
   "window": {
     "exact_titles": [
       "冒险岛怀旧服",
@@ -19,85 +19,21 @@
     "preview_scale": 0.5
   },
   "regions": {
-    "hp_bar": {
-      "x": 0.404687,
-      "y": 0.97963,
-      "w": 0.058333,
-      "h": 0.02037
-    },
-    "mp_bar": {
-      "x": 0.461979,
-      "y": 0.980556,
-      "w": 0.056771,
-      "h": 0.019444
-    },
-    "minimap": {
-      "x": 0.002604,
-      "y": 0.062963,
-      "w": 0.056771,
-      "h": 0.087963
-    },
-    "combat": {
-      "x": 0.061458,
-      "y": 0.349074,
-      "w": 0.916667,
-      "h": 0.440741
-    }
+    "hp_bar": {"x": 0.0, "y": 0.0, "w": 0.1, "h": 0.05},
+    "mp_bar": {"x": 0.1, "y": 0.0, "w": 0.1, "h": 0.05},
+    "minimap": {"x": 0.0, "y": 0.05, "w": 0.12, "h": 0.16},
+    "combat": {"x": 0.0, "y": 0.05, "w": 1.0, "h": 0.9}
   },
   "vision": {
     "hp_hsv_ranges": [
-      {
-        "lower": [
-          0,
-          80,
-          60
-        ],
-        "upper": [
-          12,
-          255,
-          255
-        ]
-      },
-      {
-        "lower": [
-          168,
-          80,
-          60
-        ],
-        "upper": [
-          179,
-          255,
-          255
-        ]
-      }
+      {"lower": [0, 80, 60], "upper": [12, 255, 255]},
+      {"lower": [168, 80, 60], "upper": [179, 255, 255]}
     ],
     "mp_hsv_ranges": [
-      {
-        "lower": [
-          90,
-          70,
-          50
-        ],
-        "upper": [
-          135,
-          255,
-          255
-        ]
-      }
+      {"lower": [90, 70, 50], "upper": [135, 255, 255]}
     ],
     "player_hsv_ranges": [
-      {
-        "lower": [
-          21,
-          49,
-          35
-        ],
-        "upper": [
-          39,
-          189,
-          150
-        ]
-      }
+      {"lower": [21, 170, 185], "upper": [39, 255, 255]}
     ],
     "player_blob_min_area": 2,
     "player_blob_max_area": 180,
@@ -122,6 +58,9 @@
     "left": "left",
     "right": "right"
   },
+  "input": {
+    "delivery": "background"
+  },
   "behavior": {
     "hp_threshold": 0.35,
     "mp_threshold": 0.25,
@@ -129,8 +68,12 @@
     "attack_interval_seconds": 0.24,
     "face_tap_seconds": 0.025,
     "attack_dead_zone": 0.015,
-    "bow_attack_range": 0.312,
-    "bow_vertical_tolerance": 0.12,
+    "bow_attack_box": {
+      "forward": 0.312,
+      "back": 0.08,
+      "up": 0.12,
+      "down": 0.12
+    },
     "target_lost_patrol_delay_seconds": 1.4,
     "patrol_left": 0.16,
     "patrol_right": 0.84,
@@ -138,17 +81,5 @@
     "pickup_after_target_lost": false,
     "max_marker_lost_seconds": 3.0,
     "max_runtime_minutes": 0
-  },
-  "calibration": {
-    "window_size": [
-      1920,
-      1080
-    ],
-    "timestamp": "2026-08-13T00:38:25",
-    "player_hsv_sample": [
-      30,
-      119,
-      80
-    ]
   }
 }

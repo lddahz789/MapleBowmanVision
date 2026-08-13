@@ -1,0 +1,17 @@
+---
+description: MapleBowmanVision 项目约束与模块分工。改代码前必读。
+alwaysApply: true
+---
+
+# MapleBowmanVision
+
+先读仓库根目录 `AGENTS.md` 和玩家手册 `README.md`。
+
+- 这是经典冒险岛怀旧服弓箭手视觉助手，不是 Artale 项目。不要搬符文、跑图、组队红条主定位，不要注入/读内存/抓包。
+- 业务只改 `mbv/`。`maple_bowman.py`、`game_overlay.py`、`control_panel.py` 是兼容入口。
+- 后台按键必须保留 `SendInput` 扫描码；不要改成失焦后只 `PostMessage`。
+- 攻击范围按角色中心和面向保存前后上下，不要做对称修正。
+- 模板采集用冻结帧（先截图再框选同一帧）。
+- 不要提交 `config.json` 和个人 `assets` 截图。测试：`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`。
+- 用户要求提交时，同一次 commit 必须更新 `mbv/__init__.py` 的 `__version__` 和 `CHANGELOG.md`。
+- 对用户用简体中文。未要求不要 git commit。
