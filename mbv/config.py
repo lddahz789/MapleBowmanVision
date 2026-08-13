@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from mbv.input import input_delivery
-from mbv.paths import ASSET_DIR, LOG_DIR, PLAYER_ASSET_DIR, PLAYER_HEAD_ASSET_DIR, PLAYER_TITLE_ASSET_DIR
+from mbv.paths import LOG_DIR, PLAYER_ASSET_DIR, PLAYER_HEAD_ASSET_DIR, PLAYER_TITLE_ASSET_DIR
+from mbv.template_store import list_monster_categories
 from mbv.vision import attack_box_from_config
 
 class SessionLog:
@@ -29,8 +30,11 @@ def png_count(directory: Path) -> int:
 
 
 def template_counts() -> dict[str, int]:
+    categories = list_monster_categories()
     return {
-        "monster": png_count(ASSET_DIR),
+        "monster": sum(item.monster_count for item in categories),
+        "filter": sum(item.filter_count for item in categories),
+        "category": len(categories),
         "player": png_count(PLAYER_ASSET_DIR),
         "head": png_count(PLAYER_HEAD_ASSET_DIR),
         "title": png_count(PLAYER_TITLE_ASSET_DIR),
@@ -47,6 +51,11 @@ def load_config(path: Path) -> dict[str, Any]:
     input_delivery(config)
     config.setdefault("behavior", {})
     config["behavior"]["bow_attack_box"] = attack_box_from_config(config["behavior"])
+    config.setdefault("vision", {})
+    monster_threshold = float(config["vision"].get("monster_template_threshold", 0.79))
+    config["vision"].setdefault("active_monster_category", "")
+    config["vision"].setdefault("monster_filter_threshold", max(monster_threshold, 0.84))
+    config["vision"].setdefault("monster_filter_overlap", 0.5)
     return config
 
 

@@ -10,6 +10,7 @@ import threading
 from mbv.bot import BowmanBot
 from mbv.calibrate import (
     calibrate,
+    capture_monster_filter,
     capture_player_aux_template,
     capture_player_template,
     capture_template,
@@ -53,6 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="配置文件路径")
     parser.add_argument("--calibrate", action="store_true", help="进行画面区域校准")
     parser.add_argument("--capture-template", action="store_true", help="采集怪物模板")
+    parser.add_argument("--capture-monster-filter", action="store_true", help="采集怪物过滤项")
+    parser.add_argument("--monster-category", default="", help="怪物模板采集分类；留空为未分类")
     parser.add_argument("--capture-player-template", action="store_true", help="采集玩家模板")
     parser.add_argument("--capture-player-head", action="store_true", help="采集玩家头部模板")
     parser.add_argument("--capture-player-title", action="store_true", help="采集玩家称号勋章模板")
@@ -75,7 +78,10 @@ def main() -> int:
         calibrate(config_path)
         return 0
     if args.capture_template:
-        capture_template(config_path)
+        capture_template(config_path, category=args.monster_category)
+        return 0
+    if args.capture_monster_filter:
+        capture_monster_filter(config_path, category=args.monster_category)
         return 0
     if args.capture_player_template:
         capture_player_template(config_path)

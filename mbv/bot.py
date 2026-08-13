@@ -10,9 +10,15 @@ from typing import Any
 import mss
 
 from mbv.config import SessionLog, load_config
-from mbv.input import Keyboard, input_delivery, key_is_down, rising_edge
+from mbv.input import Keyboard, input_delivery, key_is_down, rising_edge, vk_for
 from mbv.overlay import RuntimeOverlay
-from mbv.paths import PLAYER_ASSET_DIR, PLAYER_HEAD_ASSET_DIR, PLAYER_TITLE_ASSET_DIR
+from mbv.paths import (
+    ASSET_DIR,
+    MONSTER_FILTER_ASSET_DIR,
+    PLAYER_ASSET_DIR,
+    PLAYER_HEAD_ASSET_DIR,
+    PLAYER_TITLE_ASSET_DIR,
+)
 from mbv.vision import (
     Detection,
     PlayerAnchor,
@@ -27,8 +33,11 @@ from mbv.vision import (
     crop,
     find_detections,
     load_templates,
+    monster_template_category,
+    monster_templates_for_category,
     player_anchor_center,
     player_marker,
+    suppress_monster_detections,
 )
 from mbv.win32 import (
     HOTKEY_ID_EXIT,
@@ -46,7 +55,6 @@ from mbv.win32 import (
 from mbv.window import capture_client, client_window, find_game_window, focus_game_window, window_process_path
 
 STATE_LABELS = {
-    "OBSERVER": "观察模式",
     "PAUSED": "已暂停",
     "SCANNING": "正在搜索目标",
     "PATROL_LEFT": "向左巡逻",
@@ -111,13 +119,21 @@ class BowmanBot:
         self.delivery = input_delivery(config)
         self.background_input = self.delivery == "background"
         self.keyboard = Keyboard(self.delivery)
-        self.templates = load_templates()
+        self.active_monster_category = str(config["vision"].get("active_monster_category", "")).strip()
+        self.templates = monster_templates_for_category(
+            load_templates(ASSET_DIR, recursive=True),
+            self.active_monster_category,
+        )
+        self.monster_filter_templates = monster_templates_for_category(
+            load_templates(MONSTER_FILTER_ASSET_DIR, recursive=True),
+            self.active_monster_category,
+        )
         self.player_templates = load_templates(PLAYER_ASSET_DIR)
         self.player_head_templates = load_templates(PLAYER_HEAD_ASSET_DIR)
         self.player_title_templates = load_templates(PLAYER_TITLE_ASSET_DIR)
         self.log = SessionLog()
         self.armed = False
-        self.state = "OBSERVER"
+        self.state = "PAUSED"
         self.direction: str | None = None
         self.marker: tuple[float, float] | None = None
         self.marker_last_seen = time.monotonic()
@@ -150,6 +166,7 @@ class BowmanBot:
         self.ui_hp = 0.0
         self.ui_mp = 0.0
         self.config_lock = threading.Lock()
+        self.action_lock = threading.RLock()
 
     def notify(self, message: str, seconds: float = 4.0) -> None:
         self.notice = message
@@ -234,11 +251,15 @@ class BowmanBot:
             user32.MessageBeep(0x00000030)
 
     def toggle(self, window: WindowInfo) -> None:
+        with self.action_lock:
+            self._toggle(window)
+
+    def _toggle(self, window: WindowInfo) -> None:
         if self.armed:
             self.disarm("按下了 F8")
             return
         if not self.input_authorized:
-            self.notify("当前是观察模式，不会发送按键。请在控制面板点击「启动挂机」。", 6.0)
+            self.notify("当前进程没有按键授权，请从唯一入口 Start.bat 启动。", 6.0)
             return
         if not self.config.get("calibrated"):
             self.notify("尚未完成校准，请在控制面板点击「画面校准」。")
@@ -279,55 +300,84 @@ class BowmanBot:
         if self.background_input:
             self.notify("已经启动（后台按键）。始终发送扫描码；控制面板不抢焦点。", 5.0)
         else:
-            self.notify("已经启动。按 F8 暂停，F7 显隐校对信息，按 F9 或 Ctrl+Shift+Q 立即退出。", 3.0)
+            self.notify("已经启动。按 F8 暂停，F7 显隐 Debug 框，按 F9 或 Ctrl+Shift+Q 立即退出。", 3.0)
         user32.MessageBeep(0x00000040)
 
     def request_toggle(self) -> None:
         self.f8_requested.set()
 
     def toggle_calibration_overlay(self) -> None:
-        self.calibration_overlay_visible = not self.calibration_overlay_visible
+        self.set_calibration_overlay_visible(not self.calibration_overlay_visible)
+
+    def set_calibration_overlay_visible(self, visible: bool) -> None:
+        self.calibration_overlay_visible = bool(visible)
         self.log.write("calibration_overlay", visible=self.calibration_overlay_visible)
 
     def suspend_vision(self) -> None:
-        if self.armed:
-            self.disarm("打开采集工具")
-        self.vision_suspended.set()
-        self.keyboard.release_all()
+        with self.action_lock:
+            self.vision_suspended.set()
+            self.f8_requested.clear()
+            if self.armed:
+                self.disarm("打开采集工具")
+            self.keyboard.release_all()
 
     def resume_vision(self) -> None:
         self.vision_suspended.clear()
 
     def reload_templates(self) -> None:
-        self.templates = load_templates()
-        self.player_templates = load_templates(PLAYER_ASSET_DIR)
-        self.player_head_templates = load_templates(PLAYER_HEAD_ASSET_DIR)
-        self.player_title_templates = load_templates(PLAYER_TITLE_ASSET_DIR)
+        monster_templates = monster_templates_for_category(
+            load_templates(ASSET_DIR, recursive=True),
+            self.active_monster_category,
+        )
+        monster_filter_templates = monster_templates_for_category(
+            load_templates(MONSTER_FILTER_ASSET_DIR, recursive=True),
+            self.active_monster_category,
+        )
+        player_templates = load_templates(PLAYER_ASSET_DIR)
+        player_head_templates = load_templates(PLAYER_HEAD_ASSET_DIR)
+        player_title_templates = load_templates(PLAYER_TITLE_ASSET_DIR)
+        self.templates = monster_templates
+        self.monster_filter_templates = monster_filter_templates
+        self.player_templates = player_templates
+        self.player_head_templates = player_head_templates
+        self.player_title_templates = player_title_templates
+        self.last_detections = []
+        self.last_detection_box = None
+        self.last_detection_score = -1.0
+        self.last_detection_name = None
+        self.last_detection_at = 0.0
         self.last_player_auxiliary_at = 0.0
         self.log.write(
             "templates_reloaded",
+            category=self.active_monster_category,
             monsters=len(self.templates),
+            filters=len(self.monster_filter_templates),
             player=len(self.player_templates),
             head=len(self.player_head_templates),
             title=len(self.player_title_templates),
         )
 
     def apply_config(self, config: dict[str, Any]) -> None:
-        with self.config_lock:
-            was_armed = self.armed
-            if was_armed:
-                self.disarm("配置已更新")
-            new_delivery = input_delivery(config)
-            hwnd = self.keyboard.root_hwnd or self.keyboard.hwnd
-            if new_delivery != self.delivery:
-                self.keyboard.release_all()
-                self.delivery = new_delivery
-                self.background_input = new_delivery == "background"
-                self.keyboard = Keyboard(self.delivery)
-                if hwnd:
-                    self.keyboard.bind_window(hwnd)
-            self.config = config
-            self.last_player_auxiliary_at = 0.0
+        with self.action_lock:
+            self.f8_requested.clear()
+            with self.config_lock:
+                was_armed = self.armed
+                if was_armed:
+                    self.disarm("配置已更新")
+                new_delivery = input_delivery(config)
+                hwnd = self.keyboard.root_hwnd or self.keyboard.hwnd
+                if new_delivery != self.delivery:
+                    self.keyboard.release_all()
+                    self.delivery = new_delivery
+                    self.background_input = new_delivery == "background"
+                    self.keyboard = Keyboard(self.delivery)
+                    if hwnd:
+                        self.keyboard.bind_window(hwnd)
+                self.config = config
+                self.active_monster_category = str(
+                    config["vision"].get("active_monster_category", "")
+                ).strip()
+                self.last_player_auxiliary_at = 0.0
 
     def reload_from_disk(self, config_path: Path) -> None:
         self.apply_config(load_config(config_path))
@@ -387,7 +437,34 @@ class BowmanBot:
         has_monster_candidates: bool,
         now: float,
     ) -> None:
-        if not self.armed:
+        with self.action_lock:
+            self._act(
+                window,
+                hp,
+                mp,
+                marker,
+                player_box,
+                target_box,
+                chase_box,
+                combat_width,
+                has_monster_candidates,
+                now,
+            )
+
+    def _act(
+        self,
+        window: WindowInfo,
+        hp: float,
+        mp: float,
+        marker: tuple[float, float] | None,
+        player_box: tuple[int, int, int, int] | None,
+        target_box: tuple[int, int, int, int] | None,
+        chase_box: tuple[int, int, int, int] | None,
+        combat_width: int,
+        has_monster_candidates: bool,
+        now: float,
+    ) -> None:
+        if not self.armed or not self.input_authorized:
             return
         if not user32.IsWindow(window.hwnd) or user32.IsIconic(window.hwnd):
             self.disarm("游戏窗口已关闭或最小化")
@@ -476,6 +553,8 @@ class BowmanBot:
         vision = self.config["vision"]
         print(f"游戏窗口：{window.title}（{window.width}×{window.height}）")
         print(f"已载入怪物模板：{len(self.templates)} 个")
+        print(f"已载入怪物过滤项：{len(self.monster_filter_templates)} 个")
+        print(f"当前怪物分类：{self.active_monster_category or '未分类'}")
         print(
             "已载入玩家定位模板："
             f"姓名板 {len(self.player_templates)} / 头部 {len(self.player_head_templates)} / "
@@ -484,13 +563,15 @@ class BowmanBot:
         print("按键投递：" + ("后台扫描码（失焦仍 SendInput，并补发窗口消息）。" if self.background_input else "前台 SendInput（游戏必须在前台）。"))
         if self.input_authorized and not self.integrity_ok:
             print("权限不足：助手权限低于游戏，输入会被 Windows 阻止。")
-        print("F7 显隐校对信息，F8 启动或暂停，F9 / Ctrl+Shift+Q 立即退出。按键输入：" + ("已允许。" if self.input_authorized else "未允许（观察模式）。"))
+        print("F7 显隐 Debug 框，F8 启动或暂停，F9 / Ctrl+Shift+Q 立即退出。按键输入：" + ("已允许。" if self.input_authorized else "未授权。"))
         self.log.write(
             "session_start",
             input_authorized=self.input_authorized,
+            active_monster_category=self.active_monster_category,
             delivery=self.delivery,
             input_hwnd=self.keyboard.hwnd,
             templates=len(self.templates),
+            monster_filter_templates=len(self.monster_filter_templates),
             player_templates=len(self.player_templates),
             player_head_templates=len(self.player_head_templates),
             player_title_templates=len(self.player_title_templates),
@@ -505,9 +586,10 @@ class BowmanBot:
                     if self.f9_requested.is_set():
                         self.f9_requested.clear()
                         break
-                    if self.f8_requested.is_set():
-                        self.f8_requested.clear()
-                        self.toggle(window)
+                    with self.action_lock:
+                        if self.f8_requested.is_set():
+                            self.f8_requested.clear()
+                            self.toggle(window)
                     if self.f7_requested.is_set():
                         self.f7_requested.clear()
                         self.toggle_calibration_overlay()
@@ -553,15 +635,66 @@ class BowmanBot:
                         float(vision["monster_template_threshold"]),
                         float(vision.get("monster_detection_scale", 1.0)),
                     )
+                    raw_monster_count = len(detected_monsters)
+                    hold_seconds = float(vision.get("monster_hold_seconds", 0.0))
+                    held_monsters = (
+                        self.last_detections
+                        if now - self.last_detection_at <= hold_seconds
+                        else []
+                    )
+                    filter_sources = [*detected_monsters, *held_monsters]
+                    if self.monster_filter_templates and filter_sources:
+                        active_categories = {
+                            monster_template_category(detection.name).casefold()
+                            for detection in filter_sources
+                        }
+                        filter_detections: list[Detection] = []
+                        for category in active_categories:
+                            category_templates = [
+                                template
+                                for template in self.monster_filter_templates
+                                if monster_template_category(template.name).casefold() == category
+                            ]
+                            if not category_templates:
+                                continue
+                            category_filters, _filter_score, _filter_name = find_detections(
+                                scene,
+                                category_templates,
+                                float(vision.get("monster_filter_threshold", 0.84)),
+                                float(vision.get("monster_detection_scale", 1.0)),
+                                max_per_template=16,
+                                nms_iou=0.38,
+                                max_detections=32,
+                            )
+                            filter_detections.extend(category_filters)
+                        if filter_detections:
+                            overlap = float(vision.get("monster_filter_overlap", 0.5))
+                            detected_monsters = suppress_monster_detections(
+                                detected_monsters,
+                                filter_detections,
+                                overlap,
+                            )
+                            held_monsters = suppress_monster_detections(
+                                held_monsters,
+                                filter_detections,
+                                overlap,
+                            )
+                            self.last_detections = held_monsters
+                    if detected_monsters:
+                        detected_score = detected_monsters[0].score
+                        detected_name = detected_monsters[0].name
+                    elif raw_monster_count:
+                        # 候选已被过滤项明确排除，不再作为“未确认怪物”显示。
+                        detected_score = -1.0
+                        detected_name = None
                     if detected_monsters:
                         self.last_detections = detected_monsters
                         self.last_detection_box = detected_monsters[0].box
                         self.last_detection_score = detected_score
                         self.last_detection_name = detected_name
                         self.last_detection_at = now
-                    hold_seconds = float(vision.get("monster_hold_seconds", 0.0))
-                    if not detected_monsters and now - self.last_detection_at <= hold_seconds:
-                        monsters = self.last_detections
+                    if not detected_monsters and held_monsters:
+                        monsters = held_monsters
                     else:
                         monsters = detected_monsters
 
@@ -763,12 +896,12 @@ class BowmanBot:
                         elif self.background_input:
                             banner = (
                                 f"{'运行中' if self.armed else '输入待命'}｜后台按键｜{state_label}"
-                                "｜F7 校对｜F8 启动/暂停｜F9 / Ctrl+Shift+Q 退出"
+                                "｜F7 Debug 框｜F8 启动/暂停｜F9 / Ctrl+Shift+Q 退出"
                             )
                         else:
-                            banner = f"{'运行中' if self.armed else '输入待命'}｜{state_label}｜F7 校对｜F8 启动/暂停｜F9 / Ctrl+Shift+Q 退出"
+                            banner = f"{'运行中' if self.armed else '输入待命'}｜{state_label}｜F7 Debug 框｜F8 启动/暂停｜F9 / Ctrl+Shift+Q 退出"
                     else:
-                        banner = "仅观察，不会发送按键｜在控制面板点击「启动挂机」｜F7 校对｜F9 / Ctrl+Shift+Q 退出"
+                        banner = "按键未授权｜请从 Start.bat 启动｜F7 Debug 框｜F9 / Ctrl+Shift+Q 退出"
                     overlay.update(
                         {
                             "left": current_window.left,

@@ -11,7 +11,8 @@ import numpy as np
 from mbv.config import load_config, save_config
 from mbv.input import VK
 from mbv.overlay import interactive_overlay
-from mbv.paths import ASSET_DIR, PLAYER_ASSET_DIR, PLAYER_HEAD_ASSET_DIR, PLAYER_TITLE_ASSET_DIR
+from mbv.paths import PLAYER_ASSET_DIR, PLAYER_HEAD_ASSET_DIR, PLAYER_TITLE_ASSET_DIR
+from mbv.template_store import monster_template_directory
 from mbv.vision import (
     attack_box_from_rectangle,
     normalize_facing,
@@ -126,7 +127,19 @@ def capture_frozen_selection(
     return frame[top:bottom, left:right].copy()
 
 
-def capture_template(config_path: Path, parent: Any = None) -> Path:
+def _save_captured_template(image: np.ndarray, directory: Path, prefix: str, label: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    path = directory / f"{prefix}-{stamp}.png"
+    ok, encoded = cv2.imencode(".png", image)
+    if not ok:
+        raise RuntimeError(f"无法保存{label}模板图片")
+    encoded.tofile(path)
+    print(f"{label}模板已保存：{path}")
+    return path
+
+
+def capture_template(config_path: Path, parent: Any = None, category: str = "") -> Path:
     config = load_config(config_path)
     window = find_game_window(config)
     image = capture_frozen_selection(
@@ -135,14 +148,24 @@ def capture_template(config_path: Path, parent: Any = None) -> Path:
         "已取消怪物模板框选",
         parent=parent,
     )
-    ASSET_DIR.mkdir(parents=True, exist_ok=True)
-    path = ASSET_DIR / f"monster-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
-    ok, encoded = cv2.imencode(".png", image)
-    if not ok:
-        raise RuntimeError("无法保存怪物模板图片")
-    encoded.tofile(path)
-    print(f"怪物模板已保存：{path}")
-    return path
+    directory = monster_template_directory(category, "monster", create=True)
+    return _save_captured_template(image, directory, "monster", "怪物")
+
+
+def capture_monster_filter(config_path: Path, parent: Any = None, category: str = "") -> Path:
+    config = load_config(config_path)
+    window = find_game_window(config)
+    image = capture_frozen_selection(
+        window,
+        "紧贴框选不应被识别为怪物的场景物体或特效",
+        "已取消过滤项框选",
+        parent=parent,
+    )
+    # 过滤项需要保留完整矩形结构；透明度全满可阻止加载器套用怪物前景蒙版。
+    bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
+    bgra[:, :, 3] = 255
+    directory = monster_template_directory(category, "filter", create=True)
+    return _save_captured_template(bgra, directory, "filter", "怪物过滤项")
 
 
 def player_template_alpha(image: np.ndarray) -> np.ndarray:
