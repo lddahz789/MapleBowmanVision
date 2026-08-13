@@ -5,12 +5,27 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 
-from mbv.paths import ASSET_DIR, MONSTER_FILTER_ASSET_DIR, TEMPLATE_TRASH_DIR
+from mbv.paths import (
+    ASSET_DIR,
+    MONSTER_FILTER_ASSET_DIR,
+    PLAYER_ASSET_DIR,
+    PLAYER_HEAD_ASSET_DIR,
+    PLAYER_TITLE_ASSET_DIR,
+    TEMPLATE_TRASH_DIR,
+)
 
 
 UNCATEGORIZED = ""
 UNCATEGORIZED_LABEL = "未分类"
 CATEGORY_MARKER = ".gitkeep"
+TEMPLATE_KINDS = frozenset({"monster", "filter", "player", "head", "title"})
+_TRASH_DIRECTORIES = {
+    "monster": "monsters",
+    "filter": "monster_filters",
+    "player": "player",
+    "head": "player_head",
+    "title": "player_title",
+}
 _INVALID_CATEGORY_CHARS = frozenset('<>:"/\\|?*')
 _WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -34,11 +49,26 @@ class MonsterCategory:
 
 
 @dataclass(frozen=True)
-class MonsterTemplateItem:
+class TemplateRoots:
+    monster: Path = ASSET_DIR
+    filter: Path = MONSTER_FILTER_ASSET_DIR
+    player: Path = PLAYER_ASSET_DIR
+    head: Path = PLAYER_HEAD_ASSET_DIR
+    title: Path = PLAYER_TITLE_ASSET_DIR
+
+
+DEFAULT_TEMPLATE_ROOTS = TemplateRoots()
+
+
+@dataclass(frozen=True)
+class TemplateItem:
     category: str
     kind: str
     filename: str
     path: Path
+
+
+MonsterTemplateItem = TemplateItem
 
 
 def validate_category_name(name: str) -> str:
@@ -65,11 +95,16 @@ def _direct_pngs(directory: Path) -> list[Path]:
     if not directory.is_dir():
         return []
     try:
-        return sorted(
-            (path for path in directory.glob("*.png") if path.is_file()),
-            key=lambda path: path.name.casefold(),
-        )
-    except OSError:
+        resolved_directory = directory.resolve()
+        paths = []
+        for path in directory.glob("*.png"):
+            if not path.is_file():
+                continue
+            resolved_path = path.resolve()
+            if resolved_path.parent == resolved_directory:
+                paths.append(path)
+        return sorted(paths, key=lambda path: path.name.casefold())
+    except (OSError, RuntimeError):
         return []
 
 
@@ -146,6 +181,42 @@ def monster_template_directory(
         if actual:
             (directory / CATEGORY_MARKER).touch(exist_ok=True)
     return directory
+
+
+def template_directory(
+    kind: str,
+    category: str = "",
+    *,
+    roots: TemplateRoots = DEFAULT_TEMPLATE_ROOTS,
+    create: bool = False,
+) -> Path:
+    if kind not in TEMPLATE_KINDS:
+        raise ValueError(f"未知模板类型：{kind}")
+    if kind in {"monster", "filter"}:
+        return monster_template_directory(
+            category,
+            kind,
+            monster_root=roots.monster,
+            filter_root=roots.filter,
+            create=create,
+        )
+    if category:
+        raise ValueError("姓名板、头部和称号模板不使用怪物分类")
+    directory = getattr(roots, kind)
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def list_template_items(
+    kind: str,
+    category: str = "",
+    *,
+    roots: TemplateRoots = DEFAULT_TEMPLATE_ROOTS,
+) -> list[TemplateItem]:
+    directory = template_directory(kind, category, roots=roots)
+    actual_category = directory.name if category and kind in {"monster", "filter"} else ""
+    return [TemplateItem(actual_category, kind, path.name, path) for path in _direct_pngs(directory)]
 
 
 def create_monster_category(
@@ -253,13 +324,50 @@ def list_monster_template_items(
     monster_root: Path = ASSET_DIR,
     filter_root: Path = MONSTER_FILTER_ASSET_DIR,
 ) -> list[MonsterTemplateItem]:
-    directory = monster_template_directory(
-        category,
+    return list_template_items(
         kind,
-        monster_root=monster_root,
-        filter_root=filter_root,
+        category,
+        roots=TemplateRoots(monster=monster_root, filter=filter_root),
     )
-    return [MonsterTemplateItem(category, kind, path.name, path) for path in _direct_pngs(directory)]
+
+
+def trash_template(
+    kind: str,
+    filename: str,
+    category: str = "",
+    *,
+    roots: TemplateRoots = DEFAULT_TEMPLATE_ROOTS,
+    trash_root: Path = TEMPLATE_TRASH_DIR,
+) -> Path:
+    if kind not in TEMPLATE_KINDS:
+        raise ValueError(f"未知模板类型：{kind}")
+    candidate = Path(filename)
+    if candidate.name != filename or candidate.suffix.casefold() != ".png":
+        raise ValueError("只能删除列表中直属的 PNG 模板")
+
+    directory = template_directory(kind, category, roots=roots).resolve()
+    source = (directory / filename).resolve()
+    if source.parent != directory or not source.is_file():
+        raise FileNotFoundError(f"模板不存在：{filename}")
+
+    actual_category = directory.name if category and kind in {"monster", "filter"} else ""
+    label = f"{kind}-{actual_category or UNCATEGORIZED_LABEL}"
+    trash_root.mkdir(parents=True, exist_ok=True)
+    group = _trash_group(trash_root, label)
+    destination = group / _TRASH_DIRECTORIES[kind]
+    if actual_category:
+        destination /= actual_category
+    destination /= filename
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(destination))
+    except Exception:
+        if destination.exists() and not source.exists():
+            source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(destination), str(source))
+        shutil.rmtree(group, ignore_errors=True)
+        raise
+    return destination
 
 
 def trash_monster_template(
@@ -271,20 +379,10 @@ def trash_monster_template(
     filter_root: Path = MONSTER_FILTER_ASSET_DIR,
     trash_root: Path = TEMPLATE_TRASH_DIR,
 ) -> Path:
-    if Path(filename).name != filename or Path(filename).suffix.casefold() != ".png":
-        raise ValueError("只能删除分类中已列出的 PNG 模板")
-    directory = monster_template_directory(
-        category,
+    return trash_template(
         kind,
-        monster_root=monster_root,
-        filter_root=filter_root,
-    ).resolve()
-    source = (directory / filename).resolve()
-    if source.parent != directory or not source.is_file():
-        raise FileNotFoundError(f"模板不存在：{filename}")
-    trash_root.mkdir(parents=True, exist_ok=True)
-    group = _trash_group(trash_root, category or UNCATEGORIZED_LABEL)
-    destination = group / kind / (category or UNCATEGORIZED_LABEL) / filename
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(source), str(destination))
-    return destination
+        filename,
+        category,
+        roots=TemplateRoots(monster=monster_root, filter=filter_root),
+        trash_root=trash_root,
+    )

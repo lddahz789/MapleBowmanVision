@@ -9,13 +9,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from mbv.template_store import (  # noqa: E402
+    TemplateRoots,
     UNCATEGORIZED,
     create_monster_category,
     list_monster_categories,
     list_monster_template_items,
+    list_template_items,
     rename_monster_category,
     trash_monster_category,
     trash_monster_template,
+    trash_template,
     validate_category_name,
 )
 from mbv import template_store  # noqa: E402
@@ -24,16 +27,131 @@ from mbv import template_store  # noqa: E402
 class TemplateStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = TemporaryDirectory()
-        base = Path(self.temporary.name)
-        self.monsters = base / "monsters"
-        self.filters = base / "filters"
-        self.trash = base / "trash"
+        self.base = Path(self.temporary.name)
+        self.monsters = self.base / "monsters"
+        self.filters = self.base / "filters"
+        self.player = self.base / "player"
+        self.head = self.base / "player_head"
+        self.title = self.base / "player_title"
+        self.trash = self.base / "trash"
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
     def _roots(self) -> dict[str, Path]:
         return {"monster_root": self.monsters, "filter_root": self.filters}
+
+    def _template_roots(self) -> TemplateRoots:
+        return TemplateRoots(
+            monster=self.monsters,
+            filter=self.filters,
+            player=self.player,
+            head=self.head,
+            title=self.title,
+        )
+
+    def test_all_template_kinds_list_only_direct_pngs_in_name_order(self):
+        roots = self._template_roots()
+        directories = {
+            "monster": self.monsters,
+            "filter": self.filters,
+            "player": self.player,
+            "head": self.head,
+            "title": self.title,
+        }
+        for kind, directory in directories.items():
+            directory.mkdir(parents=True)
+            (directory / "z-last.png").write_bytes(kind.encode())
+            (directory / "Alpha.png").write_bytes(kind.encode())
+            (directory / "notes.txt").write_text("not a template", encoding="utf-8")
+            nested = directory / "nested"
+            nested.mkdir()
+            (nested / "hidden.png").write_bytes(b"nested")
+
+            with self.subTest(kind=kind):
+                items = list_template_items(kind, roots=roots)
+                self.assertEqual([item.filename for item in items], ["Alpha.png", "z-last.png"])
+                self.assertTrue(all(item.kind == kind for item in items))
+                self.assertTrue(all(item.category == UNCATEGORIZED for item in items))
+                self.assertEqual([item.path for item in items], [directory / item.filename for item in items])
+
+    def test_player_anchor_templates_are_soft_deleted_without_touching_siblings(self):
+        roots = self._template_roots()
+        directories = {
+            "player": self.player,
+            "head": self.head,
+            "title": self.title,
+        }
+        for kind, directory in directories.items():
+            directory.mkdir(parents=True)
+            source = directory / f"{kind}.png"
+            sibling = directory / f"{kind}-keep.png"
+            source.write_bytes(f"deleted-{kind}".encode())
+            sibling.write_bytes(f"kept-{kind}".encode())
+
+            with self.subTest(kind=kind):
+                recovered = trash_template(
+                    kind,
+                    source.name,
+                    roots=roots,
+                    trash_root=self.trash,
+                )
+                self.assertFalse(source.exists())
+                self.assertEqual(sibling.read_bytes(), f"kept-{kind}".encode())
+                self.assertEqual(recovered.read_bytes(), f"deleted-{kind}".encode())
+                recovered.resolve().relative_to(self.trash.resolve())
+
+    def test_generic_template_api_rejects_unsafe_kind_category_and_filename(self):
+        roots = self._template_roots()
+        self.player.mkdir(parents=True)
+        (self.player / "player.png").write_bytes(b"player")
+        outside = self.base / "outside.png"
+        outside.write_bytes(b"outside")
+
+        with self.assertRaises(ValueError):
+            list_template_items("unknown", roots=roots)
+        with self.assertRaises(ValueError):
+            trash_template("unknown", "player.png", roots=roots, trash_root=self.trash)
+        with self.assertRaises(ValueError):
+            list_template_items("player", category="怪物分类", roots=roots)
+        with self.assertRaises(ValueError):
+            trash_template(
+                "player",
+                "player.png",
+                category="怪物分类",
+                roots=roots,
+                trash_root=self.trash,
+            )
+        for filename in ("../outside.png", "..\\outside.png", "player.jpg"):
+            with self.subTest(filename=filename), self.assertRaises(ValueError):
+                trash_template(
+                    "player",
+                    filename,
+                    roots=roots,
+                    trash_root=self.trash,
+                )
+
+        self.assertEqual((self.player / "player.png").read_bytes(), b"player")
+        self.assertEqual(outside.read_bytes(), b"outside")
+
+    def test_generic_template_delete_cleans_trash_group_when_move_fails(self):
+        roots = self._template_roots()
+        self.player.mkdir(parents=True)
+        source = self.player / "player.png"
+        source.write_bytes(b"player")
+
+        with patch("mbv.template_store.shutil.move", side_effect=OSError("simulated move failure")):
+            with self.assertRaisesRegex(OSError, "simulated"):
+                trash_template(
+                    "player",
+                    source.name,
+                    roots=roots,
+                    trash_root=self.trash,
+                )
+
+        self.assertEqual(source.read_bytes(), b"player")
+        trash_entries = list(self.trash.iterdir()) if self.trash.exists() else []
+        self.assertEqual(trash_entries, [])
 
     def test_category_crud_preserves_and_recovers_templates(self):
         created = create_monster_category("绿水灵", **self._roots())
