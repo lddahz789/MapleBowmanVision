@@ -34,21 +34,20 @@ Windows 上的 **经典冒险岛 / 怀旧服** 弓箭手视觉挂机原型。
 maple_bowman.py      # 兼容入口 + 再导出，批处理跑这个；不要往里加业务
 game_overlay.py      # 再导出 mbv.overlay
 control_panel.py     # 再导出 mbv.panel
-Start.bat            # 观察/面板（pythonw，不发键除非之后点启动挂机并过 UAC）
-Start-Observer.bat   # 调用 Start.bat，不要复制粘贴第二份启动逻辑
-Start-Bot.bat        # UAC 后 --enable-input
+Start.bat            # 唯一日常入口；UAC 后进入输入待命，不自动启动挂机
 Setup.bat / setup_env.py
 config.example.json
 CHANGELOG.md
 mbv/
   paths.py           # ROOT、assets、logs
+  template_store.py  # 怪物分类、过滤项与可恢复删除
   config.py          # load/save、SessionLog
   win32.py           # ctypes、完整性级别
   input.py           # Keyboard、VK、SendInput/PostMessage
   window.py          # 找窗口、客户区截图
   vision.py          # ROI、血蓝、模板、玩家融合、攻击框
   calibrate.py       # 校准、冻结帧采集、框选攻击范围
-  overlay.py         # HUD、交互框选、F7 显隐
+  overlay.py         # HUD、交互框选、F7/面板 Debug 框显隐
   panel.py           # Tk 控制面板
   bot.py             # BowmanBot 主循环
   cli.py             # argparse、main/run
@@ -65,7 +64,7 @@ assets/{monsters,player,player_head,player_title}/
 3. 玩家：姓名板模板优先，失败则头部、称号；多路互相校验，避免锁别人。`PlayerAnchor.box` 顶边是脚底高度，水平中心是角色 X；攻击框锚在检测框几何中心（`raw_box` 优先）。
 4. 怪物：战斗区模板匹配。在 `bow_attack_box` 还原出的矩形内选最近目标；框外同高度带则 chase。
 5. `input.delivery=background`：始终 `SendInput` 扫描码；失焦时额外 Post/Send 消息，且不要先松开扫描码。`foreground`：仅 SendInput，失焦停机。
-6. 挂机需要管理员完整性 ≥ 游戏（UAC）。观察模式 `input_authorized=False` 不发键。
+6. 挂机需要管理员完整性 ≥ 游戏（UAC）。`Start.bat` 启动时提权并授权输入，但只进入待命；必须再点“启动挂机”或按 F8 才会发键。
 
 ## 关键行为细节
 
@@ -73,7 +72,7 @@ assets/{monsters,player,player_head,player_title}/
 - **同帧检测复用**：`BowmanBot.run` 每帧建一个 `SceneFeatures`，四路 `find_detections` 共用；模板特征按缩放比例缓存在 `Template` 上。新增检测请传同一个 `SceneFeatures`，不要重复传原始帧。
 - **冻结帧采集**：`capture_frozen_selection` 先截图，把帧传给 `interactive_overlay(..., frozen_frame=)`，裁切同一帧。不要改回「先框再截第二张图」。
 - **攻击框**：`bow_attack_box.{forward,back,up,down}` 是相对角色中心、占战斗区宽高的比例，随 `bot.direction` 左右翻转。不要再做成 `max(左,右)` 对称修正。旧配置只有 `bow_attack_range` / `bow_vertical_tolerance` 时，`attack_box_from_config` 会合成对称框。
-- **F7**：`BowmanBot.toggle_calibration_overlay`；HUD 用 `overlay_draw_plan`。与采集时 `overlay.hide()` 独立。
+- **Debug 框 / F7**：`BowmanBot.set_calibration_overlay_visible` / `toggle_calibration_overlay`；HUD 用 `overlay_draw_plan`。与采集时 `overlay.hide()` 独立。
 - **面板不抢焦点**：`prevent_window_activate` 只设 `WS_EX_NOACTIVATE`。
 - **配置**：`load_config` 要求 `version == 1`，并补 `input.delivery`、`behavior.bow_attack_box`。
 
@@ -99,8 +98,9 @@ Start.bat
 | 按键发不出去 / 后台 | `mbv/input.py` |
 | 找不到窗口 / 截图 | `mbv/window.py` |
 | 认错人、认错怪、攻击距离 | `mbv/vision.py` |
+| 怪物分类、过滤项增删 | `mbv/template_store.py`、`mbv/panel.py` |
 | 校准、采模板、冻结帧 | `mbv/calibrate.py`、`mbv/overlay.py` |
-| HUD 颜色、F7 | `mbv/overlay.py`、`mbv/bot.py` |
+| HUD 颜色、Debug 框、F7 | `mbv/overlay.py`、`mbv/bot.py`、`mbv/panel.py` |
 | 面板按钮、配置项 | `mbv/panel.py` |
 | 走位/攻击/补药状态机 | `mbv/bot.py` |
 | 启动参数 | `mbv/cli.py` |

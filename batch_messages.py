@@ -20,7 +20,7 @@ MESSAGES = {
     "setup_failed": "安装失败，请查看上方的错误信息。",
     "setup_need_python": "需要 Python 3.10 或更高版本。当前环境过旧，无法安装 numpy 2.1。",
     "input_authorized": "本次运行已允许按键输入，请保持游戏位于前台。",
-    "hotkeys": "F7 显隐校对信息，F8 启动或暂停，F9 立即退出。",
+    "hotkeys": "F7 显隐 Debug 框，F8 启动或暂停，F9 立即退出。",
     "close_window": "按任意键关闭窗口……",
 }
 

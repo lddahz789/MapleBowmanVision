@@ -10,6 +10,10 @@ diagnostics/
 # Personal calibration and captured templates
 config.json
 assets/monsters/*.png
+assets/monsters/**/*.png
+assets/monster_filters/*.png
+assets/monster_filters/**/*.png
+assets/template_trash/
 assets/player/*.png
 assets/player_head/*.png
 assets/player_title/*.png

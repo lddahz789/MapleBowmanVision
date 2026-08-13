@@ -35,7 +35,7 @@ user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, LONG_PTR]
 TRANSPARENT = "#010101"
 INTERACTIVE_CAPTURE_BG = "#020202"
 INTERACTIVE_CAPTURE_ALPHA = 0.02
-CALIBRATION_HINT = "F7 显示校对信息"
+CALIBRATION_HINT = "F7 显示 Debug 框"
 
 
 def overlay_draw_plan(state: dict[str, Any]) -> dict[str, Any]:
@@ -135,7 +135,7 @@ class RuntimeOverlay:
         exit_root.wm_attributes("-topmost", True)
         exit_button = tk.Button(
             exit_root,
-            text="退出观察",
+            text="退出程序",
             command=self._request_exit,
             bg="#a52828",
             fg="white",
@@ -162,6 +162,8 @@ class RuntimeOverlay:
         self._exit_button = exit_button
         self._exit_hwnd = exit_hwnd
         self._closed = False
+        self._visible = True
+        self._last_state: dict[str, Any] | None = None
 
     def set_exit_handler(self, handler: Callable[[], None]) -> None:
         self._exit_handler = handler
@@ -195,11 +197,19 @@ class RuntimeOverlay:
                 pass
 
     def hide(self) -> None:
+        self._visible = False
         self._root.withdraw()
         self._exit_root.withdraw()
 
     def show(self) -> None:
-        pass
+        if self._closed:
+            return
+        self._visible = True
+        if self._last_state is not None:
+            try:
+                self._draw(self._root, self._canvas, self._hwnd, self._last_state)
+            except tk.TclError:
+                self._closed = True
 
     def start_polling(self) -> None:
         self._root.after(0, self._poll)
@@ -221,7 +231,9 @@ class RuntimeOverlay:
             self._root.destroy()
             return
         if latest is not ...:
-            self._draw(self._root, self._canvas, self._hwnd, latest)
+            self._last_state = latest
+            if self._visible:
+                self._draw(self._root, self._canvas, self._hwnd, latest)
         if not self._closed:
             self._root.after(25, self._poll)
 
@@ -255,7 +267,7 @@ class RuntimeOverlay:
             exit_height,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )
-        self._exit_button.configure(text="退出程序" if state.get("input_authorized") else "退出观察")
+        self._exit_button.configure(text="退出程序")
         canvas.delete("all")
         font = ("Microsoft YaHei UI", max(12, int(height * 0.016)), "bold")
         small = ("Microsoft YaHei UI", max(11, int(height * 0.014)))

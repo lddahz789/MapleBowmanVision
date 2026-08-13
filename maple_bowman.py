@@ -7,6 +7,7 @@ from mbv.calibrate import (
     capture_attack_range,
     capture_frozen_selection,
     capture_key_name,
+    capture_monster_filter,
     capture_player_aux_template,
     capture_player_template,
     capture_template,
@@ -36,8 +37,12 @@ from mbv.vision import (
     choose_nearest_target,
     find_detections,
     find_monster,
+    load_templates,
+    monster_template_category,
+    monster_templates_for_category,
     player_marker,
     roi_pixels,
+    suppress_monster_detections,
 )
 from mbv.win32 import process_integrity_level, user32
 from mbv.window import WindowInfo

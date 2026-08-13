@@ -1,9 +1,11 @@
 import ctypes
 import json
 from pathlib import Path
+import queue
 import sys
+from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import cv2
 import numpy as np
@@ -28,6 +30,26 @@ class CoreTests(unittest.TestCase):
     def test_keyboard_scan_codes_exist(self):
         self.assertGreater(int(bot.user32.MapVirtualKeyW(bot.vk_for("shift"), 0)), 0)
         self.assertGreater(int(bot.user32.MapVirtualKeyW(bot.vk_for("left"), 0)), 0)
+
+    def test_hotkey_monitor_registers_all_bindings(self):
+        import threading
+        from mbv import bot as runtime_bot
+
+        instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
+        instance.hotkey_stop = threading.Event()
+        instance.hotkey_thread_id = 0
+        instance.log = type("Log", (), {"write": lambda _self, *_args, **_kwargs: None})()
+
+        with (
+            patch.object(runtime_bot.user32, "RegisterHotKey", return_value=True) as register,
+            patch.object(runtime_bot.user32, "GetMessageW", return_value=0),
+            patch.object(runtime_bot.user32, "UnregisterHotKey", return_value=True) as unregister,
+        ):
+            instance.monitor_hotkeys()
+
+        self.assertEqual(register.call_count, 4)
+        self.assertEqual(unregister.call_count, 4)
+        self.assertEqual(instance.hotkey_thread_id, 0)
 
     def test_current_process_integrity_is_readable(self):
         pid = int(ctypes.windll.kernel32.GetCurrentProcessId())
@@ -104,6 +126,60 @@ class CoreTests(unittest.TestCase):
         boxes = {item.box for item in detections}
         self.assertIn((25, 20, 12, 14), boxes)
         self.assertIn((101, 48, 12, 14), boxes)
+
+    def test_recursive_monster_template_loading_keeps_category_names(self):
+        rng = np.random.default_rng(29)
+        image = rng.integers(0, 256, (12, 10, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".png", image)
+        self.assertTrue(ok)
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            category = root / "绿水灵"
+            category.mkdir()
+            encoded.tofile(root / "legacy.png")
+            encoded.tofile(category / "jump.png")
+
+            recursive = bot.load_templates(root, recursive=True)
+            shallow = bot.load_templates(root)
+
+        self.assertEqual({item.name for item in recursive}, {"legacy.png", "绿水灵/jump.png"})
+        self.assertEqual([item.name for item in shallow], ["legacy.png"])
+
+    def test_monster_templates_only_keep_selected_category(self):
+        image = np.zeros((8, 8, 3), dtype=np.uint8)
+        mask = np.full((8, 8), 255, dtype=np.uint8)
+        templates = [
+            bot.Template("legacy.png", image, mask),
+            bot.Template("绿水灵/a.png", image, mask),
+            bot.Template("蓝蜗牛/b.png", image, mask),
+        ]
+
+        self.assertEqual(
+            [item.name for item in bot.monster_templates_for_category(templates, "绿水灵")],
+            ["绿水灵/a.png"],
+        )
+        self.assertEqual(
+            [item.name for item in bot.monster_templates_for_category(templates, "")],
+            ["legacy.png"],
+        )
+
+    def test_monster_filters_only_suppress_overlapping_same_category(self):
+        detections = [
+            bot.Detection((20, 20, 30, 30), 0.95, "绿水灵/a.png"),
+            bot.Detection((20, 20, 30, 30), 0.94, "蓝蜗牛/b.png"),
+            bot.Detection((120, 20, 30, 30), 0.93, "绿水灵/c.png"),
+            bot.Detection((20, 90, 30, 30), 0.92, "legacy.png"),
+        ]
+        filters = [
+            bot.Detection((16, 16, 38, 38), 0.9, "绿水灵/wall.png"),
+            bot.Detection((18, 88, 36, 36), 0.9, "root-wall.png"),
+        ]
+
+        kept = bot.suppress_monster_detections(detections, filters, min_overlap=0.5)
+
+        self.assertEqual([item.name for item in kept], ["蓝蜗牛/b.png", "绿水灵/c.png"])
+        self.assertEqual(bot.monster_template_category("legacy.png"), "")
+        self.assertEqual(bot.monster_template_category("绿水灵/jump.png"), "绿水灵")
 
     def test_target_selection_prefers_nearest_in_range_on_same_level(self):
         player = (100, 100, 40, 80)
@@ -266,6 +342,52 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(mid), 1)
         self.assertEqual(mid[0]["lower"][0], 81)
         self.assertEqual(mid[0]["upper"][0], 99)
+
+    def test_old_config_gets_safe_monster_filter_defaults(self):
+        legacy = json.loads(json.dumps(self.config))
+        legacy["vision"].pop("active_monster_category", None)
+        legacy["vision"].pop("monster_filter_threshold", None)
+        legacy["vision"].pop("monster_filter_overlap", None)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = bot.load_config(path)
+        self.assertEqual(loaded["vision"]["monster_filter_threshold"], 0.84)
+        self.assertEqual(loaded["vision"]["monster_filter_overlap"], 0.5)
+        self.assertEqual(loaded["vision"]["active_monster_category"], "")
+
+    def test_captured_monster_filter_keeps_full_rectangle_mask(self):
+        from mbv import calibrate as runtime_calibrate
+
+        image = np.zeros((16, 20, 3), dtype=np.uint8)
+        image[:, :10] = (30, 90, 180)
+        window = type("Window", (), {})()
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with (
+                patch.object(runtime_calibrate, "load_config", return_value=self.config),
+                patch.object(runtime_calibrate, "find_game_window", return_value=window),
+                patch.object(runtime_calibrate, "capture_frozen_selection", return_value=image),
+                patch.object(runtime_calibrate, "monster_template_directory", return_value=directory),
+            ):
+                path = runtime_calibrate.capture_monster_filter(Path("unused.json"), category="绿水灵")
+            decoded = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        self.assertEqual(decoded.shape, (16, 20, 4))
+        self.assertTrue(np.all(decoded[:, :, 3] == 255))
+
+    def test_template_preview_keeps_aspect_ratio_and_flattens_alpha(self):
+        from mbv.panel import template_preview_image
+
+        image = np.zeros((40, 80, 4), dtype=np.uint8)
+        image[10:30, 20:60] = (255, 80, 30, 255)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "preview.png"
+            ok, encoded = cv2.imencode(".png", image)
+            self.assertTrue(ok)
+            encoded.tofile(path)
+            preview = template_preview_image(path, (40, 40))
+        self.assertEqual(preview.size, (40, 20))
+        self.assertEqual(preview.mode, "RGB")
 
     def test_frozen_selection_displays_and_crops_the_same_captured_frame(self):
         frame = np.arange(8 * 10 * 3, dtype=np.uint8).reshape((8, 10, 3))
@@ -441,9 +563,27 @@ class CoreTests(unittest.TestCase):
 
     def test_template_counts_are_non_negative(self):
         counts = bot.template_counts()
-        self.assertEqual(set(counts), {"monster", "player", "head", "title"})
+        self.assertEqual(set(counts), {"monster", "filter", "category", "player", "head", "title"})
         for value in counts.values():
             self.assertGreaterEqual(value, 0)
+
+    def test_act_never_sends_input_without_authorization(self):
+        instance = bot.BowmanBot.__new__(bot.BowmanBot)
+        instance.armed = True
+        instance.input_authorized = False
+        instance.action_lock = __import__("threading").RLock()
+        instance.keyboard = MagicMock()
+
+        instance.act(None, 1.0, 1.0, None, None, None, None, 1, False, 0.0)
+
+        self.assertEqual(instance.keyboard.method_calls, [])
+
+    def test_start_bat_is_the_only_daily_startup(self):
+        startup_files = sorted(path.name for path in ROOT.glob("Start*.bat"))
+        self.assertEqual(startup_files, ["Start.bat"])
+        script = (ROOT / "Start.bat").read_text(encoding="utf-8")
+        self.assertIn("-Verb RunAs", script)
+        self.assertIn("--enable-input", script)
 
     def test_apply_config_switches_delivery_without_sendinput(self):
         instance = bot.BowmanBot.__new__(bot.BowmanBot)
@@ -453,6 +593,8 @@ class CoreTests(unittest.TestCase):
         instance.keyboard = bot.Keyboard("foreground")
         instance.keyboard.hwnd = 0
         instance.config_lock = __import__("threading").Lock()
+        instance.action_lock = __import__("threading").RLock()
+        instance.f8_requested = __import__("threading").Event()
         instance.last_player_auxiliary_at = 123.0
         config = json.loads(json.dumps(self.config))
         config.setdefault("input", {})["delivery"] = "background"
@@ -461,6 +603,52 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(instance.background_input)
         self.assertEqual(instance.last_player_auxiliary_at, 0.0)
         self.assertEqual(instance.keyboard.delivery, "background")
+
+    def test_apply_config_clears_pending_toggle_and_keeps_bot_paused(self):
+        import threading
+
+        instance = bot.BowmanBot.__new__(bot.BowmanBot)
+        instance.armed = True
+        instance.delivery = "background"
+        instance.background_input = True
+        instance.keyboard = MagicMock()
+        instance.keyboard.root_hwnd = 0
+        instance.keyboard.hwnd = 0
+        instance.config_lock = threading.Lock()
+        instance.action_lock = threading.RLock()
+        instance.f8_requested = threading.Event()
+        instance.f8_requested.set()
+        instance.last_player_auxiliary_at = 123.0
+        instance.log = MagicMock()
+        instance.notify = MagicMock()
+        config = json.loads(json.dumps(self.config))
+
+        instance.apply_config(config)
+
+        self.assertFalse(instance.armed)
+        self.assertFalse(instance.f8_requested.is_set())
+        instance.keyboard.release_all.assert_called_once_with()
+
+    def test_suspend_vision_clears_pending_toggle_and_releases_input(self):
+        import threading
+
+        instance = bot.BowmanBot.__new__(bot.BowmanBot)
+        instance.armed = True
+        instance.state = "ATTACK_RIGHT"
+        instance.action_lock = threading.RLock()
+        instance.vision_suspended = threading.Event()
+        instance.f8_requested = threading.Event()
+        instance.f8_requested.set()
+        instance.keyboard = MagicMock()
+        instance.log = MagicMock()
+        instance.notify = MagicMock()
+
+        instance.suspend_vision()
+
+        self.assertTrue(instance.vision_suspended.is_set())
+        self.assertFalse(instance.f8_requested.is_set())
+        self.assertFalse(instance.armed)
+        instance.keyboard.release_all.assert_called()
 
     def test_name_for_vk_roundtrip(self):
         for name in ("shift", "home", "end", "left", "a", "1"):
@@ -533,6 +721,74 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(hidden["notice"], "已暂停")
         self.assertTrue(overlay.overlay_draw_plan({})["show_calibration"])
 
+    def test_runtime_overlay_hide_blocks_queued_redraw_until_show(self):
+        import game_overlay as overlay
+
+        instance = overlay.RuntimeOverlay.__new__(overlay.RuntimeOverlay)
+        instance._updates = queue.Queue(maxsize=1)
+        instance._closed = False
+        instance._visible = True
+        instance._last_state = None
+        instance._root = MagicMock()
+        instance._exit_root = MagicMock()
+        instance._canvas = MagicMock()
+        instance._hwnd = 123
+        state = {"left": 10, "top": 20, "width": 800, "height": 600}
+        instance.update(state)
+
+        with patch.object(instance, "_draw") as draw:
+            instance.hide()
+            instance._poll()
+            draw.assert_not_called()
+            self.assertEqual(instance._last_state, state)
+
+            instance.show()
+            draw.assert_called_once_with(instance._root, instance._canvas, 123, state)
+
+    def test_closed_runtime_overlay_does_not_redraw_when_shown(self):
+        import game_overlay as overlay
+
+        instance = overlay.RuntimeOverlay.__new__(overlay.RuntimeOverlay)
+        instance._closed = True
+        instance._visible = False
+        instance._last_state = {"width": 800}
+        instance._root = MagicMock()
+        instance._canvas = MagicMock()
+        instance._hwnd = 123
+        with patch.object(instance, "_draw") as draw:
+            instance.show()
+        draw.assert_not_called()
+        self.assertFalse(instance._visible)
+
+    def test_template_manager_cleanup_clears_busy_when_overlay_is_closed(self):
+        from mbv.panel import ControlPanel
+
+        instance = ControlPanel.__new__(ControlPanel)
+        instance.busy = True
+        instance.bot = MagicMock()
+        instance.overlay = MagicMock()
+        instance.overlay.show.side_effect = RuntimeError("HUD 已关闭")
+        instance.root = MagicMock()
+        instance.root.winfo_exists.return_value = False
+
+        instance._close_template_manager(None)
+
+        instance.bot.resume_vision.assert_called_once_with()
+        self.assertFalse(instance.busy)
+
+    def test_panel_debug_button_updates_bot_visibility(self):
+        from mbv.panel import ControlPanel
+
+        instance = ControlPanel.__new__(ControlPanel)
+        instance.busy = False
+        instance.debug_boxes = MagicMock()
+        instance.debug_boxes.get.return_value = False
+        instance.bot = MagicMock()
+
+        instance._toggle_debug_boxes()
+
+        instance.bot.set_calibration_overlay_visible.assert_called_once_with(False)
+
     def test_toggle_calibration_overlay_is_independent_of_hide(self):
         instance = bot.BowmanBot.__new__(bot.BowmanBot)
         instance.calibration_overlay_visible = True
@@ -541,6 +797,8 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(instance.calibration_overlay_visible)
         instance.toggle_calibration_overlay()
         self.assertTrue(instance.calibration_overlay_visible)
+        instance.set_calibration_overlay_visible(False)
+        self.assertFalse(instance.calibration_overlay_visible)
         self.assertEqual(bot.vk_for("f7"), 0x76)
         self.assertEqual(bot.name_for_vk(0x76), "f7")
 

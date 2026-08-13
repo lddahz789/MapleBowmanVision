@@ -174,7 +174,7 @@ def main():
 
     subprocess.check_call([str(VENV_PYTHON), "-m", "pip", "--version"])
     pip_install()
-    print_utf8("安装完成。下一步请运行 Start-Calibrate.bat 进行画面校准。")
+    print_utf8("安装完成。下一步请运行唯一入口 Start.bat，并在控制面板中进行画面校准。")
     return 0
 
 

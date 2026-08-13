@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, Callable
 
 import cv2
@@ -154,19 +155,24 @@ def opponent_colors(image: np.ndarray) -> np.ndarray:
     return np.dstack((blue - green, red - green)).astype(np.float32)
 
 
-def load_templates(directory: Path = ASSET_DIR) -> list[Template]:
+def load_templates(directory: Path = ASSET_DIR, *, recursive: bool = False) -> list[Template]:
     templates: list[Template] = []
     directory.mkdir(parents=True, exist_ok=True)
-    for path in sorted(directory.glob("*.png")):
-        data = np.fromfile(path, dtype=np.uint8)
-        decoded = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+    paths = directory.rglob("*.png") if recursive else directory.glob("*.png")
+    for path in sorted(paths, key=lambda item: item.as_posix().casefold()):
+        try:
+            data = np.fromfile(path, dtype=np.uint8)
+            decoded = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+        except (OSError, ValueError, cv2.error):
+            continue
         if decoded is None:
             continue
         alpha = decoded[:, :, 3] if decoded.ndim == 3 and decoded.shape[2] == 4 else None
         image = decoded[:, :, :3] if decoded.ndim == 3 and decoded.shape[2] == 4 else decoded
         if image is not None and image.shape[0] >= 4 and image.shape[1] >= 4:
             mask = alpha if alpha is not None and int(np.count_nonzero(alpha)) > 0 else template_foreground_mask(image)
-            templates.append(Template(path.name, image, mask))
+            name = path.relative_to(directory).as_posix() if recursive else path.name
+            templates.append(Template(name, image, mask))
     return templates
 
 
@@ -216,6 +222,72 @@ def box_iou(first: tuple[int, int, int, int], second: tuple[int, int, int, int])
         return 0.0
     union = aw * ah + bw * bh - intersection
     return float(intersection / max(1, union))
+
+
+def monster_template_category(name: str) -> str:
+    """从递归模板名称中取得分类；根目录旧模板属于未分类。"""
+    parts = PurePosixPath(str(name).replace("\\", "/")).parts
+    return parts[0] if len(parts) > 1 else ""
+
+
+def monster_templates_for_category(
+    templates: list[Template],
+    category: str,
+) -> list[Template]:
+    """只保留指定怪物分类；空字符串表示根目录中的“未分类”。"""
+    selected = str(category).strip().casefold()
+    return [
+        template
+        for template in templates
+        if monster_template_category(template.name).casefold() == selected
+    ]
+
+
+def _intersection_over_smaller_box(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> float:
+    ax, ay, aw, ah = first
+    bx, by, bw, bh = second
+    left = max(ax, bx)
+    top = max(ay, by)
+    right = min(ax + aw, bx + bw)
+    bottom = min(ay + ah, by + bh)
+    intersection = max(0, right - left) * max(0, bottom - top)
+    return float(intersection / max(1, min(aw * ah, bw * bh)))
+
+
+def suppress_monster_detections(
+    detections: list[Detection],
+    filters: list[Detection],
+    min_overlap: float = 0.5,
+    center_margin: float = 0.15,
+) -> list[Detection]:
+    """只用同分类、同位置的过滤项抑制怪物候选，避免一处负样本误伤全屏。"""
+    overlap_threshold = max(0.0, min(1.0, float(min_overlap)))
+    margin = max(0.0, float(center_margin))
+    kept: list[Detection] = []
+    for detection in detections:
+        category = monster_template_category(detection.name).casefold()
+        center_x = detection.box[0] + detection.box[2] / 2.0
+        center_y = detection.box[1] + detection.box[3] / 2.0
+        suppressed = False
+        for exclusion in filters:
+            if monster_template_category(exclusion.name).casefold() != category:
+                continue
+            ex, ey, ew, eh = exclusion.box
+            margin_x = ew * margin
+            margin_y = eh * margin
+            center_inside = (
+                ex - margin_x <= center_x <= ex + ew + margin_x
+                and ey - margin_y <= center_y <= ey + eh + margin_y
+            )
+            if center_inside and _intersection_over_smaller_box(detection.box, exclusion.box) >= overlap_threshold:
+                suppressed = True
+                break
+        if not suppressed:
+            kept.append(detection)
+    return kept
 
 
 def find_detections(
