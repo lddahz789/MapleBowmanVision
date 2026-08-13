@@ -191,7 +191,12 @@ def capture_frozen_selection(
 def _save_captured_template(image: np.ndarray, directory: Path, prefix: str, label: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    path = directory / f"{prefix}-{stamp}.png"
+    stem = f"{prefix}-{stamp}"
+    path = directory / f"{stem}.png"
+    sequence = 2
+    while path.exists():
+        path = directory / f"{stem}-{sequence}.png"
+        sequence += 1
     ok, encoded = cv2.imencode(".png", image)
     if not ok:
         raise RuntimeError(f"无法保存{label}模板图片")
@@ -295,14 +300,7 @@ def capture_player_template(config_path: Path, parent: Any = None) -> Path:
     alpha = nameplate_template_alpha(image)
     bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
     bgra[:, :, 3] = alpha
-    PLAYER_ASSET_DIR.mkdir(parents=True, exist_ok=True)
-    path = PLAYER_ASSET_DIR / f"nameplate-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
-    ok, encoded = cv2.imencode(".png", bgra)
-    if not ok:
-        raise RuntimeError("无法保存玩家模板图片")
-    encoded.tofile(path)
-    print(f"玩家姓名板模板已保存：{path}")
-    return path
+    return _save_captured_template(bgra, PLAYER_ASSET_DIR, "nameplate", "玩家姓名板")
 
 
 def capture_player_aux_template(config_path: Path, kind: str, parent: Any = None) -> Path:
@@ -329,14 +327,7 @@ def capture_player_aux_template(config_path: Path, kind: str, parent: Any = None
     alpha = player_template_alpha(image) if kind == "head" else nameplate_template_alpha(image)
     bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
     bgra[:, :, 3] = alpha
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{prefix}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
-    ok, encoded = cv2.imencode(".png", bgra)
-    if not ok:
-        raise RuntimeError(f"无法保存{label}模板图片")
-    encoded.tofile(path)
-    print(f"{label}模板已保存：{path}")
-    return path
+    return _save_captured_template(bgra, directory, prefix, label)
 
 
 def capture_key_name(config: dict[str, Any], parent: Any = None) -> str:

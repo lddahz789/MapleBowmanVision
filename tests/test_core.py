@@ -623,6 +623,32 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(decoded.shape, (16, 20, 4))
         self.assertTrue(np.all(decoded[:, :, 3] == 255))
 
+    def test_captured_template_never_overwrites_an_existing_timestamp(self):
+        from datetime import datetime as real_datetime
+        from mbv import calibrate as runtime_calibrate
+
+        class FixedDateTime:
+            @classmethod
+            def now(cls):
+                return real_datetime(2026, 8, 14, 12, 30, 0, 123456)
+
+        first_image = np.full((8, 8, 3), 20, dtype=np.uint8)
+        second_image = np.full((8, 8, 3), 220, dtype=np.uint8)
+        with TemporaryDirectory() as temporary, patch.object(
+            runtime_calibrate,
+            "datetime",
+            FixedDateTime,
+        ):
+            directory = Path(temporary)
+            first = runtime_calibrate._save_captured_template(first_image, directory, "head", "玩家头部")
+            second = runtime_calibrate._save_captured_template(second_image, directory, "head", "玩家头部")
+            first_decoded = cv2.imdecode(np.fromfile(first, dtype=np.uint8), cv2.IMREAD_COLOR)
+            second_decoded = cv2.imdecode(np.fromfile(second, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(np.all(first_decoded == 20))
+        self.assertTrue(np.all(second_decoded == 220))
+
     def test_template_preview_keeps_aspect_ratio_and_flattens_alpha(self):
         from mbv.panel import template_preview_image
 
@@ -636,6 +662,20 @@ class CoreTests(unittest.TestCase):
             preview = template_preview_image(path, (40, 40))
         self.assertEqual(preview.size, (40, 20))
         self.assertEqual(preview.mode, "RGB")
+
+    def test_template_manager_exposes_all_persisted_image_kinds(self):
+        from mbv.panel import TEMPLATE_GROUPS
+
+        self.assertEqual(
+            TEMPLATE_GROUPS,
+            (
+                ("monster", "怪物模板"),
+                ("filter", "过滤项"),
+                ("player", "姓名板"),
+                ("head", "头部"),
+                ("title", "称号勋章"),
+            ),
+        )
 
     def test_strategy_numeric_stepper_changes_values_without_keyboard_focus(self):
         from mbv.panel import adjusted_numeric_text

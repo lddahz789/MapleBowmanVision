@@ -41,7 +41,7 @@ CHANGELOG.md
 STRATEGIES.md       # 职业策略接口、配置与协作扩展规范
 mbv/
   paths.py           # ROOT、assets、logs
-  template_store.py  # 怪物分类、过滤项与可恢复删除
+  template_store.py  # 五类采集图片、怪物分类与可恢复删除
   config.py          # load/save、SessionLog
   win32.py           # ctypes、完整性级别
   input.py           # Keyboard、VK、SendInput/PostMessage
@@ -104,7 +104,7 @@ Start.bat
 | 按键发不出去 / 后台 | `mbv/input.py` |
 | 找不到窗口 / 截图 | `mbv/window.py` |
 | 认错人、认错怪、攻击距离 | `mbv/vision.py` |
-| 怪物分类、过滤项增删 | `mbv/template_store.py`、`mbv/panel.py` |
+| 怪物分类、所有采集图片增删 | `mbv/template_store.py`、`mbv/panel.py` |
 | 校准、采模板、冻结帧 | `mbv/calibrate.py`、`mbv/overlay.py` |
 | HUD 颜色、Debug 框、F7 | `mbv/overlay.py`、`mbv/bot.py`、`mbv/panel.py` |
 | 面板按钮、配置项 | `mbv/panel.py` |

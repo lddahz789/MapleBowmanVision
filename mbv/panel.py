@@ -29,10 +29,10 @@ from mbv.template_store import (
     UNCATEGORIZED_LABEL,
     create_monster_category,
     list_monster_categories,
-    list_monster_template_items,
+    list_template_items,
     rename_monster_category,
     trash_monster_category,
-    trash_monster_template,
+    trash_template,
 )
 
 BG = "#1b1b1b"
@@ -48,6 +48,14 @@ FONT = ("Microsoft YaHei UI", 10)
 FONT_TITLE = ("Microsoft YaHei UI", 14, "bold")
 FONT_SECTION = ("Microsoft YaHei UI", 11, "bold")
 FONT_SMALL = ("Microsoft YaHei UI", 9)
+TEMPLATE_GROUPS = (
+    ("monster", "怪物模板"),
+    ("filter", "过滤项"),
+    ("player", "姓名板"),
+    ("head", "头部"),
+    ("title", "称号勋章"),
+)
+TEMPLATE_GROUP_LABELS = dict(TEMPLATE_GROUPS)
 
 
 def template_preview_image(path: Path, max_size: tuple[int, int] = (280, 260)) -> Image.Image:
@@ -242,7 +250,7 @@ class ControlPanel:
             ).pack(side="left", fill="x", expand=True, padx=2, ipady=2)
         self._row_button(capture, "采集怪物模板", lambda: self._capture("monster"))
         self._row_button(capture, "采集过滤项（排除误识别）", lambda: self._capture("filter"))
-        self._row_button(capture, "管理当前分类模板…", self._manage_monster_templates)
+        self._row_button(capture, "管理所有采集图片…", self._manage_templates)
         tk.Label(
             capture,
             textvariable=self.monster_category_summary,
@@ -840,7 +848,7 @@ class ControlPanel:
         if not category:
             messagebox.showinfo(
                 "无法删除分类",
-                f'系统分类“{UNCATEGORIZED_LABEL}”不能删除；可以点击“管理当前分类模板”删除其中的图片。',
+                f'系统分类“{UNCATEGORIZED_LABEL}”不能删除；可以点击“管理所有采集图片”删除其中的图片。',
                 parent=self.root,
             )
             return
@@ -860,21 +868,20 @@ class ControlPanel:
 
         self._run_tool("分类删除", action)
 
-    def _manage_monster_templates(self) -> None:
+    def _manage_templates(self) -> None:
         if self.busy:
             return
         category = self._selected_monster_category()
-        label = category or UNCATEGORIZED_LABEL
         self.busy = True
         dialog: tk.Toplevel | None = None
         try:
             self.overlay.hide()
             self.bot.suspend_vision()
             dialog = tk.Toplevel(self.root)
-            dialog.title(f"管理怪物模板 · {label}")
+            dialog.title("管理所有采集图片")
             dialog.configure(bg=BG)
-            dialog.geometry("920x500")
-            dialog.minsize(760, 420)
+            dialog.geometry("980x560")
+            dialog.minsize(900, 480)
             dialog.transient(self.root)
             dialog.wm_attributes("-topmost", True)
             dialog.update_idletasks()
@@ -889,6 +896,10 @@ class ControlPanel:
                 messagebox.showerror("打开模板管理失败", str(exc), parent=self.root)
             except tk.TclError:
                 pass
+
+    def _manage_monster_templates(self) -> None:
+        """兼容旧入口；当前管理器已覆盖全部五类采集图片。"""
+        self._manage_templates()
 
     def _close_template_manager(self, dialog: tk.Toplevel | None) -> None:
         if dialog is not None and bool(getattr(dialog, "_mbv_closed", False)):
@@ -926,7 +937,7 @@ class ControlPanel:
         groups: dict[str, dict[str, Any]] = {}
         preview_photo: list[ImageTk.PhotoImage | None] = [None]
         active_kind: list[str | None] = [None]
-        preview_title = tk.StringVar(value="选择左侧模板以预览")
+        preview_title = tk.StringVar(value="选择左侧图片以预览")
         preview_info = tk.StringVar(value="")
 
         preview_frame = tk.Frame(dialog, bg=PANEL, highlightbackground="#333333", highlightthickness=1)
@@ -961,7 +972,7 @@ class ControlPanel:
             justify="center",
         ).pack(fill="x", padx=10, pady=(4, 10))
 
-        def clear_preview(message: str = "选择左侧模板以预览") -> None:
+        def clear_preview(message: str = "选择左侧图片以预览") -> None:
             preview_photo[0] = None
             preview_title.set(message)
             preview_info.set("")
@@ -988,8 +999,11 @@ class ControlPanel:
                 preview_title.set(template.filename)
                 with Image.open(template.path) as original:
                     width, height = original.size
-                kind_label = "怪物模板" if kind == "monster" else "过滤项"
-                preview_info.set(f"{kind_label}｜原图 {width}×{height}")
+                details = [TEMPLATE_GROUP_LABELS[kind]]
+                if kind in {"monster", "filter"}:
+                    details.append(f"分类 {group['category'] or UNCATEGORIZED_LABEL}")
+                details.append(f"原图 {width}×{height}")
+                preview_info.set("｜".join(details))
             except Exception as exc:
                 clear_preview(f"无法预览：{template.filename}")
                 preview_info.set(str(exc))
@@ -998,39 +1012,62 @@ class ControlPanel:
             active_kind[0] = None
             for kind, group in groups.items():
                 listbox = group["listbox"]
-                items = list_monster_template_items(category, kind)
+                items = list_template_items(kind, group["category"])
                 group["items"] = items
                 listbox.delete(0, "end")
                 for template in items:
                     listbox.insert("end", template.filename)
+                group["notebook"].tab(
+                    group["frame"],
+                    text=f"{TEMPLATE_GROUP_LABELS[kind]} ({len(items)})",
+                )
             clear_preview()
             if preferred is not None:
                 kind, index = preferred
                 items = groups[kind]["items"]
                 if items:
                     selected_index = min(index, len(items) - 1)
+                    groups[kind]["notebook"].select(groups[kind]["frame"])
                     groups[kind]["listbox"].selection_set(selected_index)
                     groups[kind]["listbox"].see(selected_index)
                     show_preview(kind)
+
+        def capture_new(kind: str) -> None:
+            self._close_template_manager(dialog)
+
+            def capture_and_reopen() -> None:
+                self._capture(kind)
+                try:
+                    if self.root.winfo_exists():
+                        self._manage_templates()
+                except tk.TclError:
+                    pass
+
+            self.root.after_idle(capture_and_reopen)
 
         def delete_selected(kind: str) -> None:
             group = groups[kind]
             indexes = group["listbox"].curselection()
             if not indexes:
-                messagebox.showinfo("删除模板", "请先选择一张模板。", parent=dialog)
+                messagebox.showinfo("删除采集图片", "请先选择一张图片。", parent=dialog)
                 return
             index = int(indexes[0])
             template = group["items"][index]
+            kind_label = TEMPLATE_GROUP_LABELS[kind]
+            consequence = ""
+            if kind == "player" and len(group["items"]) == 1:
+                consequence = "\n\n这是最后一张姓名板；删除后必须重新采集才能启动挂机。"
             if not messagebox.askyesno(
-                "删除模板",
-                f"确定删除 {template.filename} 吗？\n文件会移入模板回收目录。",
+                "删除采集图片",
+                f"确定删除{kind_label} {template.filename} 吗？"
+                f"{consequence}\n\n文件会移入模板回收目录，可以手动恢复。",
                 parent=dialog,
             ):
                 return
             try:
-                trash_monster_template(category, kind, template.filename)
+                trash_template(kind, template.filename, group["category"])
             except Exception as exc:
-                messagebox.showerror("删除模板失败", str(exc), parent=dialog)
+                messagebox.showerror("删除采集图片失败", str(exc), parent=dialog)
                 return
 
             try:
@@ -1050,12 +1087,12 @@ class ControlPanel:
 
                 if refresh_errors:
                     messagebox.showwarning(
-                        "模板已删除，但刷新未完成",
+                        "图片已删除，但刷新未完成",
                         f"{template.filename} 已移入模板回收目录。\n\n" + "\n".join(refresh_errors),
                         parent=dialog,
                     )
                 else:
-                    self.bot.notify(f"已删除模板：{template.filename}", 3.0)
+                    self.bot.notify(f"已删除{kind_label}：{template.filename}", 3.0)
             finally:
                 try:
                     if dialog.winfo_exists():
@@ -1064,12 +1101,24 @@ class ControlPanel:
                 except tk.TclError:
                     pass
 
-        for kind, title in (("monster", "怪物模板"), ("filter", "过滤项")):
-            frame = tk.Frame(dialog, bg=PANEL, highlightbackground="#333333", highlightthickness=1)
-            frame.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
-            tk.Label(frame, text=title, bg=PANEL, fg=FG, font=FONT_SECTION).pack(fill="x", padx=8, pady=6)
+        left_frame = tk.Frame(dialog, bg=BG)
+        left_frame.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        tk.Label(
+            left_frame,
+            text=f"怪物与过滤项使用当前分类：{category or UNCATEGORIZED_LABEL}",
+            bg=BG,
+            fg=MUTED,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 5))
+        notebook = ttk.Notebook(left_frame)
+        notebook.pack(fill="both", expand=True)
+
+        for kind, title in TEMPLATE_GROUPS:
+            frame = tk.Frame(notebook, bg=PANEL)
+            notebook.add(frame, text=title)
             list_wrap = tk.Frame(frame, bg=PANEL)
-            list_wrap.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+            list_wrap.pack(fill="both", expand=True, padx=8, pady=8)
             scrollbar = tk.Scrollbar(list_wrap, orient="vertical")
             scrollbar.pack(side="right", fill="y")
             listbox = tk.Listbox(
@@ -1085,10 +1134,30 @@ class ControlPanel:
             )
             listbox.pack(side="left", fill="both", expand=True)
             scrollbar.configure(command=listbox.yview)
-            groups[kind] = {"listbox": listbox, "items": []}
+            groups[kind] = {
+                "listbox": listbox,
+                "items": [],
+                "category": category if kind in {"monster", "filter"} else "",
+                "frame": frame,
+                "notebook": notebook,
+            }
             listbox.bind("<<ListboxSelect>>", lambda _event, selected_kind=kind: show_preview(selected_kind))
+            buttons = tk.Frame(frame, bg=PANEL)
+            buttons.pack(fill="x", padx=8, pady=(0, 8))
             tk.Button(
-                frame,
+                buttons,
+                text="新增采集…",
+                command=lambda selected_kind=kind: capture_new(selected_kind),
+                bg="#235b32",
+                fg="white",
+                activebackground="#2d7540",
+                activeforeground="white",
+                relief="flat",
+                font=FONT,
+                cursor="hand2",
+            ).pack(side="left", fill="x", expand=True, padx=(0, 4), ipady=3)
+            tk.Button(
+                buttons,
                 text="删除选中项",
                 command=lambda selected_kind=kind: delete_selected(selected_kind),
                 bg="#7a2020",
@@ -1098,8 +1167,21 @@ class ControlPanel:
                 relief="flat",
                 font=FONT,
                 cursor="hand2",
-            ).pack(fill="x", padx=8, pady=(0, 8), ipady=3)
+            ).pack(side="left", fill="x", expand=True, padx=(4, 0), ipady=3)
 
+        def selected_tab_changed(_event: tk.Event | None = None) -> None:
+            selected_frame = str(notebook.select())
+            for kind, group in groups.items():
+                if str(group["frame"]) != selected_frame:
+                    continue
+                if group["listbox"].curselection():
+                    show_preview(kind)
+                else:
+                    active_kind[0] = None
+                    clear_preview(f"选择{TEMPLATE_GROUP_LABELS[kind]}图片以预览")
+                break
+
+        notebook.bind("<<NotebookTabChanged>>", selected_tab_changed)
         reload_lists()
 
     def _tick(self) -> None:
