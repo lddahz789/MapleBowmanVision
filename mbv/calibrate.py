@@ -23,6 +23,204 @@ from mbv.vision import (
 )
 from mbv.window import WindowInfo, capture_client, find_game_window, focus_game_window
 
+
+STATUS_ITEM_KEYS = ("hp_bar", "mp_bar", "minimap", "player_marker")
+WINDOW_ASPECT_RATIO_TOLERANCE = 0.03
+
+
+def _mark_calibration_item(config: dict[str, Any], key: str) -> None:
+    calibration = config.setdefault("calibration", {})
+    items = calibration.setdefault("items", {})
+    items[key] = {
+        "complete": True,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _invalidate_calibration_item(config: dict[str, Any], key: str) -> None:
+    calibration = config.setdefault("calibration", {})
+    items = calibration.setdefault("items", {})
+    previous = items.get(key, {})
+    timestamp = previous.get("timestamp") if isinstance(previous, dict) else None
+    items[key] = {"complete": False}
+    if timestamp:
+        items[key]["previous_timestamp"] = timestamp
+
+
+def _prepare_window_calibration(config: dict[str, Any], window: WindowInfo) -> None:
+    calibration = config.setdefault("calibration", {})
+    previous = calibration.get("window_size")
+    current = [window.width, window.height]
+    if isinstance(previous, list) and len(previous) == 2 and list(previous) != current:
+        previous_width, previous_height = (int(previous[0]), int(previous[1]))
+        previous_ratio = previous_width / max(1, previous_height)
+        current_ratio = window.width / max(1, window.height)
+        aspect_ratio_drift = abs(current_ratio / max(previous_ratio, 1e-9) - 1.0)
+        # Every captured rectangle/point is stored as normalized coordinates.
+        # A proportional resize (including the control panel docking the game)
+        # therefore must not erase already completed independent capture items.
+        # Only a material aspect-ratio change can alter the game's layout enough
+        # to make those normalized coordinates unsafe to reuse.
+        if aspect_ratio_drift > WINDOW_ASPECT_RATIO_TOLERANCE:
+            for key in (
+                "hp_bar",
+                "mp_bar",
+                "minimap",
+                "player_marker",
+                "combat_region",
+                "platform_center",
+                "targeting_range",
+                "throwing_star_safe_output_area",
+            ):
+                _invalidate_calibration_item(config, key)
+            recognition = config.setdefault("recognition", {})
+            recognition["platform_center_captured"] = False
+            recognition["throwing_star_safe_output_area_captured"] = False
+    calibration["window_size"] = current
+
+
+def capture_status_region(
+    config_path: Path,
+    region_key: str,
+    label: str,
+    parent: Any = None,
+) -> dict[str, float]:
+    """独立框选一个状态区域；失败时不影响其它已采集项目。"""
+    key = str(region_key).strip()
+    if key not in {"hp_bar", "mp_bar", "minimap"}:
+        raise ValueError(f"不支持的状态区域：{key}")
+    config = load_config(config_path)
+    window = find_game_window(config)
+    _prepare_window_calibration(config, window)
+    focus_game_window(window)
+    shape = (window.height, window.width, 3)
+    with mss.MSS() as sct:
+        frozen_frame = capture_client(sct, window)
+    result = interactive_overlay(
+        window,
+        f"框选{label}，回车确认",
+        "rectangle",
+        parent=parent,
+        frozen_frame=frozen_frame,
+    )
+    if result.cancelled or result.rectangle is None:
+        raise RuntimeError(f"已取消{label}采集")
+    region = normalized_roi(result.rectangle, shape)
+    config.setdefault("regions", {})[key] = region
+    if key == "minimap":
+        _invalidate_calibration_item(config, "player_marker")
+    _mark_calibration_item(config, key)
+    calibration = config.setdefault("calibration", {})
+    calibration["window_size"] = [window.width, window.height]
+    refresh_calibrated(config)
+    save_config(config_path, config)
+    return region
+
+
+def capture_player_marker(config_path: Path, parent: Any = None) -> tuple[int, int, int]:
+    """在已采集小地图中独立取玩家标记颜色，并用同一冻结帧完成取样。"""
+    config = load_config(config_path)
+    window = find_game_window(config)
+    _prepare_window_calibration(config, window)
+    focus_game_window(window)
+    shape = (window.height, window.width, 3)
+    minimap_rect = roi_pixels(shape, config["regions"]["minimap"])
+    with mss.MSS() as sct:
+        frozen_frame = capture_client(sct, window)
+    result = interactive_overlay(
+        window,
+        "点击自己的小地图标记中心，回车确认",
+        "point",
+        guide_rect=minimap_rect,
+        parent=parent,
+        frozen_frame=frozen_frame,
+    )
+    if result.cancelled or result.point is None:
+        raise RuntimeError("已取消小地图玩家标记采集")
+    px, py = result.point
+    mx, my, mw, mh = minimap_rect
+    if not (mx <= px <= mx + mw and my <= py <= my + mh):
+        raise RuntimeError("玩家标记采样点必须位于小地图区域内")
+    hue, saturation, value = hsv_median_at(frozen_frame, px, py)
+    config.setdefault("vision", {})["player_hsv_ranges"] = hue_ranges(hue, saturation, value)
+    _mark_calibration_item(config, "player_marker")
+    calibration = config.setdefault("calibration", {})
+    calibration["player_hsv_sample"] = [hue, saturation, value]
+    calibration["window_size"] = [window.width, window.height]
+    refresh_calibrated(config)
+    save_config(config_path, config)
+    return hue, saturation, value
+
+
+def capture_combat_region(config_path: Path, parent: Any = None) -> dict[str, float]:
+    """独立采集战斗识别区，不强制同时采集平台中心。"""
+    config = load_config(config_path)
+    window = find_game_window(config)
+    _prepare_window_calibration(config, window)
+    focus_game_window(window)
+    shape = (window.height, window.width, 3)
+    with mss.MSS() as sct:
+        frozen_frame = capture_client(sct, window)
+    result = interactive_overlay(
+        window,
+        "框选整个可见战斗识别区（排除底部状态栏），回车确认",
+        "rectangle",
+        parent=parent,
+        frozen_frame=frozen_frame,
+    )
+    if result.cancelled or result.rectangle is None:
+        raise RuntimeError("已取消战斗识别区域采集")
+    region = normalized_roi(result.rectangle, shape)
+    config.setdefault("regions", {})["combat"] = region
+    for dependent in ("platform_center", "targeting_range", "throwing_star_safe_output_area"):
+        _invalidate_calibration_item(config, dependent)
+    recognition = config.setdefault("recognition", {})
+    recognition["platform_center_captured"] = False
+    recognition["throwing_star_safe_output_area_captured"] = False
+    _mark_calibration_item(config, "combat_region")
+    calibration = config.setdefault("calibration", {})
+    calibration["window_size"] = [window.width, window.height]
+    refresh_calibrated(config)
+    save_config(config_path, config)
+    return region
+
+
+def capture_platform_center(config_path: Path, parent: Any = None) -> dict[str, float]:
+    """在已有战斗识别区内独立记录平台中心。"""
+    config = load_config(config_path)
+    window = find_game_window(config)
+    _prepare_window_calibration(config, window)
+    focus_game_window(window)
+    shape = (window.height, window.width, 3)
+    combat_rect = roi_pixels(shape, config["regions"]["combat"])
+    with mss.MSS() as sct:
+        frozen_frame = capture_client(sct, window)
+    result = interactive_overlay(
+        window,
+        "点击当前平台中心，回车确认",
+        "point",
+        guide_rect=combat_rect,
+        parent=parent,
+        frozen_frame=frozen_frame,
+    )
+    if result.cancelled or result.point is None:
+        raise RuntimeError("已取消平台中心采集")
+    px, py = result.point
+    cx, cy, cw, ch = combat_rect
+    if not (cx <= px <= cx + cw and cy <= py <= cy + ch):
+        raise RuntimeError("平台中心必须位于战斗识别区域内")
+    center = {
+        "x": round((px - cx) / max(1, cw), 6),
+        "y": round((py - cy) / max(1, ch), 6),
+    }
+    recognition = config.setdefault("recognition", {})
+    recognition["platform_center"] = center
+    recognition["platform_center_captured"] = True
+    _mark_calibration_item(config, "platform_center")
+    refresh_calibrated(config)
+    save_config(config_path, config)
+    return center
+
 def hue_ranges(hue: int, saturation: int, value: int) -> list[dict[str, list[int]]]:
     delta_h = 9
     low_s = max(30, saturation - 70)
@@ -57,6 +255,7 @@ def calibrate(config_path: Path, parent: Any = None) -> None:
     """采集状态栏和小地图；战斗识别区由 capture_recognition_region 独立采集。"""
     config = load_config(config_path)
     window = find_game_window(config)
+    _prepare_window_calibration(config, window)
     print(f"正在校准状态栏与小地图：{window.title}（{window.width}×{window.height}）")
     print("提示会直接叠加在游戏画面上。拖动框选后按回车或空格确认。")
     focus_game_window(window)
@@ -88,6 +287,8 @@ def calibrate(config_path: Path, parent: Any = None) -> None:
     hue, saturation, value = hsv_median_at(frame, px, py)
     config["vision"]["player_hsv_ranges"] = hue_ranges(hue, saturation, value)
     calibration = config.setdefault("calibration", {})
+    for key in STATUS_ITEM_KEYS:
+        _mark_calibration_item(config, key)
     calibration.update(
         {
             "status_regions_complete": True,
@@ -105,6 +306,7 @@ def capture_recognition_region(config_path: Path, parent: Any = None) -> dict[st
     """独立采集战斗识别区，并在区内记录策略可复用的平台中心锚点。"""
     config = load_config(config_path)
     window = find_game_window(config)
+    _prepare_window_calibration(config, window)
     focus_game_window(window)
     shape = (window.height, window.width, 3)
     with mss.MSS() as sct:
@@ -141,6 +343,8 @@ def capture_recognition_region(config_path: Path, parent: Any = None) -> dict[st
     config["regions"]["combat"] = combat_roi
     config.setdefault("recognition", {})["platform_center"] = platform_center
     config["recognition"]["platform_center_captured"] = True
+    _mark_calibration_item(config, "combat_region")
+    _mark_calibration_item(config, "platform_center")
     calibration = config.setdefault("calibration", {})
     calibration.update(
         {
@@ -156,6 +360,57 @@ def capture_recognition_region(config_path: Path, parent: Any = None) -> dict[st
         f"y={platform_center['y']:.3f}（相对识别区）"
     )
     return platform_center
+
+
+def capture_strategy_area(
+    config_path: Path,
+    recognition_key: str,
+    prompt: str,
+    parent: Any = None,
+) -> dict[str, float]:
+    """框选并保存相对战斗识别区归一化的策略矩形。"""
+    key = str(recognition_key).strip()
+    if not key or not key.replace("_", "").isalnum():
+        raise ValueError("策略采集键无效")
+    config = load_config(config_path)
+    window = find_game_window(config)
+    _prepare_window_calibration(config, window)
+    focus_game_window(window)
+    shape = (window.height, window.width, 3)
+    combat_rect = roi_pixels(shape, config["regions"]["combat"])
+    with mss.MSS() as sct:
+        frozen_frame = capture_client(sct, window)
+    result = interactive_overlay(
+        window,
+        prompt,
+        "rectangle",
+        guide_rect=combat_rect,
+        parent=parent,
+        frozen_frame=frozen_frame,
+    )
+    if result.cancelled or result.rectangle is None:
+        raise RuntimeError("已取消安全输出位置框选")
+    rx, ry, rw, rh = result.rectangle
+    cx, cy, cw, ch = combat_rect
+    if rx < cx or ry < cy or rx + rw > cx + cw or ry + rh > cy + ch:
+        raise RuntimeError("安全输出位置必须完整位于战斗识别区域内")
+    area = {
+        "x": round((rx - cx) / max(1, cw), 6),
+        "y": round((ry - cy) / max(1, ch), 6),
+        "w": round(rw / max(1, cw), 6),
+        "h": round(rh / max(1, ch), 6),
+    }
+    recognition = config.setdefault("recognition", {})
+    recognition[key] = area
+    recognition[f"{key}_captured"] = True
+    _mark_calibration_item(config, key)
+    refresh_calibrated(config)
+    save_config(config_path, config)
+    print(
+        f"安全输出位置已保存：x={area['x']:.3f}, y={area['y']:.3f}, "
+        f"w={area['w']:.3f}, h={area['h']:.3f}（相对战斗识别区）"
+    )
+    return area
 
 
 def capture_frozen_selection(
@@ -357,6 +612,7 @@ def capture_target_range(
         raise RuntimeError("尚未识别到角色，请先让姓名板出现在画面上再框选攻击范围")
     config = load_config(config_path)
     window = find_game_window(config)
+    _prepare_window_calibration(config, window)
     focus_game_window(window)
     shape = (window.height, window.width, 3)
     combat_rect = roi_pixels(shape, config["regions"]["combat"])
@@ -378,6 +634,8 @@ def capture_target_range(
         player_anchor=player_anchor or player_attack_anchor(player_box, raw_box),
     )
     config.setdefault("targeting", {})["box"] = attack_box
+    _mark_calibration_item(config, "targeting_range")
+    refresh_calibrated(config)
     save_config(config_path, config)
     print(
         "通用索敌范围已保存："

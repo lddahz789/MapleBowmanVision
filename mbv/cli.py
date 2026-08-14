@@ -16,9 +16,9 @@ from mbv.calibrate import (
     capture_recognition_region,
     capture_template,
 )
-from mbv.config import load_config
+from mbv.config import create_config_from_example, load_config
 from mbv.overlay import RuntimeOverlay
-from mbv.paths import DEFAULT_CONFIG, LOG_DIR
+from mbv.paths import DEFAULT_CONFIG, EXAMPLE_CONFIG, LOG_DIR
 from mbv.window import visible_windows
 from mbv.win32 import user32
 
@@ -74,8 +74,12 @@ def main() -> int:
         list_windows()
         return 0
     if not config_path.exists():
-        print(f"找不到配置文件：{config_path}")
-        return 2
+        if config_path == DEFAULT_CONFIG.resolve():
+            create_config_from_example(config_path, EXAMPLE_CONFIG)
+            print(f"已创建个人配置文件：{config_path}")
+        else:
+            print(f"找不到配置文件：{config_path}")
+            return 2
     if args.calibrate:
         calibrate(config_path)
         return 0

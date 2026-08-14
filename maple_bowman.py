@@ -4,18 +4,23 @@ from __future__ import annotations
 from mbv.bot import STATE_LABELS, BowmanBot, runtime_limit_reached
 from mbv.calibrate import (
     calibrate,
+    capture_combat_region,
     capture_attack_range,
     capture_target_range,
     capture_frozen_selection,
     capture_key_name,
     capture_monster_filter,
+    capture_platform_center,
     capture_player_aux_template,
+    capture_player_marker,
     capture_player_template,
     capture_recognition_region,
+    capture_strategy_area,
+    capture_status_region,
     capture_template,
     hue_ranges,
 )
-from mbv.config import load_config, save_config, template_counts
+from mbv.config import create_config_from_example, load_config, save_config, template_counts
 from mbv.input import (
     INPUT,
     Keyboard,
@@ -49,7 +54,7 @@ from mbv.vision import (
     suppress_monster_detections,
 )
 from mbv.win32 import process_integrity_level, user32
-from mbv.window import WindowInfo
+from mbv.window import WindowInfo, set_window_topmost
 
 
 def main() -> int:

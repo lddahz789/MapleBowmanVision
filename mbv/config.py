@@ -71,9 +71,13 @@ def load_config(path: Path) -> dict[str, Any]:
         config = json.load(handle)
     if config.get("version") != 1:
         raise RuntimeError("不支持的配置文件版本")
+    config.setdefault("window", {})
+    config["window"].setdefault("topmost_while_armed", True)
     config.setdefault("input", {})
     config["input"].setdefault("delivery", "foreground")
     input_delivery(config)
+    config.setdefault("keys", {})
+    config["keys"].setdefault("jump", "alt")
     config.setdefault("behavior", {})
     legacy_bow_attack_box = attack_box_from_config(config["behavior"])
     had_strategy_section = isinstance(config.get("strategy"), dict)
@@ -102,13 +106,31 @@ def load_config(path: Path) -> dict[str, Any]:
     config.setdefault("recognition", {})
     config["recognition"].setdefault("platform_center", {"x": 0.5, "y": 0.5})
     config["recognition"].setdefault("platform_center_captured", False)
+    config["recognition"].setdefault(
+        "throwing_star_safe_output_area",
+        {"x": 0.45, "y": 0.35, "w": 0.1, "h": 0.1},
+    )
+    config["recognition"].setdefault("throwing_star_safe_output_area_captured", False)
     calibration = config.setdefault("calibration", {})
     legacy_calibrated = bool(config.get("calibrated"))
     calibration.setdefault("status_regions_complete", legacy_calibrated)
     calibration.setdefault("recognition_region_complete", legacy_calibrated)
-    config["calibrated"] = bool(
-        calibration["status_regions_complete"] and calibration["recognition_region_complete"]
+    items = calibration.setdefault("items", {})
+    legacy_status_complete = bool(calibration["status_regions_complete"])
+    legacy_recognition_complete = bool(calibration["recognition_region_complete"])
+    for key in ("hp_bar", "mp_bar", "minimap", "player_marker"):
+        items.setdefault(key, {"complete": legacy_status_complete})
+    items.setdefault("combat_region", {"complete": legacy_recognition_complete})
+    items.setdefault(
+        "platform_center",
+        {"complete": bool(config["recognition"].get("platform_center_captured"))},
     )
+    items.setdefault("targeting_range", {"complete": legacy_calibrated})
+    items.setdefault(
+        "throwing_star_safe_output_area",
+        {"complete": bool(config["recognition"].get("throwing_star_safe_output_area_captured"))},
+    )
+    refresh_calibrated(config)
     config.setdefault("vision", {})
     monster_threshold = float(config["vision"].get("monster_template_threshold", 0.79))
     config["vision"].setdefault("active_monster_category", "")
@@ -121,6 +143,18 @@ def load_config(path: Path) -> dict[str, Any]:
 
 def refresh_calibrated(config: dict[str, Any]) -> bool:
     calibration = config.setdefault("calibration", {})
+    items = calibration.get("items", {})
+    if isinstance(items, dict) and items:
+        def item_complete(key: str) -> bool:
+            value = items.get(key, {})
+            if isinstance(value, dict):
+                return bool(value.get("complete"))
+            return bool(value)
+
+        calibration["status_regions_complete"] = all(
+            item_complete(key) for key in ("hp_bar", "mp_bar", "minimap", "player_marker")
+        )
+        calibration["recognition_region_complete"] = item_complete("combat_region")
     complete = bool(
         calibration.get("status_regions_complete")
         and calibration.get("recognition_region_complete")
@@ -133,3 +167,21 @@ def save_config(path: Path, config: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(config, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
+
+
+def create_config_from_example(path: Path, example_path: Path) -> bool:
+    """Create a personal config once without overwriting an existing one."""
+    if path.exists():
+        return False
+    with example_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    if config.get("version") != 1:
+        raise RuntimeError("示例配置文件版本无效")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("x", encoding="utf-8") as handle:
+            json.dump(config, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+    except FileExistsError:
+        return False
+    return True

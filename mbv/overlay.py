@@ -4,6 +4,7 @@ import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
 import queue
+import os
 import threading
 import time
 import tkinter as tk
@@ -49,6 +50,12 @@ def overlay_draw_plan(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def debug_item_enabled(state: dict[str, Any], item: str) -> bool:
+    """Return whether a Debug layer belongs to the active all/single-item view."""
+    selected = str(state.get("debug_item") or "").strip()
+    return not selected or selected == item
+
+
 def _top_level_hwnd(widget: tk.Misc) -> int:
     hwnd = int(widget.winfo_id())
     while True:
@@ -59,6 +66,8 @@ def _top_level_hwnd(widget: tk.Misc) -> int:
 
 
 def _exclude_from_capture(hwnd: int) -> None:
+    if os.environ.get("MBV_QA_CAPTURE") == "1":
+        return
     # Windows 10 2004+ 支持；旧系统失败时 HUD 仍可工作，只是可能被截图采入。
     try:
         user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
@@ -289,12 +298,14 @@ class RuntimeOverlay:
             return
 
         roi_specs = [
-            ("hp_roi", "血量", "#ff4040", f"{float(state.get('hp', 0)):.0%}"),
-            ("mp_roi", "蓝量", "#40aaff", f"{float(state.get('mp', 0)):.0%}"),
-            ("minimap_roi", "小地图", "#ffe04a", ""),
-            ("combat_roi", "识别区域", "#55ff88", ""),
+            ("hp_bar", "hp_roi", "血量", "#ff4040", f"{float(state.get('hp', 0)):.0%}"),
+            ("mp_bar", "mp_roi", "蓝量", "#40aaff", f"{float(state.get('mp', 0)):.0%}"),
+            ("minimap", "minimap_roi", "小地图", "#ffe04a", ""),
+            ("combat_region", "combat_roi", "识别区域", "#55ff88", ""),
         ]
-        for key, label, color, value in roi_specs:
+        for item, key, label, color, value in roi_specs:
+            if not debug_item_enabled(state, item):
+                continue
             roi = state.get(key)
             if not roi:
                 continue
@@ -303,12 +314,19 @@ class RuntimeOverlay:
             canvas.create_text(x + 3, y + 3, anchor="nw", text=f"{label} {value}".strip(), fill=color, font=small)
 
         marker = state.get("marker_screen")
-        if marker:
+        if marker and debug_item_enabled(state, "player_marker"):
             mx, my = marker
             canvas.create_oval(mx - 6, my - 6, mx + 6, my + 6, outline="#3cff55", width=3)
 
+        platform_center = state.get("platform_center_screen")
+        if platform_center and debug_item_enabled(state, "platform_center"):
+            px, py = platform_center
+            canvas.create_line(px - 12, py, px + 12, py, fill="#18d1ff", width=3)
+            canvas.create_line(px, py - 12, px, py + 12, fill="#18d1ff", width=3)
+            canvas.create_text(px + 15, py, anchor="w", text="平台中心", fill="#18d1ff", font=small)
+
         attack_range = state.get("attack_range_box")
-        if attack_range:
+        if attack_range and debug_item_enabled(state, "targeting_range"):
             x, y, w, h = attack_range
             canvas.create_rectangle(x, y, x + w, y + h, outline="#ffe04a", width=1)
             canvas.create_text(
@@ -320,12 +338,50 @@ class RuntimeOverlay:
                 font=small,
             )
 
-        for candidate in state.get("monster_boxes", []):
-            x, y, w, h = candidate
-            canvas.create_rectangle(x, y, x + w, y + h, outline="#b94cff", width=1)
+        for area in state.get("strategy_area_boxes", []):
+            area_key = str(area.get("key", "")) if isinstance(area, dict) else ""
+            if not debug_item_enabled(state, area_key):
+                continue
+            box = area.get("box") if isinstance(area, dict) else None
+            if not box:
+                continue
+            x, y, w, h = box
+            label = str(area.get("label", "策略安全区"))
+            canvas.create_rectangle(x, y, x + w, y + h, outline="#ff66d9", width=2)
+            canvas.create_text(x + 3, y + 3, anchor="nw", text=label, fill="#ff8fe3", font=small)
+
+        overlap_ratio = state.get("close_overlap_ratio")
+        overlap_threshold = state.get("close_overlap_threshold")
+        if (
+            not state.get("debug_item")
+            and overlap_ratio is not None
+            and overlap_threshold is not None
+        ):
+            triggered = float(overlap_ratio) >= float(overlap_threshold)
+            color = "#ff654d" if triggered else "#ffb347"
+            span = state.get("close_overlap_span")
+            if span:
+                sx, sy, sw = span
+                canvas.create_line(sx, sy, sx + sw, sy, fill=color, width=5)
+            combat = state.get("combat_roi")
+            if combat:
+                x, y, _w, _h = _rect(combat, width, height)
+                canvas.create_text(
+                    x + 3,
+                    y + 42,
+                    anchor="nw",
+                    text=f"近身重叠 {float(overlap_ratio):.0%} / {float(overlap_threshold):.0%}",
+                    fill=color,
+                    font=small,
+                )
+
+        if not state.get("debug_item"):
+            for candidate in state.get("monster_boxes", []):
+                x, y, w, h = candidate
+                canvas.create_rectangle(x, y, x + w, y + h, outline="#b94cff", width=1)
 
         player_box = state.get("player_box")
-        if player_box:
+        if player_box and debug_item_enabled(state, "player"):
             x, y, w, h = player_box
             canvas.create_rectangle(x, y, x + w, y + h, outline="#00e5ff", width=3)
             player_score = float(state.get("player_score", -1))
@@ -340,7 +396,7 @@ class RuntimeOverlay:
             )
 
         chase = state.get("chase_box")
-        if chase:
+        if chase and not state.get("debug_item"):
             x, y, w, h = chase
             distance = state.get("target_distance_px")
             direction = str(state.get("target_direction", ""))
@@ -358,7 +414,7 @@ class RuntimeOverlay:
             )
 
         monster = state.get("monster_box")
-        if monster:
+        if monster and not state.get("debug_item"):
             x, y, w, h = monster
             canvas.create_rectangle(x, y, x + w, y + h, outline="#39ff72", width=3)
             distance = state.get("target_distance_px")
@@ -374,7 +430,7 @@ class RuntimeOverlay:
                 fill="#39ff72",
                 font=font,
             )
-        elif float(state.get("monster_score", -1)) >= 0:
+        elif not state.get("debug_item") and float(state.get("monster_score", -1)) >= 0:
             combat = state.get("combat_roi")
             if combat:
                 x, y, _w, _h = _rect(combat, width, height)

@@ -13,6 +13,11 @@ from PIL import Image, ImageTk
 from mbv.bot import STATE_LABELS, BowmanBot
 from mbv.calibrate import (
     calibrate,
+    capture_combat_region,
+    capture_platform_center,
+    capture_player_marker,
+    capture_status_region,
+    capture_strategy_area,
     capture_target_range,
     capture_key_name,
     capture_monster_filter,
@@ -25,6 +30,7 @@ from mbv.config import load_config, save_config, template_counts
 from mbv.input import input_delivery, vk_for
 from mbv.overlay import RuntimeOverlay, _exclude_from_capture, _top_level_hwnd, prevent_window_activate
 from mbv.strategies import active_strategy, get_strategy, list_strategies
+from mbv.strategies.base import StrategyCaptureField
 from mbv.template_store import (
     UNCATEGORIZED_LABEL,
     create_monster_category,
@@ -35,15 +41,17 @@ from mbv.template_store import (
     trash_template,
 )
 
-BG = "#1b1b1b"
-PANEL = "#242424"
-ENTRY_BG = "#111111"
+BG = "#080d12"
+PANEL = "#101820"
+ENTRY_BG = "#070b0f"
 FG = "#f2f2f2"
-MUTED = "#9a9a9a"
-ACCENT = "#4cff79"
+MUTED = "#8b9aa8"
+ACCENT = "#18d1ff"
+SUCCESS = "#4cff79"
+WARNING = "#ffd84a"
 ARMED = "#ff4545"
-BUTTON_BG = "#2f2f2f"
-BUTTON_ACTIVE = "#3a3a3a"
+BUTTON_BG = "#17232d"
+BUTTON_ACTIVE = "#213542"
 FONT = ("Microsoft YaHei UI", 10)
 FONT_TITLE = ("Microsoft YaHei UI", 14, "bold")
 FONT_SECTION = ("Microsoft YaHei UI", 11, "bold")
@@ -93,14 +101,16 @@ class ControlPanel:
     def __init__(self, config_path: Path, enable_input: bool) -> None:
         self.config_path = config_path
         self.root = tk.Tk()
-        self.root.title("冒险岛弓箭手")
+        self.root.title("MapleBowmanVision")
         self.root.configure(bg=BG)
-        self.root.minsize(380, 720)
+        self.root.minsize(560, 720)
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        height = min(820, max(560, screen_h - 70))
-        self.root.geometry(f"400x{height}+{max(40, screen_w - 430)}+20")
-        self.root.wm_attributes("-topmost", True)
+        width = min(640, max(560, screen_w - 80))
+        height = min(980, max(720, screen_h - 100))
+        left = max(20, screen_w - width - 20)
+        self.root.geometry(f"{width}x{height}+{left}+20")
+        self.root.wm_attributes("-topmost", False)
         self.root.update_idletasks()
         panel_hwnd = _top_level_hwnd(self.root)
         _exclude_from_capture(panel_hwnd)
@@ -115,7 +125,6 @@ class ControlPanel:
         self._loading_settings = True
         self._autosave_after_id: str | None = None
         self._autosave_reconfigure = False
-
         self.status = tk.StringVar(value="正在连接游戏窗口…")
         self.counts = tk.StringVar(value="")
         self.monster_category = tk.StringVar(value=UNCATEGORIZED_LABEL)
@@ -125,20 +134,32 @@ class ControlPanel:
         self.hp_threshold_percent = tk.IntVar(value=int(round(float(config["behavior"]["hp_threshold"]) * 100)))
         self.mp_threshold_percent = tk.IntVar(value=int(round(float(config["behavior"]["mp_threshold"]) * 100)))
         self.delivery = tk.BooleanVar(value=input_delivery(config) == "background")
+        self.topmost_while_armed = tk.BooleanVar(
+            value=bool(config.get("window", {}).get("topmost_while_armed", True))
+        )
         self.fallback_patrol = tk.BooleanVar(value=bool(config["behavior"].get("fallback_patrol")))
         self.pickup_lost = tk.BooleanVar(value=bool(config["behavior"].get("pickup_after_target_lost")))
         selected_strategy = active_strategy(config)
+        self.profession_name = tk.StringVar(value=selected_strategy.profession)
         self.strategy_name = tk.StringVar(value=selected_strategy.display_name)
         self.strategy_description = tk.StringVar(value=selected_strategy.description)
         self._strategy_lookup = {item.display_name: item.key for item in list_strategies()}
+        self._profession_strategies: dict[str, tuple[Any, ...]] = {}
+        for item in list_strategies():
+            self._profession_strategies.setdefault(item.profession, tuple())
+            self._profession_strategies[item.profession] += (item,)
         self._entries: dict[str, tk.Entry] = {}
         self._targeting_entries: dict[str, tk.Entry] = {}
         self._strategy_entries: dict[str, tk.Entry] = {}
-
+        self._strategy_toggles: dict[str, tk.BooleanVar] = {}
+        self._capture_status_vars: dict[str, tk.StringVar] = {}
+        self._capture_status_labels: dict[str, tk.Label] = {}
+        self._capture_buttons: dict[str, tk.Button] = {}
         self._build()
         self._refresh_counts()
         self._load_entries(config)
         self._loading_settings = False
+        self.root.after_idle(lambda: self._capture_canvas.yview_moveto(0))
 
         self.worker = threading.Thread(target=self._run_bot, name="MapleVisionWorker", daemon=False)
         self.worker.start()
@@ -159,11 +180,61 @@ class ControlPanel:
         self.quit()
 
     def _build(self) -> None:
-        outer = tk.Frame(self.root, bg=BG)
-        outer.pack(fill="both", expand=True)
-        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0, bd=0)
-        scroll = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        self.root.grid_rowconfigure(1, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+
+        topbar = tk.Frame(self.root, bg=BG, height=54, highlightbackground="#263642", highlightthickness=1)
+        topbar.grid(row=0, column=0, sticky="ew")
+        topbar.grid_propagate(False)
+        tk.Label(
+            topbar,
+            text="◉  MapleBowmanVision",
+            bg=BG,
+            fg=FG,
+            font=("Microsoft YaHei UI", 16, "bold"),
+        ).pack(side="left", padx=18)
+        tk.Label(
+            topbar,
+            textvariable=self.status,
+            bg=BG,
+            fg=ACCENT,
+            font=FONT,
+            anchor="e",
+        ).pack(side="right", padx=(10, 18))
+
+        main = tk.Frame(self.root, bg=BG)
+        main.grid(row=1, column=0, sticky="nsew")
+        main.grid_rowconfigure(0, weight=1)
+        main.grid_columnconfigure(0, weight=1)
+
+        left_shell = tk.Frame(main, bg=BG, width=600, highlightbackground="#263642", highlightthickness=1)
+        left_shell.grid(row=0, column=0, sticky="nsew")
+        left_shell.pack_propagate(False)
+        tk.Label(
+            left_shell,
+            text="采集与校准",
+            bg=BG,
+            fg=FG,
+            font=("Microsoft YaHei UI", 18, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=14, pady=(12, 2))
+        tk.Label(
+            left_shell,
+            textvariable=self.counts,
+            bg=BG,
+            fg=MUTED,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=400,
+        ).pack(fill="x", padx=14, pady=(0, 6))
+
+        scroll_shell = tk.Frame(left_shell, bg=BG)
+        scroll_shell.pack(fill="both", expand=True)
+        canvas = tk.Canvas(scroll_shell, bg=BG, highlightthickness=0, bd=0)
+        scroll = tk.Scrollbar(scroll_shell, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=scroll.set)
+        self._capture_canvas = canvas
         scroll.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
         self._content = tk.Frame(canvas, bg=BG)
@@ -182,34 +253,68 @@ class ControlPanel:
         canvas.bind("<Enter>", lambda _event: canvas.bind_all("<MouseWheel>", _on_wheel))
         canvas.bind("<Leave>", lambda _event: canvas.unbind_all("<MouseWheel>"))
 
-        pad = {"padx": 12, "pady": (10, 0)}
-        tk.Label(self._content, text="冒险岛弓箭手", bg=BG, fg=FG, font=FONT_TITLE, anchor="w").pack(fill="x", **pad)
-        self.status_label = tk.Label(
-            self._content,
-            textvariable=self.status,
-            bg=BG,
-            fg=ACCENT,
-            font=FONT,
-            anchor="w",
-            wraplength=340,
-            justify="left",
-        )
-        self.status_label.pack(fill="x", padx=12)
-        tk.Label(
-            self._content,
-            textvariable=self.counts,
-            bg=BG,
-            fg=MUTED,
-            font=FONT_SMALL,
-            anchor="w",
-            wraplength=340,
-            justify="left",
-        ).pack(fill="x", padx=12, pady=(0, 6))
+        self.status_label = tk.Label(self._content, text="", bg=BG, fg=ACCENT)
 
-        self._section("采集")
+        self._section("基础区域")
         capture = self._last_body
-        self._row_button(capture, "校准状态栏与小地图", self._calibrate)
-        self._row_button(capture, "采集识别区域与平台中心", self._capture_recognition_region)
+        self._capture_item_row(
+            capture,
+            "血条区域",
+            "hp_bar",
+            lambda: self._capture_status_item("hp_bar", "血条区域"),
+        )
+        self._capture_item_row(
+            capture,
+            "蓝条区域",
+            "mp_bar",
+            lambda: self._capture_status_item("mp_bar", "蓝条区域"),
+        )
+        self._capture_item_row(
+            capture,
+            "小地图区域",
+            "minimap",
+            lambda: self._capture_status_item("minimap", "小地图区域"),
+        )
+        self._capture_item_row(
+            capture,
+            "小地图玩家标记",
+            "player_marker",
+            self._capture_player_marker_item,
+        )
+
+        self._section("战斗识别")
+        capture = self._last_body
+        self._capture_item_row(
+            capture,
+            "战斗识别区域",
+            "combat_region",
+            self._capture_combat_region_item,
+        )
+        self._capture_item_row(
+            capture,
+            "平台中心",
+            "platform_center",
+            self._capture_platform_center_item,
+        )
+        self.capture_target_area_button = self._capture_item_row(
+            capture,
+            "通用索敌范围",
+            "targeting_range",
+            self._capture_target_range,
+        )
+
+        self._section("模板采集")
+        templates = self._last_body
+        capture = tk.Frame(templates, bg="#0b1218", highlightbackground="#263642", highlightthickness=1)
+        capture.pack(fill="x", padx=6, pady=(4, 7))
+        tk.Label(
+            capture,
+            text="怪物模板",
+            bg="#0b1218",
+            fg=ACCENT,
+            font=FONT_SECTION,
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=(7, 2))
         category_row = tk.Frame(capture, bg=PANEL)
         category_row.pack(fill="x", padx=8, pady=(5, 2))
         tk.Label(
@@ -248,9 +353,15 @@ class ControlPanel:
                 font=FONT_SMALL,
                 cursor="hand2",
             ).pack(side="left", fill="x", expand=True, padx=2, ipady=2)
-        self._row_button(capture, "采集怪物模板", lambda: self._capture("monster"))
-        self._row_button(capture, "采集过滤项（排除误识别）", lambda: self._capture("filter"))
-        self._row_button(capture, "管理所有采集图片…", self._manage_templates)
+        template_actions = tk.Frame(capture, bg=PANEL)
+        template_actions.pack(fill="x", padx=8, pady=2)
+        self._compact_button(template_actions, "新增怪物模板", lambda: self._capture("monster")).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        self._compact_button(template_actions, "采集过滤项", lambda: self._capture("filter")).pack(side="left", fill="x", expand=True, padx=2)
+        self._compact_button(
+            template_actions,
+            "管理怪物模板",
+            lambda: self._manage_templates("monster"),
+        ).pack(side="left", fill="x", expand=True, padx=(2, 0))
         tk.Label(
             capture,
             textvariable=self.monster_category_summary,
@@ -260,101 +371,73 @@ class ControlPanel:
             anchor="w",
             justify="left",
         ).pack(fill="x", padx=8, pady=(2, 5))
-        self._row_button(capture, "采集姓名板", lambda: self._capture("player"))
-        self._row_button(capture, "采集头部", lambda: self._capture("head"))
-        self._row_button(capture, "采集称号勋章", lambda: self._capture("title"))
 
-        self._section("运行")
-        run = self._last_body
-        self.debug_button = tk.Checkbutton(
-            run,
-            text="显示 Debug 框",
-            variable=self.debug_boxes,
-            command=self._toggle_debug_boxes,
-            indicatoron=False,
-            onvalue=True,
-            offvalue=False,
-            bg=BUTTON_BG,
+        player_capture = tk.Frame(templates, bg="#0b1218", highlightbackground="#263642", highlightthickness=1)
+        player_capture.pack(fill="x", padx=6, pady=(0, 5))
+        tk.Label(
+            player_capture,
+            text="人物模板",
+            bg="#0b1218",
             fg=ACCENT,
-            selectcolor="#244b30",
-            activebackground=BUTTON_ACTIVE,
-            activeforeground=FG,
-            relief="flat",
-            font=FONT,
-            cursor="hand2",
-        )
-        self.debug_button.pack(fill="x", padx=8, pady=3, ipady=4)
-        self.arm_button = self._row_button(run, "启动挂机", self._toggle_arm)
-        self._row_button(run, "退出程序", self.quit)
-        tk.Checkbutton(
-            run,
-            text="后台按键（始终扫描码；面板不抢游戏焦点）",
-            variable=self.delivery,
-            command=lambda: self._schedule_settings_save(reconfigure=True),
-            bg=PANEL,
-            fg=FG,
-            selectcolor=ENTRY_BG,
-            activebackground=PANEL,
-            activeforeground=FG,
-            font=FONT,
+            font=FONT_SECTION,
             anchor="w",
-        ).pack(fill="x", padx=8, pady=2)
-
-        self._section("挂机配置")
+        ).pack(fill="x", padx=8, pady=(7, 2))
+        self._capture_item_row(
+            player_capture,
+            "玩家姓名板",
+            "player",
+            lambda: self._capture("player"),
+        )
+        player_actions = tk.Frame(player_capture, bg="#0b1218")
+        player_actions.pack(fill="x", padx=8, pady=2)
+        self._compact_button(player_actions, "采集头部", lambda: self._capture("head")).pack(
+            side="left", fill="x", expand=True, padx=(0, 2)
+        )
+        self._compact_button(player_actions, "采集称号勋章", lambda: self._capture("title")).pack(
+            side="left", fill="x", expand=True, padx=2
+        )
+        self._compact_button(
+            player_actions,
+            "管理人物模板",
+            lambda: self._manage_templates("player"),
+        ).pack(side="left", fill="x", expand=True, padx=(2, 0))
+        self._section("职业与策略")
         settings = self._last_body
-        tk.Label(
-            settings,
-            text="通用索敌区",
-            bg=PANEL,
-            fg=FG,
-            font=FONT_SECTION,
-            anchor="w",
-        ).pack(fill="x", padx=8, pady=(3, 2))
-        for path, label in (
-            ("box.forward", "索敌区前方"),
-            ("box.back", "索敌区后方"),
-            ("box.up", "索敌区上方"),
-            ("box.down", "索敌区下方"),
-        ):
-            self._labeled_entry(
-                settings,
-                f"targeting.{path}",
-                label,
-                entries=self._targeting_entries,
-                adjust_step=0.01,
-                minimum=0.0,
-                maximum=1.0,
-                on_adjust=lambda text, field_path=path: self._preview_targeting_setting(field_path, text),
-            )
-        self.capture_target_area_button = self._row_button(
-            settings,
-            "框选通用索敌范围",
-            self._capture_target_range,
-        )
-        tk.Label(
-            settings,
-            text="职业策略",
-            bg=PANEL,
-            fg=FG,
-            font=FONT_SECTION,
-            anchor="w",
-        ).pack(fill="x", padx=8, pady=(8, 2))
         strategy_row = tk.Frame(settings, bg=PANEL)
         strategy_row.pack(fill="x", padx=8, pady=(3, 2))
         tk.Label(
             strategy_row,
-            text="职业策略",
+            text="当前职业",
             bg=PANEL,
             fg=MUTED,
             font=FONT_SMALL,
-            width=18,
+            width=10,
+            anchor="w",
+        ).pack(side="left")
+        self.profession_combo = ttk.Combobox(
+            strategy_row,
+            textvariable=self.profession_name,
+            state="readonly",
+            values=list(self._profession_strategies),
+            font=FONT,
+        )
+        self.profession_combo.pack(side="left", fill="x", expand=True)
+        self.profession_combo.bind("<<ComboboxSelected>>", self._profession_changed)
+        strategy_select_row = tk.Frame(settings, bg=PANEL)
+        strategy_select_row.pack(fill="x", padx=8, pady=(3, 2))
+        tk.Label(
+            strategy_select_row,
+            text="基础策略",
+            bg=PANEL,
+            fg=MUTED,
+            font=FONT_SMALL,
+            width=10,
             anchor="w",
         ).pack(side="left")
         self.strategy_combo = ttk.Combobox(
-            strategy_row,
+            strategy_select_row,
             textvariable=self.strategy_name,
             state="readonly",
-            values=list(self._strategy_lookup),
             font=FONT,
         )
         self.strategy_combo.pack(side="left", fill="x", expand=True)
@@ -371,8 +454,29 @@ class ControlPanel:
         ).pack(fill="x", padx=8, pady=(2, 5))
         self.strategy_settings_body = tk.Frame(settings, bg=PANEL)
         self.strategy_settings_body.pack(fill="x")
+
+        self._section("参数设置")
+        settings = self._last_body
+        tk.Label(settings, text="通用索敌区", bg=PANEL, fg=FG, font=FONT_SECTION, anchor="w").pack(fill="x", padx=8, pady=(3, 2))
+        for path, label in (
+            ("box.forward", "索敌区前方"),
+            ("box.back", "索敌区后方"),
+            ("box.up", "索敌区上方"),
+            ("box.down", "索敌区下方"),
+        ):
+            self._labeled_entry(
+                settings,
+                f"targeting.{path}",
+                label,
+                entries=self._targeting_entries,
+                adjust_step=0.01,
+                minimum=0.0,
+                maximum=1.0,
+                on_adjust=lambda text, field_path=path: self._preview_targeting_setting(field_path, text),
+            )
         fields = [
             ("keys.attack", "攻击键", None, None, None),
+            ("keys.jump", "跳跃键", None, None, None),
             ("keys.pickup", "拾取键", None, None, None),
             ("keys.hp_potion", "HP 药键", None, None, None),
             ("keys.mp_potion", "MP 药键", None, None, None),
@@ -424,21 +528,168 @@ class ControlPanel:
             font=FONT,
             anchor="w",
         ).pack(fill="x", padx=8, pady=2)
-        self._row_button(settings, "保存配置", self._save_settings)
+        tk.Checkbutton(
+            settings,
+            text="挂机时强制游戏窗口置顶",
+            variable=self.topmost_while_armed,
+            command=self._schedule_settings_save,
+            bg=PANEL,
+            fg=FG,
+            selectcolor=ENTRY_BG,
+            activebackground=PANEL,
+            activeforeground=FG,
+            font=FONT,
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=2)
         tk.Label(
             self._content,
-            text="F7 显隐 Debug 框｜F8 启动/暂停｜F9 或 Ctrl+Shift+Q 退出。采集时请把游戏露出来。"
-            "按键点「采集」或点输入框后，在游戏画面上按下要绑定的键。"
-            "先分别采集状态栏/小地图和识别区域/平台中心。策略说明及专属参数会随下拉选项切换。"
-            "通用索敌区供所有职业策略共享，可按角色位置和面向拖框。"
-            "改完其它项后点「保存配置」。",
+            text="F7 显隐 Debug 框｜F8 启动/暂停｜F9 或 Ctrl+Shift+Q 退出。每个采集项独立保存，失败时只需重采当前项。",
             bg=BG,
             fg=MUTED,
             font=FONT_SMALL,
-            wraplength=340,
+            wraplength=400,
             justify="left",
             anchor="w",
         ).pack(fill="x", padx=12, pady=10)
+
+        footer = tk.Frame(self.root, bg=BG, height=68, highlightbackground="#263642", highlightthickness=1)
+        footer.grid(row=2, column=0, sticky="ew")
+        footer.grid_propagate(False)
+        self.debug_button = tk.Checkbutton(
+            footer,
+            text="显示 Debug 框",
+            variable=self.debug_boxes,
+            command=self._toggle_debug_boxes,
+            indicatoron=False,
+            bg=BUTTON_BG,
+            fg=ACCENT,
+            selectcolor="#163844",
+            activebackground=BUTTON_ACTIVE,
+            activeforeground=FG,
+            relief="flat",
+            font=FONT,
+            cursor="hand2",
+        )
+        self.debug_button.pack(side="left", padx=(16, 6), pady=12, ipadx=12, ipady=7)
+        tk.Checkbutton(
+            footer,
+            text="后台按键",
+            variable=self.delivery,
+            command=lambda: self._schedule_settings_save(reconfigure=True),
+            bg=BG,
+            fg=FG,
+            selectcolor=ENTRY_BG,
+            activebackground=BG,
+            activeforeground=FG,
+            font=FONT,
+        ).pack(side="left", padx=8)
+        self.arm_button = self._compact_button(footer, "启动挂机", self._toggle_arm, accent=True)
+        self.arm_button.pack(side="right", padx=(6, 16), pady=12, ipadx=18, ipady=7)
+        self._compact_button(footer, "退出程序", self.quit).pack(side="right", padx=6, pady=12, ipadx=12, ipady=7)
+        self._compact_button(footer, "保存配置", self._save_settings).pack(side="right", padx=6, pady=12, ipadx=12, ipady=7)
+
+        self._refresh_strategy_choices()
+
+    def _compact_button(
+        self,
+        parent: tk.Misc,
+        text: str,
+        command: Callable[[], None],
+        *,
+        accent: bool = False,
+    ) -> tk.Button:
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=ACCENT if accent else BUTTON_BG,
+            fg="#041014" if accent else FG,
+            activebackground="#61e3ff" if accent else BUTTON_ACTIVE,
+            activeforeground="#041014" if accent else FG,
+            relief="flat",
+            bd=0,
+            font=FONT,
+            cursor="hand2",
+        )
+
+    def _capture_item_row(
+        self,
+        parent: tk.Misc,
+        label: str,
+        key: str,
+        command: Callable[[], None],
+    ) -> tk.Button:
+        row = tk.Frame(parent, bg=PANEL, highlightbackground="#263642", highlightthickness=1)
+        row.pack(fill="x", padx=8, pady=2)
+        tk.Label(row, text=label, bg=PANEL, fg=FG, font=FONT, anchor="w").pack(
+            side="left", fill="x", expand=True, padx=(9, 4), pady=5
+        )
+        variable = tk.StringVar(value="未采集")
+        status = tk.Label(row, textvariable=variable, bg=PANEL, fg=MUTED, font=FONT_SMALL, width=8, anchor="e")
+        status.pack(side="left", padx=4)
+        self._capture_status_vars[key] = variable
+        self._capture_status_labels[key] = status
+        show_button = self._compact_button(
+            row,
+            "显示",
+            lambda selected=label, selected_key=key: self._show_capture_item(selected, selected_key),
+        )
+        button = self._compact_button(
+            row,
+            "采集",
+            lambda selected=label, action=command: self._select_capture_item(selected, action),
+        )
+        button.pack(side="right", padx=5, pady=4, ipadx=5)
+        show_button.pack(side="right", padx=(2, 0), pady=4, ipadx=3)
+        self._capture_buttons[key] = button
+        return button
+
+    def _select_capture_item(self, label: str, command: Callable[[], None]) -> None:
+        command()
+
+    def _show_capture_item(self, label: str, key: str) -> None:
+        self.debug_boxes.set(True)
+        self.bot.set_calibration_overlay_item(key)
+
+    def _refresh_strategy_choices(self) -> None:
+        profession = self.profession_name.get()
+        strategies = self._profession_strategies.get(profession, ())
+        names = [item.display_name for item in strategies]
+        self.strategy_combo.configure(values=names)
+        if names and self.strategy_name.get() not in names:
+            self.strategy_name.set(names[0])
+
+    def _profession_changed(self, _event: tk.Event | None = None) -> None:
+        self._refresh_strategy_choices()
+        self._strategy_changed()
+
+    @staticmethod
+    def _item_complete(config: dict[str, Any], key: str) -> bool:
+        value = config.get("calibration", {}).get("items", {}).get(key, {})
+        if isinstance(value, dict):
+            return bool(value.get("complete"))
+        return bool(value)
+
+    def _refresh_capture_status(self, config: dict[str, Any]) -> None:
+        counts = template_counts()
+        status_values: dict[str, tuple[str, str]] = {}
+        for key in ("hp_bar", "mp_bar", "minimap", "player_marker", "combat_region", "platform_center", "targeting_range"):
+            complete = self._item_complete(config, key)
+            status_values[key] = ("已通过" if complete else "未采集", SUCCESS if complete else MUTED)
+        status_values["player"] = (
+            (f"{counts['player']} 张" if counts["player"] else "未采集"),
+            SUCCESS if counts["player"] else MUTED,
+        )
+        for key, (text, color) in status_values.items():
+            variable = self._capture_status_vars.get(key)
+            label = self._capture_status_labels.get(key)
+            if variable is not None:
+                variable.set(text)
+            if label is not None:
+                label.configure(fg=color)
+            button = self._capture_buttons.get(key)
+            if button is not None:
+                button.configure(text="重采" if color == SUCCESS else "采集")
 
     def _section(self, title: str) -> None:
         wrap = tk.Frame(self._content, bg=PANEL, highlightbackground="#333333", highlightthickness=1)
@@ -629,7 +880,9 @@ class ControlPanel:
         self._loading_settings = True
         try:
             strategy = active_strategy(config)
+            self.profession_name.set(strategy.profession)
             self.strategy_name.set(strategy.display_name)
+            self._refresh_strategy_choices()
             self._render_strategy_settings(config)
             for key, entry in self._entries.items():
                 value = self._nested(config, key)
@@ -639,6 +892,8 @@ class ControlPanel:
                 value = self._nested(config, key)
                 entry.delete(0, "end")
                 entry.insert(0, str(value))
+            for key, variable in self._strategy_toggles.items():
+                variable.set(bool(self._nested(config, key)))
             for key, entry in self._targeting_entries.items():
                 value = self._nested(config, key)
                 entry.delete(0, "end")
@@ -661,9 +916,47 @@ class ControlPanel:
         for child in self.strategy_settings_body.winfo_children():
             child.destroy()
         self._strategy_entries.clear()
+        self._strategy_toggles.clear()
         strategy = self._selected_strategy()
         self.strategy_description.set(strategy.description)
         prefix = f"strategy.options.{strategy.key}."
+        tk.Label(
+            self.strategy_settings_body,
+            text="策略多选",
+            bg=PANEL,
+            fg=FG,
+            font=FONT_SECTION,
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=(4, 2))
+        base_enabled = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            self.strategy_settings_body,
+            text=f"基础输出 · {strategy.display_name}",
+            variable=base_enabled,
+            state="disabled",
+            disabledforeground=SUCCESS,
+            bg=PANEL,
+            fg=FG,
+            selectcolor=ENTRY_BG,
+            font=FONT,
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=2)
+        for field in strategy.toggle_fields:
+            variable = tk.BooleanVar(value=bool(self._nested(config, prefix + field.path)))
+            self._strategy_toggles[prefix + field.path] = variable
+            tk.Checkbutton(
+                self.strategy_settings_body,
+                text=field.label,
+                variable=variable,
+                command=lambda path=field.path, selected=variable: self._preview_strategy_toggle(path, selected),
+                bg=PANEL,
+                fg=FG,
+                selectcolor=ENTRY_BG,
+                activebackground=PANEL,
+                activeforeground=FG,
+                font=FONT,
+                anchor="w",
+            ).pack(fill="x", padx=8, pady=2)
         for field in strategy.setting_fields:
             self._labeled_entry(
                 self.strategy_settings_body,
@@ -674,6 +967,12 @@ class ControlPanel:
                 minimum=field.minimum,
                 maximum=field.maximum,
                 on_adjust=lambda text, path=field.path: self._preview_strategy_setting(path, text),
+            )
+        for field in strategy.capture_fields:
+            self._row_button(
+                self.strategy_settings_body,
+                field.button_label,
+                lambda selected=field: self._capture_strategy_area(selected),
             )
 
     def _strategy_changed(self, _event: tk.Event | None = None) -> None:
@@ -687,6 +986,8 @@ class ControlPanel:
             for key, entry in self._strategy_entries.items():
                 entry.delete(0, "end")
                 entry.insert(0, str(self._nested(config, key)))
+            for key, variable in self._strategy_toggles.items():
+                variable.set(bool(self._nested(config, key)))
         except Exception as exc:
             messagebox.showerror("切换职业策略失败", str(exc), parent=self.root)
 
@@ -699,6 +1000,15 @@ class ControlPanel:
         save_config(self.config_path, config)
         if strategy.key == self.bot.strategy.key:
             self.bot.preview_strategy_setting(path, value)
+
+    def _preview_strategy_toggle(self, path: str, variable: tk.BooleanVar) -> None:
+        strategy = self._selected_strategy()
+        value = bool(variable.get())
+        config = load_config(self.config_path)
+        self._nested(config, f"strategy.options.{strategy.key}.{path}", value)
+        save_config(self.config_path, config)
+        if strategy.key == self.bot.strategy.key:
+            self.bot.apply_config(config)
 
     def _preview_targeting_setting(self, path: str, text: str) -> None:
         value = float(text)
@@ -753,6 +1063,7 @@ class ControlPanel:
             f"姓名板 {counts['player']}｜"
             f"头部 {counts['head']}｜称号 {counts['title']}"
         )
+        self._refresh_capture_status(config)
 
     def _refresh_monster_categories(self, preferred: str | None = None) -> str:
         categories = list_monster_categories()
@@ -868,9 +1179,10 @@ class ControlPanel:
 
         self._run_tool("分类删除", action)
 
-    def _manage_templates(self) -> None:
+    def _manage_templates(self, family: str = "monster") -> None:
         if self.busy:
             return
+        selected_family = "player" if family == "player" else "monster"
         category = self._selected_monster_category()
         self.busy = True
         dialog: tk.Toplevel | None = None
@@ -887,7 +1199,7 @@ class ControlPanel:
             dialog.update_idletasks()
             _exclude_from_capture(_top_level_hwnd(dialog))
             dialog.protocol("WM_DELETE_WINDOW", lambda: self._close_template_manager(dialog))
-            self._build_template_manager(dialog, category)
+            self._build_template_manager(dialog, category, selected_family)
             dialog.grab_set()
             dialog.focus_force()
         except Exception as exc:
@@ -899,7 +1211,7 @@ class ControlPanel:
 
     def _manage_monster_templates(self) -> None:
         """兼容旧入口；当前管理器已覆盖全部五类采集图片。"""
-        self._manage_templates()
+        self._manage_templates("monster")
 
     def _close_template_manager(self, dialog: tk.Toplevel | None) -> None:
         if dialog is not None and bool(getattr(dialog, "_mbv_closed", False)):
@@ -933,7 +1245,12 @@ class ControlPanel:
                     except tk.TclError:
                         pass
 
-    def _build_template_manager(self, dialog: tk.Toplevel, category: str) -> None:
+    def _build_template_manager(
+        self,
+        dialog: tk.Toplevel,
+        category: str,
+        initial_family: str = "monster",
+    ) -> None:
         groups: dict[str, dict[str, Any]] = {}
         preview_photo: list[ImageTk.PhotoImage | None] = [None]
         active_kind: list[str | None] = [None]
@@ -1027,6 +1344,7 @@ class ControlPanel:
                 items = groups[kind]["items"]
                 if items:
                     selected_index = min(index, len(items) - 1)
+                    family_notebook.select(family_frames[groups[kind]["family"]])
                     groups[kind]["notebook"].select(groups[kind]["frame"])
                     groups[kind]["listbox"].selection_set(selected_index)
                     groups[kind]["listbox"].see(selected_index)
@@ -1039,7 +1357,8 @@ class ControlPanel:
                 self._capture(kind)
                 try:
                     if self.root.winfo_exists():
-                        self._manage_templates()
+                        reopened_family = "monster" if kind in {"monster", "filter"} else "player"
+                        self._manage_templates(reopened_family)
                 except tk.TclError:
                     pass
 
@@ -1111,10 +1430,23 @@ class ControlPanel:
             font=FONT_SMALL,
             anchor="w",
         ).pack(fill="x", pady=(0, 5))
-        notebook = ttk.Notebook(left_frame)
-        notebook.pack(fill="both", expand=True)
+        family_notebook = ttk.Notebook(left_frame)
+        family_notebook.pack(fill="both", expand=True)
+        family_frames = {
+            "monster": tk.Frame(family_notebook, bg=PANEL),
+            "player": tk.Frame(family_notebook, bg=PANEL),
+        }
+        family_notebook.add(family_frames["monster"], text="怪物模板")
+        family_notebook.add(family_frames["player"], text="人物模板")
+        family_notebooks: dict[str, ttk.Notebook] = {}
+        for family_key, family_frame in family_frames.items():
+            inner_notebook = ttk.Notebook(family_frame)
+            inner_notebook.pack(fill="both", expand=True, padx=6, pady=6)
+            family_notebooks[family_key] = inner_notebook
 
         for kind, title in TEMPLATE_GROUPS:
+            family_key = "monster" if kind in {"monster", "filter"} else "player"
+            notebook = family_notebooks[family_key]
             frame = tk.Frame(notebook, bg=PANEL)
             notebook.add(frame, text=title)
             list_wrap = tk.Frame(frame, bg=PANEL)
@@ -1140,6 +1472,7 @@ class ControlPanel:
                 "category": category if kind in {"monster", "filter"} else "",
                 "frame": frame,
                 "notebook": notebook,
+                "family": family_key,
             }
             listbox.bind("<<ListboxSelect>>", lambda _event, selected_kind=kind: show_preview(selected_kind))
             buttons = tk.Frame(frame, bg=PANEL)
@@ -1169,9 +1502,11 @@ class ControlPanel:
                 cursor="hand2",
             ).pack(side="left", fill="x", expand=True, padx=(4, 0), ipady=3)
 
-        def selected_tab_changed(_event: tk.Event | None = None) -> None:
+        def selected_tab_changed(notebook: ttk.Notebook) -> None:
             selected_frame = str(notebook.select())
             for kind, group in groups.items():
+                if group["notebook"] is not notebook:
+                    continue
                 if str(group["frame"]) != selected_frame:
                     continue
                 if group["listbox"].curselection():
@@ -1181,7 +1516,13 @@ class ControlPanel:
                     clear_preview(f"选择{TEMPLATE_GROUP_LABELS[kind]}图片以预览")
                 break
 
-        notebook.bind("<<NotebookTabChanged>>", selected_tab_changed)
+        for notebook in family_notebooks.values():
+            notebook.bind(
+                "<<NotebookTabChanged>>",
+                lambda _event, selected_notebook=notebook: selected_tab_changed(selected_notebook),
+            )
+        selected_family = "player" if initial_family == "player" else "monster"
+        family_notebook.select(family_frames[selected_family])
         reload_lists()
 
     def _tick(self) -> None:
@@ -1204,8 +1545,12 @@ class ControlPanel:
             color = ACCENT
             self.arm_button.configure(text="启动挂机")
         self.debug_boxes.set(self.bot.calibration_overlay_visible)
+        debug_item = getattr(self.bot, "calibration_overlay_item", None)
+        debug_mode = "单项" if self.bot.calibration_overlay_visible and debug_item else (
+            "全部" if self.bot.calibration_overlay_visible else "关"
+        )
         self.debug_button.configure(
-            text="显示 Debug 框：开" if self.bot.calibration_overlay_visible else "显示 Debug 框：关",
+            text=f"显示 Debug 框：{debug_mode}",
             fg=ACCENT if self.bot.calibration_overlay_visible else MUTED,
         )
         notice = self.bot.notice if self.bot.notice and self.bot.notice_until >= time.monotonic() else ""
@@ -1242,6 +1587,30 @@ class ControlPanel:
 
     def _calibrate(self) -> None:
         self._run_tool("状态栏与小地图校准", lambda: calibrate(self.config_path, parent=self.root))
+
+    def _capture_status_item(self, key: str, label: str) -> None:
+        self._run_tool(
+            f"{label}采集",
+            lambda: capture_status_region(self.config_path, key, label, parent=self.root),
+        )
+
+    def _capture_player_marker_item(self) -> None:
+        self._run_tool(
+            "小地图玩家标记采集",
+            lambda: capture_player_marker(self.config_path, parent=self.root),
+        )
+
+    def _capture_combat_region_item(self) -> None:
+        self._run_tool(
+            "战斗识别区域采集",
+            lambda: capture_combat_region(self.config_path, parent=self.root),
+        )
+
+    def _capture_platform_center_item(self) -> None:
+        self._run_tool(
+            "平台中心采集",
+            lambda: capture_platform_center(self.config_path, parent=self.root),
+        )
 
     def _capture_recognition_region(self) -> None:
         self._run_tool(
@@ -1298,6 +1667,30 @@ class ControlPanel:
 
         self._run_tool(
             "通用索敌范围框选",
+            action,
+        )
+
+    def _capture_strategy_area(self, field: StrategyCaptureField) -> None:
+        strategy = self._selected_strategy()
+
+        def action() -> None:
+            capture_strategy_area(
+                self.config_path,
+                field.recognition_key,
+                field.prompt,
+                parent=self.root,
+            )
+            if field.enable_setting:
+                config = load_config(self.config_path)
+                self._nested(
+                    config,
+                    f"strategy.options.{strategy.key}.{field.enable_setting}",
+                    True,
+                )
+                save_config(self.config_path, config)
+
+        self._run_tool(
+            field.button_label,
             action,
         )
 
@@ -1363,6 +1756,8 @@ class ControlPanel:
                 current = self._nested(config, key)
                 value = float(raw) if isinstance(current, (int, float)) and not isinstance(current, bool) else raw
                 self._nested(config, key, value)
+            for key, variable in self._strategy_toggles.items():
+                self._nested(config, key, bool(variable.get()))
             for key, entry in self._targeting_entries.items():
                 raw = entry.get().strip()
                 current = self._nested(config, key)
@@ -1370,6 +1765,8 @@ class ControlPanel:
                 self._nested(config, key, value)
             config.setdefault("input", {})
             config["input"]["delivery"] = "background" if self.delivery.get() else "foreground"
+            config.setdefault("window", {})
+            config["window"]["topmost_while_armed"] = bool(self.topmost_while_armed.get())
             config["behavior"]["fallback_patrol"] = bool(self.fallback_patrol.get())
             config["behavior"]["pickup_after_target_lost"] = bool(self.pickup_lost.get())
             config["behavior"]["hp_threshold"] = max(0, min(100, int(self.hp_threshold_percent.get()))) / 100.0
@@ -1385,6 +1782,7 @@ class ControlPanel:
                     "behavior.mp_threshold",
                     "behavior.fallback_patrol",
                     "behavior.pickup_after_target_lost",
+                    "window.topmost_while_armed",
                 ):
                     self.bot.preview_config_setting(key, self._nested(config, key))
             if notify:

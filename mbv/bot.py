@@ -20,7 +20,7 @@ from mbv.paths import (
     PLAYER_TITLE_ASSET_DIR,
 )
 from mbv.strategies import active_strategy, missing_recognition_data, strategy_settings
-from mbv.strategies.base import StrategyActionContext, TargetSelectionContext
+from mbv.strategies.base import StrategyActionContext, TargetSelectionContext, horizontal_overlap_ratio
 from mbv.vision import (
     Detection,
     PlayerAnchor,
@@ -36,6 +36,7 @@ from mbv.vision import (
     monster_templates_for_category,
     player_attack_anchor,
     player_marker,
+    roi_pixels,
     smooth_player_attack_anchor,
     suppress_monster_detections,
 )
@@ -52,7 +53,14 @@ from mbv.win32 import (
     process_integrity_level,
     user32,
 )
-from mbv.window import capture_client, client_window, find_game_window, focus_game_window, window_process_path
+from mbv.window import (
+    capture_client,
+    client_window,
+    find_game_window,
+    focus_game_window,
+    set_window_topmost,
+    window_process_path,
+)
 
 STATE_LABELS = {
     "PAUSED": "已暂停",
@@ -64,16 +72,27 @@ STATE_LABELS = {
     "CHASE_LEFT": "向左接近目标",
     "CHASE_RIGHT": "向右接近目标",
     "PLAYER_SCREEN_LOST": "正在识别玩家位置",
-    "TARGET_OUT_OF_RANGE": "战斗区暂无同层目标",
+    "TARGET_OUT_OF_RANGE": "战斗区暂无有效目标",
     "HP_POTION": "正在使用回血药",
     "MP_POTION": "正在使用回蓝药",
     "PICKUP": "正在拾取",
     "MARKER_LOST": "玩家标记丢失",
     "RETURN_CENTER_LEFT": "向左返回平台中心",
     "RETURN_CENTER_RIGHT": "向右返回平台中心",
+    "RETURN_SAFE_LEFT": "向左返回安全输出区",
+    "RETURN_SAFE_RIGHT": "向右返回安全输出区",
+    "RETURN_SAFE_JUMP_LEFT": "向左跳回安全输出区",
+    "RETURN_SAFE_JUMP_RIGHT": "向右跳回安全输出区",
+    "RETURN_SAFE_JUMP_UP": "向上跳回安全输出区",
+    "WAITING_SAFE_JUMP": "等待下一次回位跳跃",
+    "SAFE_OUTPUT_ABOVE": "位于安全区上方，等待人工处理",
+    "JUMP_ATTACK_CLOSE": "近身跳跃攻击",
+    "WAITING_JUMP_ATTACK": "等待近身跳跃攻击冷却",
 }
 
 DEFAULT_PLAYER_AUXILIARY_INTERVAL_SECONDS = 0.5
+JUMP_ATTACK_LEAD_SECONDS = 0.05
+JUMP_ATTACK_OVERLAP_SECONDS = 0.05
 
 
 def runtime_limit_reached(
@@ -144,6 +163,8 @@ class BowmanBot:
         self.last_attack = 0.0
         self.last_hp = 0.0
         self.last_mp = 0.0
+        self.last_jump = 0.0
+        self.last_jump_attack = 0.0
         self.last_pickup = 0.0
         self.started_at = 0.0
         self.hotkey_state: dict[str, bool] = {}
@@ -153,6 +174,7 @@ class BowmanBot:
         self.f8_requested = threading.Event()
         self.f9_requested = threading.Event()
         self.calibration_overlay_visible = True
+        self.calibration_overlay_item: str | None = None
         self.notice = ""
         self.notice_until = 0.0
         self.last_detection_box: tuple[int, int, int, int] | None = None
@@ -167,6 +189,7 @@ class BowmanBot:
         self.integrity_ok = True
         self.vision_suspended = threading.Event()
         self.window: WindowInfo | None = None
+        self.window_topmost = False
         self.ui_hp = 0.0
         self.ui_mp = 0.0
         self.config_lock = threading.Lock()
@@ -248,7 +271,17 @@ class BowmanBot:
         was_armed = self.armed
         self.armed = False
         self.state = "PAUSED"
-        self.keyboard.release_all()
+        try:
+            self.keyboard.release_all()
+        finally:
+            if getattr(self, "window_topmost", False):
+                window = getattr(self, "window", None)
+                self.window_topmost = False
+                if window is not None and user32.IsWindow(window.hwnd):
+                    try:
+                        set_window_topmost(window, False)
+                    except OSError as exc:
+                        self.log.write("window_topmost_error", enabled=False, error=str(exc))
         if was_armed:
             self.log.write("disarm", reason=reason)
             self.notify(f"已暂停：{reason}", 5.0)
@@ -268,8 +301,14 @@ class BowmanBot:
         if not self.config.get("calibrated"):
             self.notify("校准未完成，请依次采集「状态栏与小地图」和「识别区域与平台中心」。")
             return
-        if missing_recognition_data(self.config, self.strategy):
-            self.notify(f"策略“{self.strategy.display_name}”需要先采集识别区域与平台中心。", 6.0)
+        missing = missing_recognition_data(self.config, self.strategy)
+        if missing:
+            labels = {"platform_center": "识别区域与平台中心"}
+            labels.update(
+                {field.recognition_key: field.button_label for field in self.strategy.capture_fields}
+            )
+            missing_text = "、".join(labels.get(key, key) for key in missing)
+            self.notify(f"策略“{self.strategy.display_name}”需要先完成：{missing_text}。", 6.0)
             return
         if not self.player_templates:
             self.notify("尚未采集玩家姓名板模板，请在控制面板点击「采集姓名板」。", 8.0)
@@ -283,8 +322,30 @@ class BowmanBot:
         if user32.IsIconic(window.hwnd):
             self.notify("启动失败：游戏窗口已最小化。后台截图需要窗口保持可见。", 6.0)
             return
+        try:
+            window = client_window(window.hwnd, window.title)
+        except Exception as exc:
+            self.notify(f"启动失败：无法读取当前游戏窗口（{exc}）", 6.0)
+            return
+        calibrated_size = self.config.get("calibration", {}).get("window_size")
+        if (
+            isinstance(calibrated_size, list)
+            and len(calibrated_size) == 2
+            and [window.width, window.height] != [int(calibrated_size[0]), int(calibrated_size[1])]
+        ):
+            self.notify(
+                f"启动失败：游戏窗口已从 {calibrated_size[0]}×{calibrated_size[1]} 变为 "
+                f"{window.width}×{window.height}，请按左侧项目重新校准。",
+                8.0,
+            )
+            return
         self.keyboard.bind_window(window.hwnd)
-        if int(user32.GetForegroundWindow()) != window.hwnd:
+        topmost_while_armed = bool(
+            self.config.get("window", {}).get("topmost_while_armed", True)
+        )
+        if int(user32.GetForegroundWindow()) != window.hwnd and (
+            not self.background_input or topmost_while_armed
+        ):
             try:
                 focus_game_window(window, settle_seconds=0.15)
             except Exception as exc:
@@ -294,6 +355,14 @@ class BowmanBot:
         if not self.background_input and int(user32.GetForegroundWindow()) != window.hwnd:
             self.notify("启动失败：游戏没有进入前台，请点击游戏后重试。", 6.0)
             return
+        if topmost_while_armed:
+            try:
+                set_window_topmost(window, True)
+            except OSError as exc:
+                self.notify(f"启动失败：无法将游戏窗口置顶（{exc}）", 6.0)
+                return
+        self.window = window
+        self.window_topmost = topmost_while_armed
         self.armed = True
         self.state = "SCANNING"
         self.started_at = time.monotonic()
@@ -303,11 +372,14 @@ class BowmanBot:
             templates=len(self.templates),
             delivery=self.delivery,
             input_hwnd=self.keyboard.hwnd,
+            window_topmost=topmost_while_armed,
         )
         if self.background_input:
-            self.notify("已经启动（后台按键）。始终发送扫描码；控制面板不抢焦点。", 5.0)
+            window_mode = "游戏窗口置顶" if topmost_while_armed else "游戏窗口不置顶"
+            self.notify(f"已经启动（后台按键、{window_mode}）。始终发送扫描码；控制面板不抢焦点。", 5.0)
         else:
-            self.notify("已经启动。按 F8 暂停，F7 显隐 Debug 框，按 F9 或 Ctrl+Shift+Q 立即退出。", 3.0)
+            window_mode = "游戏窗口已置顶" if topmost_while_armed else "游戏窗口不置顶"
+            self.notify(f"已经启动，{window_mode}。按 F8 暂停，F7 显隐 Debug 框，按 F9 或 Ctrl+Shift+Q 立即退出。", 3.0)
         user32.MessageBeep(0x00000040)
 
     def request_toggle(self) -> None:
@@ -318,7 +390,20 @@ class BowmanBot:
 
     def set_calibration_overlay_visible(self, visible: bool) -> None:
         self.calibration_overlay_visible = bool(visible)
-        self.log.write("calibration_overlay", visible=self.calibration_overlay_visible)
+        self.calibration_overlay_item = None
+        self.log.write(
+            "calibration_overlay",
+            visible=self.calibration_overlay_visible,
+            item=None,
+        )
+
+    def set_calibration_overlay_item(self, item: str) -> None:
+        selected = str(item).strip()
+        if not selected:
+            raise ValueError("Debug 采集项不能为空")
+        self.calibration_overlay_visible = True
+        self.calibration_overlay_item = selected
+        self.log.write("calibration_overlay", visible=True, item=selected)
 
     def suspend_vision(self) -> None:
         with self.action_lock:
@@ -392,8 +477,8 @@ class BowmanBot:
         self.apply_config(load_config(config_path))
         self.reload_templates()
 
-    def preview_strategy_setting(self, path: str, value: float) -> None:
-        """实时预览策略数值，不暂停挂机；持久化仍由面板“保存配置”完成。"""
+    def preview_strategy_setting(self, path: str, value: Any) -> None:
+        """实时预览策略参数，不暂停挂机；面板同时负责持久化。"""
         parts = str(path).split(".")
         if not parts or any(not part for part in parts):
             raise ValueError("策略参数路径无效")
@@ -407,8 +492,8 @@ class BowmanBot:
                     cursor = child
                 if parts[-1] not in cursor:
                     raise KeyError(f"策略参数不存在：{path}")
-                cursor[parts[-1]] = float(value)
-        self.log.write("strategy_setting_preview", strategy=self.strategy.key, path=path, value=float(value))
+                cursor[parts[-1]] = value
+        self.log.write("strategy_setting_preview", strategy=self.strategy.key, path=path, value=value)
 
     def preview_targeting_setting(self, path: str, value: float) -> None:
         """实时预览公共索敌区参数，不暂停挂机。"""
@@ -494,6 +579,44 @@ class BowmanBot:
         self.move(desired)
         self.state = f"CHASE_{desired.upper()}"
 
+    def jump_to_safe(self, direction: str | None, now: float, state: str) -> None:
+        if direction is None:
+            self.stop_move()
+        else:
+            self.move(direction)
+        self.keyboard.tap(self.config["keys"]["jump"])
+        self.last_jump = now
+        self.state = state
+        self.log.write("safe_return_jump", direction=direction or "up")
+
+    def jump_attack(self, target_x: float, player_x: float, overlap_ratio: float, now: float) -> None:
+        keys = self.config["keys"]
+        self.stop_move()
+        desired = "left" if target_x < player_x else "right"
+        if self.direction != desired:
+            self.keyboard.tap(keys[desired], float(self.config["behavior"]["face_tap_seconds"]))
+            self.direction = desired
+        jump_key = keys["jump"]
+        attack_key = keys["attack"]
+        try:
+            self.keyboard.down(jump_key)
+            time.sleep(JUMP_ATTACK_LEAD_SECONDS)
+            self.keyboard.down(attack_key)
+            time.sleep(JUMP_ATTACK_OVERLAP_SECONDS)
+        finally:
+            self.keyboard.up(attack_key)
+            self.keyboard.up(jump_key)
+        self.last_jump_attack = now
+        self.last_attack = now
+        self.state = "JUMP_ATTACK_CLOSE"
+        self.log.write(
+            "jump_attack",
+            direction=desired,
+            overlap_ratio=round(overlap_ratio, 4),
+            jump_key=jump_key,
+            attack_key=attack_key,
+        )
+
     def act(
         self,
         window: WindowInfo,
@@ -506,6 +629,7 @@ class BowmanBot:
         combat_width: int,
         has_monster_candidates: bool,
         now: float,
+        combat_height: int = 1,
     ) -> None:
         with self.action_lock:
             self._act(
@@ -519,6 +643,7 @@ class BowmanBot:
                 combat_width,
                 has_monster_candidates,
                 now,
+                combat_height,
             )
 
     def _act(
@@ -533,6 +658,7 @@ class BowmanBot:
         combat_width: int,
         has_monster_candidates: bool,
         now: float,
+        combat_height: int = 1,
     ) -> None:
         if not self.armed or not self.input_authorized:
             return
@@ -584,6 +710,9 @@ class BowmanBot:
                 behavior=behavior,
                 settings=strategy_settings(self.config),
                 recognition=self.config["recognition"],
+                combat_height=combat_height,
+                last_jump=getattr(self, "last_jump", 0.0),
+                last_jump_attack=getattr(self, "last_jump_attack", 0.0),
             )
         )
         if decision.target_seen:
@@ -600,6 +729,15 @@ class BowmanBot:
         elif decision.action == "move":
             self.move(str(decision.direction))
             self.state = decision.state
+        elif decision.action == "jump":
+            self.jump_to_safe(decision.direction, now, decision.state)
+        elif decision.action == "jump_attack":
+            self.jump_attack(
+                float(decision.target_x),
+                float(decision.player_x),
+                float(decision.close_overlap_ratio or 0.0),
+                now,
+            )
         elif decision.action == "pickup":
             self.stop_move()
             self.keyboard.tap(keys["pickup"])
@@ -906,11 +1044,17 @@ class BowmanBot:
                     score = selected_target.score if selected_target is not None else detected_score
                     target_distance_px = None
                     target_direction = ""
+                    close_overlap_ratio = None
+                    close_overlap_threshold = None
                     if selected_target is not None and player_box is not None:
                         target_center = selected_target.box[0] + selected_target.box[2] / 2.0
                         player_center = player_box[0] + player_box[2] / 2.0
                         target_distance_px = int(round(abs(target_center - player_center)))
                         target_direction = "左" if target_center < player_center else "右"
+                        settings = strategy_settings(self.config)
+                        if "close_overlap_threshold" in settings:
+                            close_overlap_ratio = horizontal_overlap_ratio(player_box, selected_target.box)
+                            close_overlap_threshold = float(settings["close_overlap_threshold"])
                     self.act(
                         window,
                         hp,
@@ -922,6 +1066,7 @@ class BowmanBot:
                         combat_img.shape[1],
                         bool(monsters),
                         now,
+                        combat_height=combat_img.shape[0],
                     )
                     current_window = client_window(window.hwnd, window.title)
                     monster_box = None
@@ -929,11 +1074,22 @@ class BowmanBot:
                     monster_boxes: list[tuple[int, int, int, int]] = []
                     player_screen_box = None
                     attack_range_box = None
+                    strategy_area_boxes: list[dict[str, Any]] = []
+                    close_overlap_span = None
                     marker_screen = None
+                    platform_center_screen = None
                     if marker is not None:
                         mx = minimap_rect[0] + int(marker[0] * minimap_rect[2])
                         my = minimap_rect[1] + int(marker[1] * minimap_rect[3])
                         marker_screen = (mx, my)
+                    recognition = self.config["recognition"]
+                    if recognition.get("platform_center_captured"):
+                        platform_center = recognition.get("platform_center")
+                        if isinstance(platform_center, dict):
+                            platform_center_screen = (
+                                combat_rect[0] + int(round(float(platform_center["x"]) * combat_rect[2])),
+                                combat_rect[1] + int(round(float(platform_center["y"]) * combat_rect[3])),
+                            )
                     for detection in monsters:
                         dx, dy, dw, dh = detection.box
                         monster_boxes.append((combat_rect[0] + dx, combat_rect[1] + dy, dw, dh))
@@ -941,6 +1097,15 @@ class BowmanBot:
                         bx = combat_rect[0] + box[0]
                         by = combat_rect[1] + box[1]
                         monster_box = (bx, by, box[2], box[3])
+                        if close_overlap_ratio is not None and player_box is not None:
+                            overlap_left = max(player_box[0], box[0])
+                            overlap_right = min(player_box[0] + player_box[2], box[0] + box[2])
+                            if overlap_right > overlap_left:
+                                close_overlap_span = (
+                                    combat_rect[0] + overlap_left,
+                                    combat_rect[1] + player_box[1],
+                                    overlap_right - overlap_left,
+                                )
                     if chase_box is not None:
                         cx = combat_rect[0] + chase_box[0]
                         cy = combat_rect[1] + chase_box[1]
@@ -969,6 +1134,23 @@ class BowmanBot:
                                 int(round(range_right - range_left)),
                                 int(round(range_bottom - range_top)),
                             )
+                    for field in self.strategy.capture_fields:
+                        settings = strategy_settings(self.config)
+                        if field.enable_setting and not bool(settings.get(field.enable_setting)):
+                            continue
+                        if not recognition.get(f"{field.recognition_key}_captured"):
+                            continue
+                        area = recognition.get(field.recognition_key)
+                        if not isinstance(area, dict):
+                            continue
+                        ax, ay, aw, ah = roi_pixels(combat_img.shape, area)
+                        strategy_area_boxes.append(
+                            {
+                                "box": (combat_rect[0] + ax, combat_rect[1] + ay, aw, ah),
+                                "label": field.debug_label,
+                                "key": field.recognition_key,
+                            }
+                        )
                     state_label = STATE_LABELS.get(self.state, self.state)
                     if not self.player_templates:
                         banner = "缺少玩家姓名板模板｜请在控制面板采集姓名板"
@@ -995,6 +1177,7 @@ class BowmanBot:
                             "banner": banner,
                             "notice": self.notice if now <= self.notice_until else "",
                             "show_calibration": self.calibration_overlay_visible,
+                            "debug_item": self.calibration_overlay_item,
                             "hp": hp,
                             "mp": mp,
                             "hp_roi": self.config["regions"]["hp_bar"],
@@ -1002,11 +1185,16 @@ class BowmanBot:
                             "minimap_roi": self.config["regions"]["minimap"],
                             "combat_roi": self.config["regions"]["combat"],
                             "marker_screen": marker_screen,
+                            "platform_center_screen": platform_center_screen,
                             "player_box": player_screen_box,
                             "player_score": active_player_score,
                             "player_source": player_source,
                             "attack_range_box": attack_range_box,
                             "attack_range_label": "有效索敌区",
+                            "strategy_area_boxes": strategy_area_boxes,
+                            "close_overlap_ratio": close_overlap_ratio,
+                            "close_overlap_threshold": close_overlap_threshold,
+                            "close_overlap_span": close_overlap_span,
                             "monster_boxes": monster_boxes,
                             "monster_box": monster_box,
                             "chase_box": chase_screen_box,

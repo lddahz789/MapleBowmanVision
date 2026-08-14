@@ -21,6 +21,8 @@ class StationaryAttackStrategy:
         "仅在目标换边时转向后原地攻击；范围外目标不追踪，也不巡逻或返回平台中心。"
     )
     required_recognition_data: tuple[str, ...] = ()
+    toggle_fields = ()
+    capture_fields = ()
     setting_fields: tuple[StrategySettingField, ...] = ()
     default_settings: dict[str, Any] = {}
 

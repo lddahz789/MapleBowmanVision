@@ -21,6 +21,8 @@ class BowmanDynamicStrategy:
         "框外同层怪物则接近。无目标时可按配置拾取或左右巡逻。"
     )
     required_recognition_data = ("platform_center",)
+    toggle_fields = ()
+    capture_fields = ()
     setting_fields = (
         StrategySettingField("platform_center_tolerance", "平台中心安全半径", maximum=0.5),
     )

@@ -6,6 +6,7 @@ from typing import Any
 from mbv.strategies.base import CombatStrategy
 from mbv.strategies.bowman.dynamic import BowmanDynamicStrategy
 from mbv.strategies.common.stationary_attack import StationaryAttackStrategy
+from mbv.strategies.thief.throwing_star import ThrowingStarSafeStrategy
 
 DEFAULT_STRATEGY = "bowman_dynamic"
 _REGISTRY: dict[str, CombatStrategy] = {}
@@ -40,10 +41,19 @@ def strategy_settings(config: dict[str, Any], key: str | None = None) -> dict[st
 
 def missing_recognition_data(config: dict[str, Any], strategy: CombatStrategy) -> tuple[str, ...]:
     recognition = config.get("recognition", {})
+    settings = strategy_settings(config, strategy.key)
     missing: list[str] = []
     for key in strategy.required_recognition_data:
         if key not in recognition or not bool(recognition.get(f"{key}_captured")):
             missing.append(key)
+    for field in strategy.capture_fields:
+        if (
+            field.enable_setting
+            and bool(settings.get(field.enable_setting))
+            and not bool(recognition.get(f"{field.recognition_key}_captured"))
+            and field.recognition_key not in missing
+        ):
+            missing.append(field.recognition_key)
     return tuple(missing)
 
 
@@ -75,6 +85,7 @@ def normalize_strategy_config(config: dict[str, Any]) -> None:
 
 register_strategy(BowmanDynamicStrategy())
 register_strategy(StationaryAttackStrategy())
+register_strategy(ThrowingStarSafeStrategy())
 
 
 __all__ = [

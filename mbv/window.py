@@ -10,7 +10,16 @@ from typing import Any
 import mss
 import numpy as np
 
-from mbv.win32 import user32, window_process_path
+from mbv.win32 import (
+    HWND_NOTOPMOST,
+    HWND_TOPMOST,
+    SWP_NOACTIVATE,
+    SWP_NOMOVE,
+    SWP_NOSIZE,
+    SW_RESTORE,
+    user32,
+    window_process_path,
+)
 
 @dataclass
 class WindowInfo:
@@ -103,7 +112,7 @@ def focus_game_window(window: WindowInfo, settle_seconds: float = 0.8) -> None:
     # Calibration must capture the unobstructed game, not the console that
     # launched this script. This changes focus only; it sends no game keys.
     if user32.IsIconic(window.hwnd):
-        user32.ShowWindow(window.hwnd, 9)  # SW_RESTORE
+        user32.ShowWindow(window.hwnd, SW_RESTORE)
     foreground = int(user32.GetForegroundWindow() or 0)
     current_thread = int(ctypes.windll.kernel32.GetCurrentThreadId())
     foreground_pid = wintypes.DWORD()
@@ -136,6 +145,15 @@ def focus_game_window(window: WindowInfo, settle_seconds: float = 0.8) -> None:
             return
         time.sleep(0.05)
     raise RuntimeError("无法将游戏切换到前台。请手动点一下游戏窗口后重试。")
+
+
+def set_window_topmost(window: WindowInfo, enabled: bool) -> None:
+    """Keep the game visible while armed without moving, resizing, or focusing it."""
+    insert_after = HWND_TOPMOST if enabled else HWND_NOTOPMOST
+    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+    if not user32.SetWindowPos(window.hwnd, insert_after, 0, 0, 0, 0, flags):
+        action = "置顶" if enabled else "取消置顶"
+        raise OSError(f"无法{action}游戏窗口")
 
 
 def capture_client(sct: Any, window: WindowInfo, attempts: int = 3) -> np.ndarray:

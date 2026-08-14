@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = ROOT / "config.json"
+EXAMPLE_CONFIG = ROOT / "config.example.json"
 ASSET_DIR = ROOT / "assets" / "monsters"
 MONSTER_FILTER_ASSET_DIR = ROOT / "assets" / "monster_filters"
 TEMPLATE_TRASH_DIR = ROOT / "assets" / "template_trash"

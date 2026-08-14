@@ -22,6 +22,21 @@
 - 索敌框：使用公共 `targeting.box`，框随角色朝向左右翻转。
 - 专属参数：无。
 
+## 当前策略：标飞安全输出
+
+- 职业：飞侠·标飞
+- 标识：`throwing_star_safe`
+- 描述：安全输出区是可选模块；启用后，玩家脚底低于安全区时优先朝安全区水平中心移动并向上跳。只选择通用索敌区内、位于角色下方的怪物；近身水平重叠达到阈值时可执行跳跃攻击。
+- 依赖采集：战斗识别区、玩家定位模板、怪物模板；仅在 `use_safe_output_area=true` 时要求标飞安全输出位置。
+- 决策优先级：输入/窗口安全 → HP/MP 补药 → 可选安全区回位 → 近身跳跃攻击 → 普通向下攻击 → 原地等待。
+- 上方边界：当前不处理玩家位于安全区上方的下跳回位；发现位于上方时原地停住并等待人工处理。
+- 移动限制：不追怪、不巡逻、不自动拾取，避免主动离开安全输出区。
+- `jump_interval_seconds`：连续回位跳跃之间的最短间隔。
+- `minimum_target_vertical_gap`：怪物中心必须低于角色脚底的最小归一化高度差，同层目标会被过滤。
+- `use_close_jump_attack`：是否启用近身重叠跳跃攻击，默认开启。
+- `close_overlap_threshold`：水平重叠宽度除以角色与怪物较小宽度，默认阈值 `0.2`，等于阈值时触发。
+- `jump_attack_cooldown_seconds`：两次跳跃攻击之间的最短间隔。
+
 ## 新增策略必须遵循
 
 1. 按职业在 `mbv/strategies/<profession>/` 建子包，再为每个策略新建独立模块；目录、文件名和 `key` 使用稳定的 ASCII `snake_case`，不要把职业分支写回 `mbv/bot.py`。
@@ -69,7 +84,11 @@
       "bowman_dynamic": {
         "platform_center_tolerance": 0.12
       },
-      "stationary_attack": {}
+      "stationary_attack": {},
+      "throwing_star_safe": {
+        "jump_interval_seconds": 0.35,
+        "minimum_target_vertical_gap": 0.02
+      }
     }
   }
 }
