@@ -153,20 +153,119 @@ class PlayerAnchor:
     raw_box: tuple[int, int, int, int]
 
 
+def monster_template_alpha(
+    image: np.ndarray,
+    *,
+    minimum_ratio: float = 0.01,
+    maximum_ratio: float = 0.92,
+) -> np.ndarray:
+    """从框选边缘估计背景，提取与颜色无关的怪物主体 Alpha。"""
+    if image.ndim != 3 or image.shape[2] < 3:
+        raise ValueError("怪物模板必须是彩色图片")
+    height, width = image.shape[:2]
+    if height < 8 or width < 8:
+        raise ValueError("怪物模板过小，请重新框选")
+
+    grab_mask = np.full((height, width), cv2.GC_PR_BGD, dtype=np.uint8)
+    margin = max(1, min(4, min(width, height) // 10))
+    grab_mask[:margin, :] = cv2.GC_BGD
+    grab_mask[-margin:, :] = cv2.GC_BGD
+    grab_mask[:, :margin] = cv2.GC_BGD
+    grab_mask[:, -margin:] = cv2.GC_BGD
+    center_x1 = width // 6
+    center_x2 = max(center_x1 + 1, width * 5 // 6)
+    center_y1 = height // 6
+    center_y2 = max(center_y1 + 1, height * 5 // 6)
+    grab_mask[center_y1:center_y2, center_x1:center_x2] = cv2.GC_PR_FGD
+
+    def run_grabcut(mask: np.ndarray, mode: int, rect: tuple[int, int, int, int] | None = None) -> np.ndarray | None:
+        background_model = np.zeros((1, 65), dtype=np.float64)
+        foreground_model = np.zeros((1, 65), dtype=np.float64)
+        try:
+            cv2.grabCut(
+                image[:, :, :3],
+                mask,
+                rect,
+                background_model,
+                foreground_model,
+                5,
+                mode,
+            )
+        except cv2.error:
+            return None
+        alpha = np.where(
+            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD),
+            255,
+            0,
+        ).astype(np.uint8)
+        alpha = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            (alpha > 0).astype(np.uint8),
+            connectivity=8,
+        )
+        if component_count <= 1:
+            return None
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        return np.where(labels == largest, 255, 0).astype(np.uint8)
+
+    alpha = run_grabcut(grab_mask, cv2.GC_INIT_WITH_MASK)
+    if alpha is None:
+        # 中心种子不适合偏离中心或动作伸展的怪物时，用整个内框做第二次估计。
+        rect_margin = max(1, min(3, min(width, height) // 12))
+        rect = (
+            rect_margin,
+            rect_margin,
+            width - rect_margin * 2,
+            height - rect_margin * 2,
+        )
+        alpha = run_grabcut(
+            np.zeros((height, width), dtype=np.uint8),
+            cv2.GC_INIT_WITH_RECT,
+            rect,
+        )
+    if alpha is None:
+        raise ValueError("没有提取到怪物主体，请缩小框选范围并保留少量背景")
+
+    ratio = float(np.count_nonzero(alpha)) / max(1, width * height)
+    if ratio < max(0.01, float(minimum_ratio)):
+        raise ValueError("怪物前景占比过小，请紧贴怪物重新框选")
+    if ratio > min(0.99, float(maximum_ratio)):
+        raise ValueError("框选中无法区分怪物与背景，请在怪物四周保留少量背景后重试")
+    return alpha
+
+
+def monster_template_image(image: np.ndarray) -> np.ndarray:
+    """生成带 Alpha 的怪物模板，并自动裁掉分割后多余的背景。"""
+    alpha = monster_template_alpha(image)
+    ys, xs = np.where(alpha > 0)
+    if xs.size == 0 or ys.size == 0:
+        raise ValueError("没有提取到怪物主体，请重新框选")
+    subject_left = int(xs.min())
+    subject_top = int(ys.min())
+    subject_right = int(xs.max()) + 1
+    subject_bottom = int(ys.max()) + 1
+    subject_width = subject_right - subject_left
+    subject_height = subject_bottom - subject_top
+    if subject_width < 4 or subject_height < 4:
+        raise ValueError("怪物主体过小，请重新框选")
+    padding = max(2, int(round(max(subject_width, subject_height) * 0.05)))
+    left = max(0, subject_left - padding)
+    top = max(0, subject_top - padding)
+    right = min(image.shape[1], subject_right + padding)
+    bottom = min(image.shape[0], subject_bottom + padding)
+    cropped = image[top:bottom, left:right, :3]
+    cropped_alpha = alpha[top:bottom, left:right]
+    bgra = cv2.cvtColor(cropped, cv2.COLOR_BGR2BGRA)
+    bgra[:, :, 3] = cropped_alpha
+    return bgra
+
+
 def template_foreground_mask(image: np.ndarray) -> np.ndarray:
-    """保留怪物的高饱和度颜色，尽量排除木板、墙面等模板背景。"""
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    hue, saturation, value = cv2.split(hsv)
-    brown_map_background = (hue >= 5) & (hue <= 25) & (saturation >= 65)
-    mask = (
-        (saturation >= 65)
-        & (value >= 35)
-        & ~brown_map_background
-    ).astype(np.uint8) * 255
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    if int(np.count_nonzero(mask)) < image.shape[0] * image.shape[1] * 0.08:
+    """为没有 Alpha 的旧模板即时生成前景；异常旧模板保持兼容。"""
+    try:
+        return monster_template_alpha(image)
+    except ValueError:
         return np.full(image.shape[:2], 255, dtype=np.uint8)
-    return mask
 
 
 def opponent_colors(image: np.ndarray) -> np.ndarray:
@@ -176,15 +275,34 @@ def opponent_colors(image: np.ndarray) -> np.ndarray:
     return np.dstack((blue - green, red - green)).astype(np.float32)
 
 
-def nameplate_identity_mask(image: np.ndarray) -> np.ndarray:
+def nameplate_identity_mask(
+    image: np.ndarray,
+    foreground_mask: np.ndarray | None = None,
+) -> np.ndarray:
     """提取姓名板中亮、低饱和度的名字字形，排除共用蓝板和两端装饰。"""
     if image.size == 0:
         return np.zeros(image.shape[:2], dtype=np.uint8)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     _hue, saturation, value = cv2.split(hsv)
     height, width = image.shape[:2]
-    bright_threshold = max(145, int(np.percentile(value, 82)))
-    mask = ((value >= bright_threshold) & (saturation <= 115)).astype(np.uint8) * 255
+    if foreground_mask is not None:
+        valid = cv2.resize(
+            foreground_mask,
+            (width, height),
+            interpolation=cv2.INTER_NEAREST,
+        ) > 0
+    else:
+        valid = np.ones((height, width), dtype=bool)
+    valid_values = value[valid]
+    if valid_values.size == 0:
+        return np.zeros((height, width), dtype=np.uint8)
+    # 透明边缘的 RGB 往往保留为纯白；百分位只使用 Alpha 有效区，避免阈值被推到 255。
+    bright_threshold = max(145, int(np.percentile(valid_values, 82)))
+    mask = (
+        (value >= bright_threshold)
+        & (saturation <= 115)
+        & valid
+    ).astype(np.uint8) * 255
     # 宽姓名板的两端通常是所有玩家共用的装饰；短姓名板本身已接近名字区域。
     margin_ratio = 0.18 if width >= height * 2.1 else 0.05
     margin_x = min(width // 3, int(round(width * margin_ratio)))
@@ -198,14 +316,18 @@ def nameplate_identity_mask(image: np.ndarray) -> np.ndarray:
     return mask
 
 
-def nameplate_identity_similarity(template: np.ndarray, candidate: np.ndarray) -> float:
+def nameplate_identity_similarity(
+    template: np.ndarray,
+    candidate: np.ndarray,
+    foreground_mask: np.ndarray | None = None,
+) -> float:
     """比较姓名字形的重合度；共享蓝板本身不会贡献身份分。"""
     if template.size == 0 or candidate.size == 0:
         return 0.0
     if candidate.shape[:2] != template.shape[:2]:
         candidate = cv2.resize(candidate, (template.shape[1], template.shape[0]), interpolation=cv2.INTER_AREA)
-    expected = nameplate_identity_mask(template) > 0
-    actual = nameplate_identity_mask(candidate) > 0
+    expected = nameplate_identity_mask(template, foreground_mask) > 0
+    actual = nameplate_identity_mask(candidate, foreground_mask) > 0
     expected_count = int(np.count_nonzero(expected))
     if expected_count < 3 or int(np.count_nonzero(actual)) < 3:
         return 0.0
@@ -252,7 +374,11 @@ def verify_nameplate_identities(
         if right - left != template.image.shape[1] or bottom - top != template.image.shape[0]:
             score = 0.0
         else:
-            score = nameplate_identity_similarity(template.image, scene[top:bottom, left:right])
+            score = nameplate_identity_similarity(
+                template.image,
+                scene[top:bottom, left:right],
+                template.foreground_mask,
+            )
         verified.append(
             replace(
                 detection,
@@ -261,6 +387,26 @@ def verify_nameplate_identities(
             )
         )
     return verified
+
+
+def deduplicate_nameplate_detections(
+    detections: list[Detection],
+    nms_iou: float = 0.35,
+    max_detections: int = 8,
+) -> list[Detection]:
+    """优先保留姓名字形分高的候选，再跨模板合并同一姓名板。"""
+    kept: list[Detection] = []
+    ordered = sorted(
+        detections,
+        key=lambda item: (float(item.identity_score or 0.0), item.score),
+        reverse=True,
+    )
+    for candidate in ordered:
+        if all(box_iou(candidate.box, existing.box) < nms_iou for existing in kept):
+            kept.append(candidate)
+            if len(kept) >= max(1, int(max_detections)):
+                break
+    return kept
 
 
 def _load_template_anchor(path: Path) -> tuple[float, float] | None:
@@ -480,6 +626,7 @@ def find_detections(
     max_detections: int = 24,
     structure_weight: float = 0.0,
     search_roi: tuple[int, int, int, int] | None = None,
+    nms_across_templates: bool = True,
 ) -> tuple[list[Detection], float, str | None]:
     """返回画面中的全部模板目标，并通过 NMS 合并同一目标的重复框。
 
@@ -562,7 +709,11 @@ def find_detections(
 
     kept: list[Detection] = []
     for candidate in sorted(candidates, key=lambda item: item.score, reverse=True):
-        if all(box_iou(candidate.box, existing.box) < nms_iou for existing in kept):
+        if all(
+            (not nms_across_templates and candidate.name != existing.name)
+            or box_iou(candidate.box, existing.box) < nms_iou
+            for existing in kept
+        ):
             kept.append(candidate)
             if len(kept) >= max_detections:
                 break

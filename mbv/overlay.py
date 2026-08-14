@@ -318,13 +318,6 @@ class RuntimeOverlay:
             mx, my = marker
             canvas.create_oval(mx - 6, my - 6, mx + 6, my + 6, outline="#3cff55", width=3)
 
-        platform_center = state.get("platform_center_screen")
-        if platform_center and debug_item_enabled(state, "platform_center"):
-            px, py = platform_center
-            canvas.create_line(px - 12, py, px + 12, py, fill="#18d1ff", width=3)
-            canvas.create_line(px, py - 12, px, py + 12, fill="#18d1ff", width=3)
-            canvas.create_text(px + 15, py, anchor="w", text="平台中心", fill="#18d1ff", font=small)
-
         attack_range = state.get("attack_range_box")
         if attack_range and debug_item_enabled(state, "targeting_range"):
             x, y, w, h = attack_range

@@ -16,9 +16,12 @@ from mbv.paths import PLAYER_ASSET_DIR, PLAYER_HEAD_ASSET_DIR, PLAYER_TITLE_ASSE
 from mbv.template_store import monster_template_directory
 from mbv.vision import (
     attack_box_from_rectangle,
+    monster_template_image,
+    nameplate_identity_mask,
     normalize_facing,
     normalized_roi,
     player_attack_anchor,
+    player_marker,
     roi_pixels,
     template_foreground_mask,
 )
@@ -27,6 +30,9 @@ from mbv.window import WindowInfo, capture_client, find_game_window, focus_game_
 
 STATUS_ITEM_KEYS = ("hp_bar", "mp_bar", "minimap", "player_marker")
 WINDOW_ASPECT_RATIO_TOLERANCE = 0.03
+MINIMAP_MARKER_MAX_ZOOM = 8.0
+MINIMAP_MARKER_PREVIEW_TOP = 54
+MINIMAP_MARKER_PREVIEW_MARGIN = 24
 
 
 def _mark_calibration_item(config: dict[str, Any], key: str) -> None:
@@ -110,6 +116,9 @@ def capture_status_region(
     config.setdefault("regions", {})[key] = region
     if key == "minimap":
         _invalidate_calibration_item(config, "player_marker")
+        _invalidate_calibration_item(config, "platform_center")
+        recognition = config.setdefault("recognition", {})
+        recognition["platform_center_captured"] = False
     _mark_calibration_item(config, key)
     calibration = config.setdefault("calibration", {})
     calibration["window_size"] = [window.width, window.height]
@@ -118,8 +127,151 @@ def capture_status_region(
     return region
 
 
+def magnified_roi_preview(
+    frame: np.ndarray,
+    source_rect: tuple[int, int, int, int],
+    *,
+    max_zoom: float = MINIMAP_MARKER_MAX_ZOOM,
+    top_inset: int = MINIMAP_MARKER_PREVIEW_TOP,
+    margin: int = MINIMAP_MARKER_PREVIEW_MARGIN,
+) -> tuple[np.ndarray, tuple[int, int, int, int], float]:
+    """在同尺寸暗色画布中央放大 ROI，供冻结帧精确点选。"""
+    frame_height, frame_width = frame.shape[:2]
+    source_x, source_y, source_width, source_height = source_rect
+    if source_width < 1 or source_height < 1:
+        raise ValueError("放大采集区域尺寸无效")
+    if not (
+        0 <= source_x < frame_width
+        and 0 <= source_y < frame_height
+        and source_x + source_width <= frame_width
+        and source_y + source_height <= frame_height
+    ):
+        raise ValueError("放大采集区域超出冻结画面")
+
+    usable_width = max(1, frame_width - margin * 2)
+    usable_height = max(1, frame_height - top_inset - margin)
+    zoom = min(
+        max(1.0, float(max_zoom)),
+        usable_width / source_width,
+        usable_height / source_height,
+    )
+    display_width = max(1, min(usable_width, int(round(source_width * zoom))))
+    display_height = max(1, min(usable_height, int(round(source_height * zoom))))
+    display_x = max(0, (frame_width - display_width) // 2)
+    display_y = top_inset + max(0, (usable_height - display_height) // 2)
+
+    preview = np.clip(frame.astype(np.float32) * 0.18, 0, 255).astype(np.uint8)
+    source = frame[
+        source_y : source_y + source_height,
+        source_x : source_x + source_width,
+    ]
+    enlarged = cv2.resize(
+        source,
+        (display_width, display_height),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    preview[
+        display_y : display_y + display_height,
+        display_x : display_x + display_width,
+    ] = enlarged
+    return preview, (display_x, display_y, display_width, display_height), zoom
+
+
+def map_magnified_point(
+    point: tuple[int, int],
+    display_rect: tuple[int, int, int, int],
+    source_rect: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    """把放大预览中的点映射回原始冻结帧像素。"""
+    point_x, point_y = point
+    display_x, display_y, display_width, display_height = display_rect
+    source_x, source_y, source_width, source_height = source_rect
+    if not (
+        display_x <= point_x < display_x + display_width
+        and display_y <= point_y < display_y + display_height
+    ):
+        raise ValueError("玩家标记采样点必须位于放大的小地图区域内")
+    relative_x = min(
+        source_width - 1,
+        int((point_x - display_x) * source_width / max(1, display_width)),
+    )
+    relative_y = min(
+        source_height - 1,
+        int((point_y - display_y) * source_height / max(1, display_height)),
+    )
+    return source_x + relative_x, source_y + relative_y
+
+
+def sample_player_marker_hsv(
+    minimap: np.ndarray,
+    point: tuple[int, int],
+    radius: int = 3,
+) -> tuple[int, int, int]:
+    """只从点击附近同色且明亮的像素取样，避免小标记被地图背景中位数淹没。"""
+    height, width = minimap.shape[:2]
+    point_x, point_y = point
+    if not (0 <= point_x < width and 0 <= point_y < height):
+        raise RuntimeError("玩家标记取样点超出小地图")
+    hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
+    sample_radius = max(1, int(radius))
+    left = max(0, point_x - sample_radius)
+    top = max(0, point_y - sample_radius)
+    right = min(width, point_x + sample_radius + 1)
+    bottom = min(height, point_y + sample_radius + 1)
+    patch = hsv[top:bottom, left:right]
+    seed_hue, seed_saturation, seed_value = (int(value) for value in hsv[point_y, point_x])
+    hue_delta = np.abs(patch[:, :, 0].astype(np.int16) - seed_hue)
+    hue_delta = np.minimum(hue_delta, 180 - hue_delta)
+    value_floor = max(120, int(np.percentile(patch[:, :, 2], 75)))
+    saturation_floor = max(30, seed_saturation - 120)
+    selected = (
+        (hue_delta <= 10)
+        & (patch[:, :, 1] >= saturation_floor)
+        & (patch[:, :, 2] >= value_floor)
+    )
+    pixels = patch[selected]
+    if pixels.shape[0] < 2:
+        pixels = np.asarray([[seed_hue, seed_saturation, seed_value]], dtype=np.uint8)
+
+    hue_offsets = (pixels[:, 0].astype(np.int16) - seed_hue + 90) % 180 - 90
+    hue = int(round((seed_hue + float(np.median(hue_offsets))) % 180))
+    saturation = int(round(float(np.median(pixels[:, 1]))))
+    value = int(round(float(np.median(pixels[:, 2]))))
+    return hue, saturation, value
+
+
+def analyze_player_marker_sample(
+    minimap: np.ndarray,
+    point: tuple[int, int],
+    min_area: int,
+    max_area: int,
+) -> tuple[tuple[int, int, int], list[dict[str, list[int]]], tuple[float, float]]:
+    """生成颜色范围并在同一冻结小地图上验证它只命中点击处。"""
+    hue, saturation, value = sample_player_marker_hsv(minimap, point)
+    ranges = hue_ranges(hue, saturation, value)
+    height, width = minimap.shape[:2]
+    clicked = (point[0] / max(1, width), point[1] / max(1, height))
+    detected, mask = player_marker(minimap, ranges, min_area, max_area, clicked)
+    count, _labels, stats, centers = cv2.connectedComponentsWithStats(mask, 8)
+    candidates = [
+        centers[index]
+        for index in range(1, count)
+        if min_area <= int(stats[index, cv2.CC_STAT_AREA]) <= max_area
+    ]
+    if detected is None:
+        raise RuntimeError("点击位置没有形成可识别的玩家标记，请点在标记最亮的中心像素")
+    distance = float(
+        np.hypot(detected[0] * width - point[0], detected[1] * height - point[1])
+    )
+    if distance > max(3.0, min(width, height) * 0.04):
+        raise RuntimeError("取样结果偏离点击位置，请重新点击玩家标记中心")
+    if len(candidates) > 1:
+        raise RuntimeError("该颜色在小地图中命中多个位置，请点击玩家标记更明亮的中心像素")
+    return (hue, saturation, value), ranges, detected
+
+
 def capture_player_marker(config_path: Path, parent: Any = None) -> tuple[int, int, int]:
-    """在已采集小地图中独立取玩家标记颜色，并用同一冻结帧完成取样。"""
+    """放大小地图后独立取玩家标记颜色，并映射回同一冻结帧取样。"""
     config = load_config(config_path)
     window = find_game_window(config)
     _prepare_window_calibration(config, window)
@@ -128,25 +280,38 @@ def capture_player_marker(config_path: Path, parent: Any = None) -> tuple[int, i
     minimap_rect = roi_pixels(shape, config["regions"]["minimap"])
     with mss.MSS() as sct:
         frozen_frame = capture_client(sct, window)
+    preview_frame, preview_rect, zoom = magnified_roi_preview(frozen_frame, minimap_rect)
     result = interactive_overlay(
         window,
-        "点击自己的小地图标记中心，回车确认",
+        f"小地图已放大 {zoom:.1f} 倍，点击自己的玩家标记中心",
         "point",
-        guide_rect=minimap_rect,
+        guide_rect=preview_rect,
         parent=parent,
-        frozen_frame=frozen_frame,
+        frozen_frame=preview_frame,
     )
     if result.cancelled or result.point is None:
         raise RuntimeError("已取消小地图玩家标记采集")
-    px, py = result.point
+    try:
+        px, py = map_magnified_point(result.point, preview_rect, minimap_rect)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     mx, my, mw, mh = minimap_rect
-    if not (mx <= px <= mx + mw and my <= py <= my + mh):
-        raise RuntimeError("玩家标记采样点必须位于小地图区域内")
-    hue, saturation, value = hsv_median_at(frozen_frame, px, py)
-    config.setdefault("vision", {})["player_hsv_ranges"] = hue_ranges(hue, saturation, value)
+    minimap = frozen_frame[my : my + mh, mx : mx + mw]
+    sample, ranges, marker_position = analyze_player_marker_sample(
+        minimap,
+        (px - mx, py - my),
+        int(config["vision"].get("player_blob_min_area", 2)),
+        int(config["vision"].get("player_blob_max_area", 180)),
+    )
+    hue, saturation, value = sample
+    config.setdefault("vision", {})["player_hsv_ranges"] = ranges
     _mark_calibration_item(config, "player_marker")
     calibration = config.setdefault("calibration", {})
     calibration["player_hsv_sample"] = [hue, saturation, value]
+    calibration["player_marker_position"] = [
+        round(marker_position[0], 6),
+        round(marker_position[1], 6),
+    ]
     calibration["window_size"] = [window.width, window.height]
     refresh_calibrated(config)
     save_config(config_path, config)
@@ -173,10 +338,9 @@ def capture_combat_region(config_path: Path, parent: Any = None) -> dict[str, fl
         raise RuntimeError("已取消战斗识别区域采集")
     region = normalized_roi(result.rectangle, shape)
     config.setdefault("regions", {})["combat"] = region
-    for dependent in ("platform_center", "targeting_range", "throwing_star_safe_output_area"):
+    for dependent in ("targeting_range", "throwing_star_safe_output_area"):
         _invalidate_calibration_item(config, dependent)
     recognition = config.setdefault("recognition", {})
-    recognition["platform_center_captured"] = False
     recognition["throwing_star_safe_output_area_captured"] = False
     _mark_calibration_item(config, "combat_region")
     calibration = config.setdefault("calibration", {})
@@ -187,35 +351,38 @@ def capture_combat_region(config_path: Path, parent: Any = None) -> dict[str, fl
 
 
 def capture_platform_center(config_path: Path, parent: Any = None) -> dict[str, float]:
-    """在已有战斗识别区内独立记录平台中心。"""
+    """放大小地图并独立记录目标平台的安全中心点。"""
     config = load_config(config_path)
     window = find_game_window(config)
     _prepare_window_calibration(config, window)
     focus_game_window(window)
     shape = (window.height, window.width, 3)
-    combat_rect = roi_pixels(shape, config["regions"]["combat"])
+    minimap_rect = roi_pixels(shape, config["regions"]["minimap"])
     with mss.MSS() as sct:
         frozen_frame = capture_client(sct, window)
+    preview_frame, preview_rect, zoom = magnified_roi_preview(frozen_frame, minimap_rect)
     result = interactive_overlay(
         window,
-        "点击当前平台中心，回车确认",
+        f"小地图已放大 {zoom:.1f} 倍，点击目标平台的安全中心点",
         "point",
-        guide_rect=combat_rect,
+        guide_rect=preview_rect,
         parent=parent,
-        frozen_frame=frozen_frame,
+        frozen_frame=preview_frame,
     )
     if result.cancelled or result.point is None:
         raise RuntimeError("已取消平台中心采集")
-    px, py = result.point
-    cx, cy, cw, ch = combat_rect
-    if not (cx <= px <= cx + cw and cy <= py <= cy + ch):
-        raise RuntimeError("平台中心必须位于战斗识别区域内")
+    try:
+        px, py = map_magnified_point(result.point, preview_rect, minimap_rect)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    mx, my, mw, mh = minimap_rect
     center = {
-        "x": round((px - cx) / max(1, cw), 6),
-        "y": round((py - cy) / max(1, ch), 6),
+        "x": round(max(0.0, min(1.0, (px - mx) / max(1, mw))), 6),
+        "y": round(max(0.0, min(1.0, (py - my) / max(1, mh))), 6),
     }
     recognition = config.setdefault("recognition", {})
     recognition["platform_center"] = center
+    recognition["platform_center_space"] = "minimap"
     recognition["platform_center_captured"] = True
     _mark_calibration_item(config, "platform_center")
     refresh_calibrated(config)
@@ -224,9 +391,11 @@ def capture_platform_center(config_path: Path, parent: Any = None) -> dict[str, 
 
 def hue_ranges(hue: int, saturation: int, value: int) -> list[dict[str, list[int]]]:
     delta_h = 9
-    low_s = max(30, saturation - 70)
+    # 黄色玩家点同时包含低饱和中心和高饱和描边；上限必须覆盖 255，
+    # 下限则限制在 110 以内，避免只采到某一种抗锯齿像素后下一帧丢失。
+    low_s = max(30, min(110, saturation - 70))
     low_v = max(35, value - 70)
-    high_s = min(255, saturation + 70)
+    high_s = 255
     high_v = min(255, value + 70)
     low_h = hue - delta_h
     high_h = hue + delta_h
@@ -272,22 +441,37 @@ def calibrate(config_path: Path, parent: Any = None) -> None:
     config["regions"]["mp_bar"] = choose_rectangle("第 2 步：框选蓝条")
     config["regions"]["minimap"] = choose_rectangle("第 3 步：框选整个小地图内部画面")
     minimap_rect = roi_pixels(shape, config["regions"]["minimap"])
-    point_result = interactive_overlay(
-        window,
-        "第 4 步：点击自己的小地图标记中心",
-        "point",
-        minimap_rect,
-        parent=parent,
-    )
-    if point_result.cancelled or point_result.point is None:
-        raise RuntimeError("已取消玩家标记颜色选择")
     focus_game_window(window, settle_seconds=0.15)
     with mss.MSS() as sct:
         frame = capture_client(sct, window)
-    px, py = point_result.point
-    hue, saturation, value = hsv_median_at(frame, px, py)
-    config["vision"]["player_hsv_ranges"] = hue_ranges(hue, saturation, value)
+    preview_frame, preview_rect, zoom = magnified_roi_preview(frame, minimap_rect)
+    point_result = interactive_overlay(
+        window,
+        f"第 4 步：小地图已放大 {zoom:.1f} 倍，点击自己的玩家标记中心",
+        "point",
+        preview_rect,
+        parent=parent,
+        frozen_frame=preview_frame,
+    )
+    if point_result.cancelled or point_result.point is None:
+        raise RuntimeError("已取消玩家标记颜色选择")
+    try:
+        px, py = map_magnified_point(point_result.point, preview_rect, minimap_rect)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    mx, my, mw, mh = minimap_rect
+    minimap = frame[my : my + mh, mx : mx + mw]
+    sample, ranges, marker_position = analyze_player_marker_sample(
+        minimap,
+        (px - mx, py - my),
+        int(config["vision"].get("player_blob_min_area", 2)),
+        int(config["vision"].get("player_blob_max_area", 180)),
+    )
+    hue, saturation, value = sample
+    config["vision"]["player_hsv_ranges"] = ranges
     calibration = config.setdefault("calibration", {})
+    _invalidate_calibration_item(config, "platform_center")
+    config.setdefault("recognition", {})["platform_center_captured"] = False
     for key in STATUS_ITEM_KEYS:
         _mark_calibration_item(config, key)
     calibration.update(
@@ -296,6 +480,10 @@ def calibrate(config_path: Path, parent: Any = None) -> None:
             "window_size": [window.width, window.height],
             "status_timestamp": datetime.now().isoformat(timespec="seconds"),
             "player_hsv_sample": [hue, saturation, value],
+            "player_marker_position": [
+                round(marker_position[0], 6),
+                round(marker_position[1], 6),
+            ],
         }
     )
     refresh_calibrated(config)
@@ -304,7 +492,7 @@ def calibrate(config_path: Path, parent: Any = None) -> None:
 
 
 def capture_recognition_region(config_path: Path, parent: Any = None) -> dict[str, float]:
-    """独立采集战斗识别区，并在区内记录策略可复用的平台中心锚点。"""
+    """兼容入口：采集战斗识别区，并在放大的小地图上记录平台安全点。"""
     config = load_config(config_path)
     window = find_game_window(config)
     _prepare_window_calibration(config, window)
@@ -322,27 +510,30 @@ def capture_recognition_region(config_path: Path, parent: Any = None) -> dict[st
     if region_result.cancelled or region_result.rectangle is None:
         raise RuntimeError("已取消识别区域采集")
     combat_roi = normalized_roi(region_result.rectangle, shape)
-    combat_rect = roi_pixels(shape, combat_roi)
+    minimap_rect = roi_pixels(shape, config["regions"]["minimap"])
+    preview_frame, preview_rect, zoom = magnified_roi_preview(frozen_frame, minimap_rect)
     center_result = interactive_overlay(
         window,
-        "第 2 步：点击当前平台的中心位置",
+        f"第 2 步：小地图已放大 {zoom:.1f} 倍，点击目标平台的安全中心点",
         "point",
-        guide_rect=combat_rect,
+        guide_rect=preview_rect,
         parent=parent,
-        frozen_frame=frozen_frame,
+        frozen_frame=preview_frame,
     )
     if center_result.cancelled or center_result.point is None:
         raise RuntimeError("已取消平台中心采集")
-    px, py = center_result.point
-    cx, cy, cw, ch = combat_rect
-    if not (cx <= px <= cx + cw and cy <= py <= cy + ch):
-        raise RuntimeError("平台中心必须位于战斗识别区域内")
+    try:
+        px, py = map_magnified_point(center_result.point, preview_rect, minimap_rect)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    mx, my, mw, mh = minimap_rect
     platform_center = {
-        "x": round(max(0.0, min(1.0, (px - cx) / max(1, cw))), 6),
-        "y": round(max(0.0, min(1.0, (py - cy) / max(1, ch))), 6),
+        "x": round(max(0.0, min(1.0, (px - mx) / max(1, mw))), 6),
+        "y": round(max(0.0, min(1.0, (py - my) / max(1, mh))), 6),
     }
     config["regions"]["combat"] = combat_roi
     config.setdefault("recognition", {})["platform_center"] = platform_center
+    config["recognition"]["platform_center_space"] = "minimap"
     config["recognition"]["platform_center_captured"] = True
     _mark_calibration_item(config, "combat_region")
     _mark_calibration_item(config, "platform_center")
@@ -357,8 +548,8 @@ def capture_recognition_region(config_path: Path, parent: Any = None) -> dict[st
     refresh_calibrated(config)
     save_config(config_path, config)
     print(
-        f"识别区域与平台中心已保存：中心 x={platform_center['x']:.3f}, "
-        f"y={platform_center['y']:.3f}（相对识别区）"
+        f"识别区域与小地图平台安全点已保存：x={platform_center['x']:.3f}, "
+        f"y={platform_center['y']:.3f}（相对小地图）"
     )
     return platform_center
 
@@ -527,12 +718,13 @@ def capture_template(config_path: Path, parent: Any = None, category: str = "") 
     window = find_game_window(config)
     image = capture_frozen_selection(
         window,
-        "框选一只清晰可见、没有遮挡的怪物",
+        "框选一只清晰、无遮挡的怪物，四周保留一些背景；程序会自动分离并紧裁主体",
         "已取消怪物模板框选",
         parent=parent,
     )
+    bgra = monster_template_image(image)
     directory = monster_template_directory(category, "monster", create=True)
-    return _save_captured_template(image, directory, "monster", "怪物")
+    return _save_captured_template(bgra, directory, "monster", "怪物")
 
 
 def capture_monster_filter(config_path: Path, parent: Any = None, category: str = "") -> Path:
@@ -615,6 +807,8 @@ def capture_player_template(config_path: Path, parent: Any = None) -> Path:
         parent=parent,
     )
     alpha = nameplate_template_alpha(image)
+    if int(np.count_nonzero(nameplate_identity_mask(image, alpha))) < 6:
+        raise RuntimeError("姓名板中没有提取到足够的名字字形，请紧贴第一行蓝色姓名板重新框选")
     bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
     bgra[:, :, 3] = alpha
     return _save_captured_template(

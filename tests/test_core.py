@@ -463,13 +463,37 @@ class CoreTests(unittest.TestCase):
         legacy["vision"].pop("active_monster_category", None)
         legacy["vision"].pop("monster_filter_threshold", None)
         legacy["vision"].pop("monster_filter_overlap", None)
+        legacy["vision"].pop("monster_structure_weight", None)
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.json"
             path.write_text(json.dumps(legacy), encoding="utf-8")
             loaded = bot.load_config(path)
         self.assertEqual(loaded["vision"]["monster_filter_threshold"], 0.84)
         self.assertEqual(loaded["vision"]["monster_filter_overlap"], 0.5)
+        self.assertEqual(loaded["vision"]["monster_structure_weight"], 0.15)
         self.assertEqual(loaded["vision"]["active_monster_category"], "")
+
+    def test_old_combat_platform_center_is_invalidated_for_minimap_recapture(self):
+        legacy = json.loads(json.dumps(self.config))
+        legacy["recognition"].pop("platform_center_space", None)
+        legacy["recognition"]["platform_center"] = {"x": 0.37, "y": 0.66}
+        legacy["recognition"]["platform_center_captured"] = True
+        legacy["calibration"]["items"]["platform_center"] = {
+            "complete": True,
+            "timestamp": "2026-08-14T21:57:00",
+        }
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = bot.load_config(path)
+
+        self.assertEqual(loaded["recognition"]["platform_center_space"], "minimap")
+        self.assertFalse(loaded["recognition"]["platform_center_captured"])
+        self.assertFalse(loaded["calibration"]["items"]["platform_center"]["complete"])
+        self.assertEqual(
+            loaded["calibration"]["items"]["platform_center"]["previous_timestamp"],
+            "2026-08-14T21:57:00",
+        )
 
     def test_old_config_migrates_once_to_bowman_dynamic_strategy(self):
         legacy = json.loads(json.dumps(self.config))
@@ -966,9 +990,9 @@ class CoreTests(unittest.TestCase):
         settings["platform_center_tolerance"] = 0.1
         context = StrategyActionContext(
             marker=(0.8, 0.5),
-            player_box=(880, 100, 40, 1),
-            player_anchor=(900.0, 100.0),
-            target_box=(920, 100, 20, 20),
+            player_box=(500, 100, 40, 1),
+            player_anchor=(520.0, 100.0),
+            target_box=(600, 100, 20, 20),
             chase_box=None,
             combat_width=1000,
             has_monster_candidates=True,
@@ -984,6 +1008,35 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(decision.action, "move")
         self.assertEqual(decision.direction, "left")
         self.assertEqual(decision.state, "RETURN_CENTER_LEFT")
+
+    def test_bowman_dynamic_center_return_uses_minimap_marker_not_combat_anchor(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        strategy = get_strategy("bowman_dynamic")
+        settings = json.loads(json.dumps(self.config["strategy"]["options"]["bowman_dynamic"]))
+        settings["platform_center_tolerance"] = 0.1
+        context = StrategyActionContext(
+            marker=(0.5, 0.5),
+            player_box=(880, 100, 40, 1),
+            player_anchor=(900.0, 100.0),
+            target_box=(920, 100, 20, 20),
+            chase_box=None,
+            combat_width=1000,
+            has_monster_candidates=True,
+            now=10.0,
+            last_target_seen=9.0,
+            last_pickup=0.0,
+            direction="right",
+            behavior=self.config["behavior"],
+            settings=settings,
+            recognition={"platform_center": {"x": 0.5, "y": 0.6}},
+        )
+
+        decision = strategy.decide(context)
+
+        self.assertEqual(decision.action, "attack")
+        self.assertAlmostEqual(decision.player_x, 0.9)
 
     def test_bowman_dynamic_attacks_when_inside_center_safe_radius(self):
         from mbv.strategies import get_strategy
@@ -1010,12 +1063,39 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(decision.action, "attack")
         self.assertTrue(decision.target_seen)
 
-    def test_recognition_region_capture_saves_normalized_platform_center(self):
+    def test_bowman_dynamic_stops_when_minimap_marker_is_temporarily_missing(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        strategy = get_strategy("bowman_dynamic")
+        context = StrategyActionContext(
+            marker=None,
+            player_box=(500, 100, 40, 1),
+            player_anchor=(520.0, 100.0),
+            target_box=(600, 100, 20, 20),
+            chase_box=None,
+            combat_width=1000,
+            has_monster_candidates=True,
+            now=10.0,
+            last_target_seen=9.0,
+            last_pickup=0.0,
+            direction="right",
+            behavior=self.config["behavior"],
+            settings=self.config["strategy"]["options"]["bowman_dynamic"],
+            recognition={"platform_center": {"x": 0.5, "y": 0.6}},
+        )
+
+        decision = strategy.decide(context)
+
+        self.assertEqual((decision.action, decision.state), ("stop", "MARKER_LOST"))
+
+    def test_recognition_region_capture_saves_minimap_platform_center(self):
         from mbv import calibrate as runtime_calibrate
 
         region = type("Result", (), {"cancelled": False, "rectangle": (100, 50, 800, 400)})()
-        center = type("Result", (), {"cancelled": False, "point": (500, 250)})()
+        center = type("Result", (), {"cancelled": False, "point": (500, 200)})()
         window = bot.WindowInfo(123, "MapleStory", 0, 0, 1000, 500)
+        preview = np.ones((500, 1000, 3), dtype=np.uint8)
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.json"
             path.write_text(json.dumps(self.config), encoding="utf-8")
@@ -1024,17 +1104,53 @@ class CoreTests(unittest.TestCase):
                 patch.object(runtime_calibrate, "focus_game_window"),
                 patch.object(runtime_calibrate, "mss"),
                 patch.object(runtime_calibrate, "capture_client", return_value=np.zeros((500, 1000, 3), dtype=np.uint8)),
+                patch.object(
+                    runtime_calibrate,
+                    "magnified_roi_preview",
+                    return_value=(preview, (300, 100, 400, 200), 4.0),
+                ),
                 patch.object(runtime_calibrate, "interactive_overlay", side_effect=[region, center]) as overlay,
             ):
                 captured = runtime_calibrate.capture_recognition_region(path)
             saved = bot.load_config(path)
         self.assertEqual(captured, {"x": 0.5, "y": 0.5})
-        self.assertIs(
-            overlay.call_args_list[0].kwargs["frozen_frame"],
-            overlay.call_args_list[1].kwargs["frozen_frame"],
-        )
+        self.assertIs(overlay.call_args_list[1].kwargs["frozen_frame"], preview)
+        self.assertEqual(overlay.call_args_list[1].kwargs["guide_rect"], (300, 100, 400, 200))
+        self.assertEqual(saved["recognition"]["platform_center_space"], "minimap")
         self.assertTrue(saved["recognition"]["platform_center_captured"])
         self.assertTrue(saved["calibration"]["recognition_region_complete"])
+
+    def test_platform_center_capture_uses_magnified_minimap(self):
+        from mbv import calibrate as runtime_calibrate
+
+        selected = type("Result", (), {"cancelled": False, "point": (500, 200)})()
+        window = bot.WindowInfo(123, "MapleStory", 0, 0, 1000, 500)
+        frozen = np.zeros((500, 1000, 3), dtype=np.uint8)
+        preview = np.ones_like(frozen)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(self.config), encoding="utf-8")
+            with (
+                patch.object(runtime_calibrate, "find_game_window", return_value=window),
+                patch.object(runtime_calibrate, "focus_game_window"),
+                patch.object(runtime_calibrate.mss, "MSS"),
+                patch.object(runtime_calibrate, "capture_client", return_value=frozen),
+                patch.object(
+                    runtime_calibrate,
+                    "magnified_roi_preview",
+                    return_value=(preview, (300, 100, 400, 200), 4.0),
+                ),
+                patch.object(runtime_calibrate, "interactive_overlay", return_value=selected) as overlay,
+            ):
+                captured = runtime_calibrate.capture_platform_center(path)
+            saved = bot.load_config(path)
+
+        self.assertEqual(captured, {"x": 0.5, "y": 0.5})
+        self.assertIs(overlay.call_args.kwargs["frozen_frame"], preview)
+        self.assertEqual(overlay.call_args.kwargs["guide_rect"], (300, 100, 400, 200))
+        self.assertIn("小地图已放大", overlay.call_args.args[1])
+        self.assertEqual(saved["recognition"]["platform_center_space"], "minimap")
+        self.assertTrue(saved["calibration"]["items"]["platform_center"]["complete"])
 
     def test_status_regions_are_captured_and_saved_independently(self):
         from mbv import calibrate as runtime_calibrate
@@ -1057,6 +1173,106 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(captured, {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.04})
         self.assertTrue(saved["calibration"]["items"]["hp_bar"]["complete"])
         self.assertFalse(saved["calibration"]["items"]["mp_bar"]["complete"])
+
+    def test_magnified_roi_preview_maps_click_back_to_original_frame(self):
+        from mbv.calibrate import magnified_roi_preview, map_magnified_point
+
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+        source_rect = (10, 20, 20, 10)
+        frame[23, 15] = (20, 120, 240)
+
+        preview, display_rect, zoom = magnified_roi_preview(
+            frame,
+            source_rect,
+            max_zoom=4.0,
+            top_inset=10,
+            margin=10,
+        )
+        mapped = map_magnified_point((82, 44), display_rect, source_rect)
+
+        self.assertEqual(preview.shape, frame.shape)
+        self.assertEqual(display_rect, (60, 30, 80, 40))
+        self.assertEqual(zoom, 4.0)
+        self.assertEqual(mapped, (15, 23))
+        self.assertTrue(np.array_equal(preview[44, 82], frame[23, 15]))
+        with self.assertRaisesRegex(ValueError, "放大的小地图"):
+            map_magnified_point((0, 0), display_rect, source_rect)
+
+    def test_player_marker_capture_uses_magnified_minimap_but_samples_original_frame(self):
+        from mbv import calibrate as runtime_calibrate
+
+        background = cv2.cvtColor(
+            np.asarray([[[28, 153, 170]]], dtype=np.uint8),
+            cv2.COLOR_HSV2BGR,
+        )[0, 0]
+        marker_color = cv2.cvtColor(
+            np.asarray([[[30, 119, 255]]], dtype=np.uint8),
+            cv2.COLOR_HSV2BGR,
+        )[0, 0]
+        frame = np.full((500, 1000, 3), background, dtype=np.uint8)
+        window = bot.WindowInfo(123, "MapleStory", 0, 0, 1000, 500)
+        minimap_rect = bot.roi_pixels(frame.shape, self.config["regions"]["minimap"])
+        mx, my, mw, mh = minimap_rect
+        marker_x, marker_y = mw // 2, mh // 2
+        frame[my + marker_y - 1 : my + marker_y + 3, mx + marker_x - 1 : mx + marker_x + 3] = marker_color
+        preview, display_rect, _zoom = runtime_calibrate.magnified_roi_preview(frame, minimap_rect)
+        dx, dy, dw, dh = display_rect
+        selected = type(
+            "Result",
+            (),
+            {
+                "cancelled": False,
+                "point": (
+                    dx + int((marker_x + 0.5) * dw / mw),
+                    dy + int((marker_y + 0.5) * dh / mh),
+                ),
+            },
+        )()
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(self.config), encoding="utf-8")
+            with (
+                patch.object(runtime_calibrate, "find_game_window", return_value=window),
+                patch.object(runtime_calibrate, "focus_game_window"),
+                patch.object(runtime_calibrate.mss, "MSS"),
+                patch.object(runtime_calibrate, "capture_client", return_value=frame),
+                patch.object(runtime_calibrate, "interactive_overlay", return_value=selected) as overlay,
+            ):
+                captured = runtime_calibrate.capture_player_marker(path)
+            saved = bot.load_config(path)
+
+        self.assertEqual(captured, (30, 119, 255))
+        self.assertEqual(overlay.call_args.kwargs["guide_rect"], display_rect)
+        self.assertTrue(np.array_equal(overlay.call_args.kwargs["frozen_frame"], preview))
+        self.assertIn("放大", overlay.call_args.args[1])
+        self.assertAlmostEqual(
+            saved["calibration"]["player_marker_position"][0],
+            (marker_x + 0.5) / mw,
+            delta=0.02,
+        )
+        self.assertAlmostEqual(
+            saved["calibration"]["player_marker_position"][1],
+            (marker_y + 0.5) / mh,
+            delta=0.02,
+        )
+
+    def test_player_marker_sample_rejects_a_color_that_matches_multiple_map_objects(self):
+        from mbv.calibrate import analyze_player_marker_sample
+
+        background = cv2.cvtColor(
+            np.asarray([[[100, 30, 80]]], dtype=np.uint8),
+            cv2.COLOR_HSV2BGR,
+        )[0, 0]
+        marker_color = cv2.cvtColor(
+            np.asarray([[[30, 140, 255]]], dtype=np.uint8),
+            cv2.COLOR_HSV2BGR,
+        )[0, 0]
+        minimap = np.full((80, 100, 3), background, dtype=np.uint8)
+        minimap[19:23, 19:23] = marker_color
+        minimap[59:63, 69:73] = marker_color
+
+        with self.assertRaisesRegex(RuntimeError, "命中多个位置"):
+            analyze_player_marker_sample(minimap, (20, 20), 2, 180)
 
     def test_proportional_resize_between_status_captures_preserves_previous_item(self):
         from mbv import calibrate as runtime_calibrate
@@ -1087,14 +1303,17 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(saved["calibration"]["items"]["mp_bar"]["complete"])
         self.assertEqual(saved["calibration"]["window_size"], [1200, 600])
 
-    def test_combat_region_no_longer_requires_platform_center_in_same_capture(self):
+    def test_combat_region_recapture_preserves_minimap_platform_center(self):
         from mbv import calibrate as runtime_calibrate
 
         result = type("Result", (), {"cancelled": False, "rectangle": (20, 30, 900, 400)})()
         window = bot.WindowInfo(123, "MapleStory", 0, 0, 1000, 500)
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.json"
-            path.write_text(json.dumps(self.config), encoding="utf-8")
+            ready = json.loads(json.dumps(self.config))
+            ready["recognition"]["platform_center_captured"] = True
+            ready["calibration"]["items"]["platform_center"] = {"complete": True}
+            path.write_text(json.dumps(ready), encoding="utf-8")
             with (
                 patch.object(runtime_calibrate, "find_game_window", return_value=window),
                 patch.object(runtime_calibrate, "focus_game_window"),
@@ -1106,7 +1325,34 @@ class CoreTests(unittest.TestCase):
             saved = bot.load_config(path)
 
         self.assertTrue(saved["calibration"]["recognition_region_complete"])
+        self.assertTrue(saved["recognition"]["platform_center_captured"])
+        self.assertTrue(saved["calibration"]["items"]["platform_center"]["complete"])
+
+    def test_minimap_recapture_invalidates_platform_center_and_player_marker(self):
+        from mbv import calibrate as runtime_calibrate
+
+        result = type("Result", (), {"cancelled": False, "rectangle": (20, 30, 120, 80)})()
+        window = bot.WindowInfo(123, "MapleStory", 0, 0, 1000, 500)
+        ready = json.loads(json.dumps(self.config))
+        ready["recognition"]["platform_center_captured"] = True
+        ready["calibration"]["items"]["platform_center"] = {"complete": True}
+        ready["calibration"]["items"]["player_marker"] = {"complete": True}
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(ready), encoding="utf-8")
+            with (
+                patch.object(runtime_calibrate, "find_game_window", return_value=window),
+                patch.object(runtime_calibrate, "focus_game_window"),
+                patch.object(runtime_calibrate.mss, "MSS"),
+                patch.object(runtime_calibrate, "capture_client", return_value=np.zeros((500, 1000, 3))),
+                patch.object(runtime_calibrate, "interactive_overlay", return_value=result),
+            ):
+                runtime_calibrate.capture_status_region(path, "minimap", "小地图")
+            saved = bot.load_config(path)
+
         self.assertFalse(saved["recognition"]["platform_center_captured"])
+        self.assertFalse(saved["calibration"]["items"]["platform_center"]["complete"])
+        self.assertFalse(saved["calibration"]["items"]["player_marker"]["complete"])
 
     def test_strategy_area_capture_is_relative_to_combat_region(self):
         from mbv import calibrate as runtime_calibrate
@@ -1178,6 +1424,90 @@ class CoreTests(unittest.TestCase):
             decoded = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
         self.assertEqual(decoded.shape, (16, 20, 4))
         self.assertTrue(np.all(decoded[:, :, 3] == 255))
+
+    def test_brown_monster_alpha_keeps_subject_and_removes_border_background(self):
+        from mbv.vision import Template, find_detections, monster_template_alpha
+
+        image = np.full((80, 100, 3), (185, 205, 215), dtype=np.uint8)
+        cv2.ellipse(image, (50, 43), (31, 25), 0, 0, 360, (45, 80, 125), -1)
+        cv2.circle(image, (60, 37), 4, (240, 240, 240), -1)
+
+        alpha = monster_template_alpha(image)
+
+        self.assertEqual(alpha[43, 50], 255)
+        self.assertEqual(alpha[0, 0], 0)
+        self.assertGreater(np.count_nonzero(alpha), image.shape[0] * image.shape[1] * 0.08)
+        self.assertLess(np.count_nonzero(alpha), image.shape[0] * image.shape[1] * 0.88)
+
+        template = Template("brown.png", image, alpha)
+        flat_brown_scene = np.full((180, 240, 3), (45, 80, 125), dtype=np.uint8)
+        color_only, _color_score, _name = find_detections(
+            flat_brown_scene,
+            [template],
+            0.79,
+            0.5,
+        )
+        structured, _structured_score, _name = find_detections(
+            flat_brown_scene,
+            [template],
+            0.79,
+            0.5,
+            structure_weight=0.15,
+        )
+        exact, _exact_score, _name = find_detections(
+            image,
+            [template],
+            0.79,
+            0.5,
+            structure_weight=0.15,
+        )
+        self.assertTrue(color_only)
+        self.assertFalse(structured)
+        self.assertTrue(exact)
+
+    def test_captured_monster_template_persists_generated_alpha(self):
+        from mbv import calibrate as runtime_calibrate
+
+        image = np.full((80, 100, 3), (185, 205, 215), dtype=np.uint8)
+        cv2.ellipse(image, (50, 43), (31, 25), 0, 0, 360, (45, 80, 125), -1)
+        window = type("Window", (), {})()
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with (
+                patch.object(runtime_calibrate, "load_config", return_value=self.config),
+                patch.object(runtime_calibrate, "find_game_window", return_value=window),
+                patch.object(runtime_calibrate, "capture_frozen_selection", return_value=image),
+                patch.object(runtime_calibrate, "monster_template_directory", return_value=directory),
+            ):
+                path = runtime_calibrate.capture_template(Path("unused.json"), category="野猪树妖")
+            decoded = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+
+        self.assertEqual(decoded.shape[2], 4)
+        self.assertLess(decoded.shape[0], image.shape[0])
+        self.assertLess(decoded.shape[1], image.shape[1])
+        self.assertGreater(np.count_nonzero(decoded[:, :, 3]), decoded.shape[0] * decoded.shape[1] * 0.4)
+        self.assertEqual(decoded[0, 0, 3], 0)
+
+    def test_monster_template_generation_accepts_loose_selection_and_tightens_it(self):
+        from mbv.vision import monster_template_image
+
+        image = np.full((180, 240, 3), (185, 205, 215), dtype=np.uint8)
+        cv2.ellipse(image, (120, 96), (28, 21), 0, 0, 360, (45, 80, 125), -1)
+
+        generated = monster_template_image(image)
+
+        self.assertEqual(generated.shape[2], 4)
+        self.assertLess(generated.shape[0], image.shape[0] // 2)
+        self.assertLess(generated.shape[1], image.shape[1] // 2)
+        self.assertGreater(np.count_nonzero(generated[:, :, 3]), generated.shape[0] * generated.shape[1] * 0.4)
+
+    def test_monster_alpha_rejects_indistinguishable_full_frame(self):
+        from mbv.vision import monster_template_alpha
+
+        image = np.full((40, 60, 3), 120, dtype=np.uint8)
+
+        with self.assertRaisesRegex(ValueError, "怪物"):
+            monster_template_alpha(image)
 
     def test_captured_template_never_overwrites_an_existing_timestamp(self):
         from datetime import datetime as real_datetime

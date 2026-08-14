@@ -27,6 +27,7 @@
   },
   "recognition": {
     "platform_center": {"x": 0.5, "y": 0.5},
+    "platform_center_space": "minimap",
     "platform_center_captured": false,
     "throwing_star_safe_output_area": {"x": 0.45, "y": 0.35, "w": 0.1, "h": 0.1},
     "throwing_star_safe_output_area_captured": false
@@ -63,6 +64,7 @@
     "monster_filter_threshold": 0.84,
     "monster_filter_overlap": 0.5,
     "monster_detection_scale": 0.5,
+    "monster_structure_weight": 0.15,
     "monster_hold_seconds": 0.35,
     "player_template_threshold": 0.7,
     "player_head_threshold": 0.76,
@@ -83,11 +85,12 @@
     "player_global_verify_interval_seconds": 1.5,
     "player_prediction_horizon_seconds": 0.2,
     "player_velocity_alpha": 0.35,
-    "player_name_identity_threshold": 0.58,
+    "player_name_identity_threshold": 0.50,
     "player_name_identity_margin": 0.08,
     "player_reacquire_confirm_frames": 2,
-    "player_occlusion_grace_seconds": 0.35,
-    "player_auxiliary_max_jump": 0.06
+    "player_auxiliary_max_jump": 0.06,
+    "player_auxiliary_identity_threshold": 0.9,
+    "player_auxiliary_reacquire_confirm_frames": 3
   },
   "keys": {
     "attack": "shift",

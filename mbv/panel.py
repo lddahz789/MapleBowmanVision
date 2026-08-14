@@ -293,9 +293,10 @@ class ControlPanel:
         )
         self._capture_item_row(
             capture,
-            "平台中心",
+            "平台安全点（小地图）",
             "platform_center",
             self._capture_platform_center_item,
+            show=False,
         )
         self.capture_target_area_button = self._capture_item_row(
             capture,
@@ -484,7 +485,9 @@ class ControlPanel:
             ("behavior.attack_interval_seconds", "攻击间隔秒", 0.01, 0.01, 10.0),
             ("behavior.max_runtime_minutes", "最长运行分钟，0=不限", 1.0, 0.0, 10080.0),
             ("vision.monster_template_threshold", "怪物识别阈值", 0.01, 0.0, 1.0),
+            ("vision.monster_structure_weight", "怪物轮廓权重", 0.05, 0.0, 0.9),
             ("vision.monster_filter_threshold", "过滤项识别阈值", 0.01, 0.0, 1.0),
+            ("vision.player_name_identity_threshold", "玩家姓名确认阈值", 0.01, 0.0, 1.0),
         ]
         for key, label, step, minimum, maximum in fields:
             self._labeled_entry(
@@ -646,6 +649,8 @@ class ControlPanel:
         label: str,
         key: str,
         command: Callable[[], None],
+        *,
+        show: bool = True,
     ) -> tk.Button:
         row = tk.Frame(parent, bg=PANEL, highlightbackground="#263642", highlightthickness=1)
         row.pack(fill="x", padx=8, pady=2)
@@ -668,7 +673,8 @@ class ControlPanel:
             lambda selected=label, action=command: self._select_capture_item(selected, action),
         )
         button.pack(side="right", padx=5, pady=4, ipadx=5)
-        show_button.pack(side="right", padx=(2, 0), pady=4, ipadx=3)
+        if show:
+            show_button.pack(side="right", padx=(2, 0), pady=4, ipadx=3)
         self._capture_buttons[key] = button
         return button
 
@@ -1084,7 +1090,7 @@ class ControlPanel:
         calibration = config.get("calibration", {})
         status_ready = "状态区✓" if calibration.get("status_regions_complete") else "状态区待采"
         recognition_ready = "识别区✓" if calibration.get("recognition_region_complete") else "识别区待采"
-        center_ready = "平台中心✓" if config["recognition"].get("platform_center_captured") else "平台中心默认值"
+        center_ready = "平台安全点✓" if config["recognition"].get("platform_center_captured") else "平台安全点待采"
         self.counts.set(
             f"{status_ready}｜{recognition_ready}｜{center_ready}｜怪物 {counts['monster']}（{counts['category']} 类）｜"
             f"过滤 {counts['filter']}｜"
@@ -1646,13 +1652,13 @@ class ControlPanel:
 
     def _capture_platform_center_item(self) -> None:
         self._run_tool(
-            "平台中心采集",
+            "小地图平台安全点采集",
             lambda: capture_platform_center(self.config_path, parent=self.root),
         )
 
     def _capture_recognition_region(self) -> None:
         self._run_tool(
-            "识别区域与平台中心采集",
+            "识别区域与小地图平台安全点采集",
             lambda: capture_recognition_region(self.config_path, parent=self.root),
         )
 

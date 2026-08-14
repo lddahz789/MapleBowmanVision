@@ -82,8 +82,9 @@ class PlayerTrackState:
         else:
             self.mode = "OCCLUDED"
 
-    def identity_within_grace(self, now: float, grace_seconds: float) -> bool:
-        return self.last_identity_at > 0.0 and now - self.last_identity_at <= max(0.0, float(grace_seconds))
+    def has_confirmed_identity(self) -> bool:
+        """是否已由姓名板或连续高置信辅助模板确认视觉身份。"""
+        return self.last_identity_at > 0.0
 
     def consider_reacquisition(
         self,

@@ -17,14 +17,14 @@ class BowmanDynamicStrategy:
     display_name = "弓箭手动态"
     profession = "弓箭手"
     description = (
-        "优先回到平台中心安全范围；范围内选择通用索敌区中最近的同层怪物攻击，"
+        "按小地图位置优先回到平台安全点附近；范围内选择通用索敌区中最近的同层怪物攻击，"
         "框外同层怪物则接近。无目标时可按配置拾取或左右巡逻。"
     )
     required_recognition_data = ("platform_center",)
     toggle_fields = ()
     capture_fields = ()
     setting_fields = (
-        StrategySettingField("platform_center_tolerance", "平台中心安全半径", maximum=0.5),
+        StrategySettingField("platform_center_tolerance", "小地图平台安全半径", maximum=0.5),
     )
     default_settings: dict[str, Any] = {
         "platform_center_tolerance": 0.12,
@@ -59,20 +59,24 @@ class BowmanDynamicStrategy:
         if context.player_box is None:
             return StrategyDecision("stop", "PLAYER_SCREEN_LOST")
 
-        anchor_x = context.player_anchor[0] if context.player_anchor is not None else (
+        combat_anchor_x = context.player_anchor[0] if context.player_anchor is not None else (
             context.player_box[0] + context.player_box[2] / 2
         )
-        player_x = anchor_x / max(1, context.combat_width)
+        combat_player_x = combat_anchor_x / max(1, context.combat_width)
+        if context.marker is None:
+            return StrategyDecision("stop", "MARKER_LOST")
+
+        marker_x = max(0.0, min(1.0, float(context.marker[0])))
         center = context.recognition.get("platform_center", {})
         center_x = max(0.0, min(1.0, float(center.get("x", 0.5))))
         tolerance = max(0.0, min(0.5, float(context.settings.get("platform_center_tolerance", 0.12))))
-        if abs(player_x - center_x) > tolerance:
-            direction = "left" if player_x > center_x else "right"
+        if abs(marker_x - center_x) > tolerance:
+            direction = "left" if marker_x > center_x else "right"
             return StrategyDecision(
                 "move",
                 f"RETURN_CENTER_{direction.upper()}",
                 direction=direction,
-                player_x=player_x,
+                player_x=marker_x,
             )
 
         if context.target_box is not None:
@@ -81,7 +85,7 @@ class BowmanDynamicStrategy:
                 "attack",
                 "ATTACK",
                 target_x=target_x,
-                player_x=player_x,
+                player_x=combat_player_x,
                 target_seen=True,
             )
         if context.chase_box is not None:
@@ -90,7 +94,7 @@ class BowmanDynamicStrategy:
                 "chase",
                 "CHASE",
                 target_x=target_x,
-                player_x=player_x,
+                player_x=combat_player_x,
                 target_seen=True,
             )
         if context.has_monster_candidates:
@@ -108,9 +112,6 @@ class BowmanDynamicStrategy:
             or target_lost_for < float(context.behavior["target_lost_patrol_delay_seconds"])
         ):
             return StrategyDecision("stop", "SCANNING")
-        if context.marker is None:
-            return StrategyDecision("stop", "MARKER_LOST")
-
         direction = context.direction
         if context.marker[0] <= float(context.behavior["patrol_left"]):
             direction = "right"

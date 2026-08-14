@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-h", "--help", action="help", help="显示这段帮助信息并退出")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="配置文件路径")
     parser.add_argument("--calibrate", action="store_true", help="校准状态栏与小地图")
-    parser.add_argument("--capture-recognition-region", action="store_true", help="采集战斗识别区与平台中心")
+    parser.add_argument("--capture-recognition-region", action="store_true", help="采集战斗识别区与小地图平台安全点")
     parser.add_argument("--capture-template", action="store_true", help="采集怪物模板")
     parser.add_argument("--capture-monster-filter", action="store_true", help="采集怪物过滤项")
     parser.add_argument("--monster-category", default="", help="怪物模板采集分类；留空为未分类")

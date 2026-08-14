@@ -104,13 +104,20 @@ def load_config(path: Path) -> dict[str, Any]:
     config["behavior"].pop("bow_attack_range", None)
     config["behavior"].pop("bow_vertical_tolerance", None)
     config.setdefault("recognition", {})
-    config["recognition"].setdefault("platform_center", {"x": 0.5, "y": 0.5})
-    config["recognition"].setdefault("platform_center_captured", False)
-    config["recognition"].setdefault(
+    recognition = config["recognition"]
+    recognition.setdefault("platform_center", {"x": 0.5, "y": 0.5})
+    legacy_platform_center = recognition.get("platform_center_space") != "minimap"
+    if legacy_platform_center:
+        # 旧值相对战斗画面，不能无损换算成地图坐标；显式失效并要求重新采集。
+        recognition["platform_center_captured"] = False
+    else:
+        recognition.setdefault("platform_center_captured", False)
+    recognition["platform_center_space"] = "minimap"
+    recognition.setdefault(
         "throwing_star_safe_output_area",
         {"x": 0.45, "y": 0.35, "w": 0.1, "h": 0.1},
     )
-    config["recognition"].setdefault("throwing_star_safe_output_area_captured", False)
+    recognition.setdefault("throwing_star_safe_output_area_captured", False)
     calibration = config.setdefault("calibration", {})
     legacy_calibrated = bool(config.get("calibrated"))
     calibration.setdefault("status_regions_complete", legacy_calibrated)
@@ -123,8 +130,14 @@ def load_config(path: Path) -> dict[str, Any]:
     items.setdefault("combat_region", {"complete": legacy_recognition_complete})
     items.setdefault(
         "platform_center",
-        {"complete": bool(config["recognition"].get("platform_center_captured"))},
+        {"complete": bool(recognition.get("platform_center_captured"))},
     )
+    if legacy_platform_center:
+        previous = items.get("platform_center", {})
+        previous_timestamp = previous.get("timestamp") if isinstance(previous, dict) else None
+        items["platform_center"] = {"complete": False}
+        if previous_timestamp:
+            items["platform_center"]["previous_timestamp"] = previous_timestamp
     items.setdefault("targeting_range", {"complete": legacy_calibrated})
     items.setdefault(
         "throwing_star_safe_output_area",
@@ -136,6 +149,7 @@ def load_config(path: Path) -> dict[str, Any]:
     config["vision"].setdefault("active_monster_category", "")
     config["vision"].setdefault("monster_filter_threshold", max(monster_threshold, 0.84))
     config["vision"].setdefault("monster_filter_overlap", 0.5)
+    config["vision"].setdefault("monster_structure_weight", 0.15)
     config["vision"].setdefault("player_anchor_smoothing_alpha", 0.25)
     config["vision"].setdefault("player_anchor_smoothing_snap", 0.08)
     config["vision"].setdefault("player_local_roi_width", 0.36)
@@ -145,11 +159,12 @@ def load_config(path: Path) -> dict[str, Any]:
     config["vision"].setdefault("player_global_verify_interval_seconds", 1.5)
     config["vision"].setdefault("player_prediction_horizon_seconds", 0.2)
     config["vision"].setdefault("player_velocity_alpha", 0.35)
-    config["vision"].setdefault("player_name_identity_threshold", 0.58)
+    config["vision"].setdefault("player_name_identity_threshold", 0.50)
     config["vision"].setdefault("player_name_identity_margin", 0.08)
     config["vision"].setdefault("player_reacquire_confirm_frames", 2)
-    config["vision"].setdefault("player_occlusion_grace_seconds", 0.35)
     config["vision"].setdefault("player_auxiliary_max_jump", 0.06)
+    config["vision"].setdefault("player_auxiliary_identity_threshold", 0.90)
+    config["vision"].setdefault("player_auxiliary_reacquire_confirm_frames", 3)
     return config
 
 

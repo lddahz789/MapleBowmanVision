@@ -32,6 +32,7 @@ from mbv.vision import (
     bar_fill,
     choose_fused_player_anchor,
     crop,
+    deduplicate_nameplate_detections,
     find_detections,
     load_templates,
     monster_template_category,
@@ -81,8 +82,8 @@ STATE_LABELS = {
     "MP_POTION": "正在使用回蓝药",
     "PICKUP": "正在拾取",
     "MARKER_LOST": "玩家标记丢失",
-    "RETURN_CENTER_LEFT": "向左返回平台中心",
-    "RETURN_CENTER_RIGHT": "向右返回平台中心",
+    "RETURN_CENTER_LEFT": "向左返回平台安全点",
+    "RETURN_CENTER_RIGHT": "向右返回平台安全点",
     "RETURN_SAFE_LEFT": "向左返回安全输出区",
     "RETURN_SAFE_RIGHT": "向右返回安全输出区",
     "RETURN_SAFE_JUMP_LEFT": "向左跳回安全输出区",
@@ -137,6 +138,20 @@ def player_anchor_within_hold(
     return None
 
 
+def configured_player_marker(config: dict[str, Any]) -> tuple[float, float] | None:
+    """读取采集时确认的初始小地图位置，供启动首帧消歧。"""
+    value = config.get("calibration", {}).get("player_marker_position")
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    try:
+        x, y = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+        return None
+    return x, y
+
+
 class BowmanBot:
     def __init__(self, config: dict[str, Any], input_authorized: bool) -> None:
         self.config = config
@@ -161,7 +176,7 @@ class BowmanBot:
         self.armed = False
         self.state = "PAUSED"
         self.direction: str | None = None
-        self.marker: tuple[float, float] | None = None
+        self.marker = configured_player_marker(config)
         self.marker_last_seen = time.monotonic()
         self.last_target_seen = 0.0
         self.last_attack = 0.0
@@ -301,11 +316,11 @@ class BowmanBot:
             self.notify("当前进程没有按键授权，请从唯一入口 Start.bat 启动。", 6.0)
             return
         if not self.config.get("calibrated"):
-            self.notify("校准未完成，请依次采集「状态栏与小地图」和「识别区域与平台中心」。")
+            self.notify("校准未完成，请依次采集状态栏、小地图和战斗识别区域。")
             return
         missing = missing_recognition_data(self.config, self.strategy)
         if missing:
-            labels = {"platform_center": "识别区域与平台中心"}
+            labels = {"platform_center": "小地图平台安全点"}
             labels.update(
                 {field.recognition_key: field.button_label for field in self.strategy.capture_fields}
             )
@@ -565,6 +580,8 @@ class BowmanBot:
             if auto_potion is not None:
                 auto_potion.set_standalone_enabled(False)
             with self.config_lock:
+                old_marker_seed = configured_player_marker(getattr(self, "config", {}))
+                new_marker_seed = configured_player_marker(config)
                 was_armed = self.armed
                 if was_armed:
                     self.disarm("配置已更新")
@@ -584,6 +601,9 @@ class BowmanBot:
                 ).strip()
                 self.player_track = PlayerTrackState()
                 self.last_attack_anchor = None
+                if new_marker_seed != old_marker_seed:
+                    self.marker = new_marker_seed
+                    self.marker_last_seen = time.monotonic()
 
     def reload_from_disk(self, config_path: Path) -> None:
         self.apply_config(load_config(config_path))
@@ -863,11 +883,13 @@ class BowmanBot:
             float(vision.get("player_detection_scale", 0.5)),
             max_per_template=8,
             nms_iou=0.35,
-            max_detections=8,
+            max_detections=max(8, len(self.player_templates) * 8),
             structure_weight=0.55,
             search_roi=search_roi,
+            nms_across_templates=False,
         )
-        return verify_nameplate_identities(scene.scene, detections, self.player_templates), score, template_name
+        verified = verify_nameplate_identities(scene.scene, detections, self.player_templates)
+        return deduplicate_nameplate_detections(verified, nms_iou=0.35, max_detections=8), score, template_name
 
     def _detect_player_auxiliary(
         self,
@@ -937,7 +959,7 @@ class BowmanBot:
             vision,
             search_roi,
         )
-        identity_threshold = float(vision.get("player_name_identity_threshold", 0.58))
+        identity_threshold = float(vision.get("player_name_identity_threshold", 0.50))
         nameplate_detections = [
             detection
             for detection in raw_nameplate_detections
@@ -1014,14 +1036,12 @@ class BowmanBot:
                     identity_confirmed = anchor is not None
         elif (
             previous_anchor is not None
-            and not global_scan
-            and not raw_nameplate_detections
-            and track.identity_within_grace(
-                now,
-                float(vision.get("player_occlusion_grace_seconds", 0.35)),
-            )
+            and not nameplate_detections
+            and track.has_confirmed_identity()
         ):
-            # 头部和称号不是唯一身份，只能在刚确认过本人后、很小的预测邻域内短时补位。
+            # 姓名板原始候选可能只是遮挡物造成的误匹配；只有通过名字身份校验的候选
+            # 才能阻止辅助模板补位。头部和称号不能建立身份，但在姓名板确认过本人后，
+            # 可以围绕连续预测位置续跟踪；即使本帧是周期全图复核，也仍受小位移约束。
             auxiliary_args = (
                 scene_width,
                 scene_height,
@@ -1036,6 +1056,35 @@ class BowmanBot:
                 *auxiliary_args,
                 reference_point=predicted_point,
             )
+        elif global_scan and not nameplate_detections:
+            # 启动时姓名板可能已被遮挡。普通辅助命中仍不能认人；只有高置信头部/称号
+            # 连续多帧落到同一位置，才允许建立受限的视觉身份。
+            auxiliary_identity_threshold = float(
+                vision.get("player_auxiliary_identity_threshold", 0.90)
+            )
+            strong_head = [
+                detection
+                for detection in head_detections
+                if detection.score >= auxiliary_identity_threshold
+            ]
+            strong_title = [
+                detection
+                for detection in title_detections
+                if detection.score >= auxiliary_identity_threshold
+            ]
+            candidate = choose_fused_player_anchor(
+                [("头部", strong_head), ("称号勋章", strong_title)],
+                None,
+                *anchor_args,
+            )
+            if candidate is not None:
+                anchor = track.consider_reacquisition(
+                    candidate,
+                    int(vision.get("player_auxiliary_reacquire_confirm_frames", 3)),
+                    float(vision.get("player_anchor_agreement", 0.07))
+                    * max(scene_width, scene_height),
+                )
+                identity_confirmed = anchor is not None
 
         if anchor is None and search_roi is not None and track.misses + 1 >= miss_limit:
             # 连续局部丢失后只允许通过本人名字做全图重定位，辅助模板不得建立新身份。
@@ -1209,6 +1258,7 @@ class BowmanBot:
                             self.templates,
                             float(vision["monster_template_threshold"]),
                             float(vision.get("monster_detection_scale", 1.0)),
+                            structure_weight=float(vision.get("monster_structure_weight", 0.15)),
                         )
                     raw_monster_count = len(detected_monsters)
                     hold_seconds = float(vision.get("monster_hold_seconds", 0.0))
@@ -1349,19 +1399,11 @@ class BowmanBot:
                     strategy_area_boxes: list[dict[str, Any]] = []
                     close_overlap_span = None
                     marker_screen = None
-                    platform_center_screen = None
                     if marker is not None:
                         mx = minimap_rect[0] + int(marker[0] * minimap_rect[2])
                         my = minimap_rect[1] + int(marker[1] * minimap_rect[3])
                         marker_screen = (mx, my)
                     recognition = self.config["recognition"]
-                    if recognition.get("platform_center_captured"):
-                        platform_center = recognition.get("platform_center")
-                        if isinstance(platform_center, dict):
-                            platform_center_screen = (
-                                combat_rect[0] + int(round(float(platform_center["x"]) * combat_rect[2])),
-                                combat_rect[1] + int(round(float(platform_center["y"]) * combat_rect[3])),
-                            )
                     for detection in monsters:
                         dx, dy, dw, dh = detection.box
                         monster_boxes.append((combat_rect[0] + dx, combat_rect[1] + dy, dw, dh))
@@ -1463,7 +1505,6 @@ class BowmanBot:
                             "minimap_roi": self.config["regions"]["minimap"],
                             "combat_roi": self.config["regions"]["combat"],
                             "marker_screen": marker_screen,
-                            "platform_center_screen": platform_center_screen,
                             "player_box": player_screen_box,
                             "player_score": active_player_score,
                             "player_source": player_source,

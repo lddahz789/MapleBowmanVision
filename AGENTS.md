@@ -64,7 +64,7 @@ assets/{monsters,player,player_head,player_title}/
 1. `cli.main` → 默认 `panel.run_control_panel`；`--overlay-only` 则只开 HUD。
 2. 面板线程跑 `BowmanBot.run`：`mss` 截客户区 → 裁 HP/MP/小地图/战斗区。
 3. 玩家：姓名板模板优先，失败则头部、称号；多路互相校验，避免锁别人。`PlayerAnchor.box` 顶边是脚底高度，水平中心是角色 X；攻击框锚在检测框几何中心（`raw_box` 优先）。
-4. 怪物：战斗区模板匹配；当前职业策略在同一批检测结果中决定攻击、追踪或回平台中心。
+4. 怪物：战斗区模板匹配；当前职业策略在同一批检测结果中决定攻击、追踪或按小地图位置返回平台安全点。
 5. `input.delivery=background`：始终 `SendInput` 扫描码；失焦时额外 Post/Send 消息，且不要先松开扫描码。`foreground`：仅 SendInput，失焦停机。
 6. 挂机需要管理员完整性 ≥ 游戏（UAC）。`Start.bat` 启动时提权并授权输入，但只进入待命；必须再点“启动挂机”或按 F8 才会发键。
 
@@ -72,11 +72,14 @@ assets/{monsters,player,player_head,player_title}/
 
 - **校准 UI**：框选和点色只用 `interactive_overlay`，不要加回 `cv2.imshow` / OpenCV 鼠标回调。
 - **同帧检测复用**：`BowmanBot.run` 每帧建一个 `SceneFeatures`，四路 `find_detections` 共用；模板特征按缩放比例缓存在 `Template` 上。新增检测请传同一个 `SceneFeatures`，不要重复传原始帧。
+- **怪物模板前景**：新怪物模板必须在采集时生成并保存 Alpha，使用框选边缘估计背景并保留最大主体连通域；不得再按固定色相排除棕色，也不得在前景异常时静默保存整幅背景。怪物检测同时使用可配置的颜色与轮廓混合权重。
 - **稳定战斗锚点**：姓名板/头部/称号的原始框只提供水平中心，高度必须用 `PlayerAnchor.box` 的统一脚底 Y；HUD、选敌和攻击范围采集共用 `last_attack_anchor`。轻量 EMA 只平滑小抖动，大幅移动立即跳转。
 - **冻结帧采集**：`capture_frozen_selection` 先截图，把帧传给 `interactive_overlay(..., frozen_frame=)`，裁切同一帧。不要改回「先框再截第二张图」。
+- **小地图标记采集**：点选时用 `magnified_roi_preview` 放大小地图，但 HSV 必须通过 `map_magnified_point` 映射回原始冻结帧，再用 `analyze_player_marker_sample` 提取点击附近的连续亮色并做唯一性验证；不得直接从插值预览或固定 `5×5` 背景中位数取色。保存采集位置供首帧消歧。
+- **姓名板身份去重与遮挡补位**：名字字形阈值只使用模板 Alpha 有效区；多模板候选先分别保留并计算身份分，再用 `deduplicate_nameplate_detections` 跨模板去重。不得让身份无效但原始相关分较高的模板提前压掉有效模板。姓名板已确认本人后，头部/称号可在预测位置和辅助最大位移约束内连续续跟踪。首次或完全丢失时，普通辅助命中不得认人；只有达到 `player_auxiliary_identity_threshold` 且连续多帧位置一致的辅助模板才可建立受限身份。
 - **职业策略**：策略只放 `mbv/strategies/`，必须实现注册元数据、目标选择和动作决策；不得在 `mbv/bot.py` 增加按职业分支。完整规范见 `STRATEGIES.md`。
 - **通用索敌区**：所有职业策略共享 `targeting.box.{forward,back,up,down}`，相对稳定战斗锚点并随朝向翻转。不得把索敌框放回某个职业的策略设置；旧策略/`behavior.bow_attack_box` 只用于一次性兼容迁移。
-- **独立校准**：`calibrate` 只采状态栏和小地图；`capture_recognition_region` 用同一冻结帧独立采战斗识别区和平台中心。平台中心坐标相对战斗区归一化。
+- **独立校准**：战斗识别区与小地图平台安全点相互独立。`capture_platform_center` 必须像玩家标记采集一样放大小地图并映射回原始冻结帧，坐标相对小地图内部归一化且写入 `platform_center_space=minimap`；重采小地图会使玩家标记和平台安全点失效，重采战斗区不得使平台安全点失效。旧战斗画面平台中心不能换算，必须要求重采。
 - **Debug 框 / F7**：`BowmanBot.set_calibration_overlay_visible` / `toggle_calibration_overlay`；HUD 用 `overlay_draw_plan`。与采集时 `overlay.hide()` 独立。
 - **面板不抢焦点**：`prevent_window_activate` 只设 `WS_EX_NOACTIVATE`。
 - **配置持久化**：挂机配置的鼠标控件要自动写入个人 `config.json`；`ControlPanel.quit/_destroy` 退出前再调用统一 `_persist_settings`。新增策略参数不能只改运行内存或 Entry。

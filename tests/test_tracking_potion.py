@@ -23,6 +23,7 @@ from mbv.vision import (  # noqa: E402
     PlayerAnchor,
     SceneFeatures,
     Template,
+    deduplicate_nameplate_detections,
     find_detections,
     load_templates,
     nameplate_identity_similarity,
@@ -117,6 +118,26 @@ class PlayerTrackingTests(unittest.TestCase):
 
         self.assertGreater(nameplate_identity_similarity(template, shifted), 0.85)
 
+    def test_nameplate_identity_similarity_ignores_transparent_white_border(self):
+        template = np.full((26, 64, 3), 255, dtype=np.uint8)
+        candidate = template.copy()
+        alpha = np.zeros((26, 64), dtype=np.uint8)
+        alpha[3:23, 10:54] = 255
+        template[3:23, 10:54] = (180, 70, 20)
+        candidate[3:23, 10:54] = (180, 70, 20)
+        cv2.putText(template, "AB", (18, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.putText(candidate, "AB", (18, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+        self.assertGreater(nameplate_identity_similarity(template, candidate, alpha), 0.9)
+
+    def test_nameplate_deduplication_prefers_identity_over_raw_template_score(self):
+        invalid = Detection((100, 50, 61, 26), 0.95, "wide.png", identity_score=0.0)
+        valid = Detection((108, 50, 44, 26), 0.90, "valid.png", identity_score=0.82)
+
+        kept = deduplicate_nameplate_detections([invalid, valid], nms_iou=0.35)
+
+        self.assertEqual(kept, [valid])
+
     def test_nameplate_identity_verification_scores_each_candidate_at_full_resolution(self):
         template_image = np.full((24, 64, 3), (180, 70, 20), dtype=np.uint8)
         own = template_image.copy()
@@ -182,7 +203,7 @@ class PlayerTrackingTests(unittest.TestCase):
         state.record(head, 11.0, velocity_alpha=1.0, max_displacement=100.0)
         self.assertEqual(state.velocity, (0.0, 0.0))
 
-    def test_auxiliary_record_does_not_extend_identity_grace(self):
+    def test_auxiliary_record_preserves_prior_identity_without_confirming_a_new_one(self):
         state = PlayerTrackState()
         nameplate = PlayerAnchor((90, 80, 20, 1), 0.9, "姓名板", (90, 80, 20, 10))
         head = PlayerAnchor((92, 80, 20, 1), 0.9, "头部", (92, 40, 20, 20))
@@ -197,7 +218,7 @@ class PlayerTrackingTests(unittest.TestCase):
 
         self.assertEqual(state.last_identity_at, 10.0)
         self.assertEqual(state.mode, "OCCLUDED")
-        self.assertFalse(state.identity_within_grace(10.4, 0.35))
+        self.assertTrue(state.has_confirmed_identity())
 
     def _tracker_bot(self) -> runtime_bot.BowmanBot:
         instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
@@ -285,7 +306,7 @@ class PlayerTrackingTests(unittest.TestCase):
         self.assertEqual(anchor.raw_box, teleported.box)
         self.assertEqual(instance.player_track.misses, 0)
 
-    def test_occluded_player_does_not_switch_to_unverified_nearby_nameplate(self):
+    def test_occluded_nameplate_uses_auxiliary_even_with_invalid_raw_candidate(self):
         instance = self._tracker_bot()
         prior = PlayerAnchor((90, 80, 20, 1), 0.9, "姓名板", (90, 80, 20, 10))
         instance.player_track.record(prior, 10.0, velocity_alpha=1.0, max_displacement=100.0)
@@ -311,9 +332,66 @@ class PlayerTrackingTests(unittest.TestCase):
 
         anchor = instance._track_player(scene, self.config["vision"], 10.1)
 
-        self.assertIsNone(anchor)
-        self.assertIs(instance.player_track.anchor, prior)
-        self.assertEqual(instance.player_track.misses, 2)
+        self.assertIsNotNone(anchor)
+        self.assertEqual(anchor.source, "头部")
+        self.assertEqual(anchor.box[1], prior.box[1])
+        self.assertEqual(instance.player_track.misses, 0)
+        instance._detect_player_auxiliary.assert_called_once()
+
+    def test_head_only_continues_tracking_after_identity_grace_and_periodic_global_scan(self):
+        instance = self._tracker_bot()
+        prior = PlayerAnchor((90, 80, 20, 1), 0.9, "姓名板", (90, 80, 20, 10))
+        instance.player_track.record(prior, 10.0, velocity_alpha=1.0, max_displacement=100.0)
+        instance.player_track.last_global_at = 10.0
+        head = Detection((92, 46, 20, 20), 0.88, "own-head.png")
+        instance._detect_player_nameplate.return_value = ([], -1.0, None)
+        instance._detect_player_auxiliary.return_value = ([head], 0.88, [], -1.0)
+        scene = SceneFeatures(np.zeros((200, 400, 3), dtype=np.uint8))
+
+        sources = [
+            instance._track_player(scene, self.config["vision"], now).source
+            for now in (10.1, 10.5, 11.0, 11.6, 12.0)
+        ]
+
+        self.assertEqual(sources, ["头部"] * 5)
+        self.assertEqual(instance.player_track.last_identity_at, 10.0)
+        self.assertEqual(instance.player_track.misses, 0)
+        self.assertIsNone(instance._detect_player_nameplate.call_args_list[3].args[2])
+
+    def test_low_confidence_head_only_cannot_establish_identity_on_fresh_global_search(self):
+        instance = self._tracker_bot()
+        instance._detect_player_nameplate.return_value = ([], -1.0, None)
+        instance._detect_player_auxiliary.return_value = (
+            [Detection((92, 46, 20, 20), 0.89, "head.png")],
+            0.89,
+            [],
+            -1.0,
+        )
+        scene = SceneFeatures(np.zeros((200, 400, 3), dtype=np.uint8))
+
+        anchors = [instance._track_player(scene, self.config["vision"], 10.0 + index * 0.1) for index in range(4)]
+
+        self.assertEqual(anchors, [None] * 4)
+        self.assertFalse(instance.player_track.has_confirmed_identity())
+
+    def test_consistent_high_confidence_head_can_establish_identity_after_three_frames(self):
+        instance = self._tracker_bot()
+        instance._detect_player_nameplate.return_value = ([], -1.0, None)
+        head = Detection((92, 46, 20, 20), 0.96, "head.png")
+        instance._detect_player_auxiliary.return_value = ([head], 0.96, [], -1.0)
+        scene = SceneFeatures(np.zeros((200, 400, 3), dtype=np.uint8))
+
+        first = instance._track_player(scene, self.config["vision"], 10.0)
+        second = instance._track_player(scene, self.config["vision"], 10.1)
+        third = instance._track_player(scene, self.config["vision"], 10.2)
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertIsNotNone(third)
+        self.assertEqual(third.source, "头部")
+        self.assertTrue(instance.player_track.has_confirmed_identity())
+        self.assertEqual(instance.player_track.last_identity_at, 10.2)
+        self.assertEqual(instance.player_track.misses, 0)
 
     def test_global_reacquisition_never_uses_head_or_title_without_identity(self):
         instance = self._tracker_bot()
@@ -460,8 +538,9 @@ class PlayerTrackingTests(unittest.TestCase):
             "player_name_identity_threshold",
             "player_name_identity_margin",
             "player_reacquire_confirm_frames",
-            "player_occlusion_grace_seconds",
             "player_auxiliary_max_jump",
+            "player_auxiliary_identity_threshold",
+            "player_auxiliary_reacquire_confirm_frames",
         ):
             config["vision"].pop(key, None)
         with TemporaryDirectory() as temporary:
@@ -473,7 +552,9 @@ class PlayerTrackingTests(unittest.TestCase):
         self.assertEqual(loaded["vision"]["player_global_verify_interval_seconds"], 1.5)
         self.assertEqual(loaded["vision"]["player_local_roi_width"], 0.36)
         self.assertEqual(loaded["vision"]["player_reacquire_confirm_frames"], 2)
-        self.assertEqual(loaded["vision"]["player_name_identity_threshold"], 0.58)
+        self.assertEqual(loaded["vision"]["player_name_identity_threshold"], 0.50)
+        self.assertEqual(loaded["vision"]["player_auxiliary_identity_threshold"], 0.90)
+        self.assertEqual(loaded["vision"]["player_auxiliary_reacquire_confirm_frames"], 3)
 
 
 class AutoPotionTests(unittest.TestCase):

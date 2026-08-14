@@ -46,6 +46,8 @@ from mbv.vision import (
     find_monster,
     load_templates,
     monster_template_category,
+    monster_template_alpha,
+    monster_template_image,
     monster_templates_for_category,
     player_attack_anchor,
     player_marker,
