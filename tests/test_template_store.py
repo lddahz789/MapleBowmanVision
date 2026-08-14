@@ -27,7 +27,8 @@ from mbv import template_store  # noqa: E402
 class TemplateStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = TemporaryDirectory()
-        self.base = Path(self.temporary.name)
+        # Windows 的 TemporaryDirectory 可能返回 8.3 短路径，而存储层会解析成长路径。
+        self.base = Path(self.temporary.name).resolve()
         self.monsters = self.base / "monsters"
         self.filters = self.base / "filters"
         self.player = self.base / "player"

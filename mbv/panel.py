@@ -131,6 +131,7 @@ class ControlPanel:
         self.monster_category_summary = tk.StringVar(value="")
         self._monster_category_lookup: dict[str, str] = {UNCATEGORIZED_LABEL: ""}
         self.debug_boxes = tk.BooleanVar(value=self.bot.calibration_overlay_visible)
+        self.standalone_potion = tk.BooleanVar(value=False)
         self.hp_threshold_percent = tk.IntVar(value=int(round(float(config["behavior"]["hp_threshold"]) * 100)))
         self.mp_threshold_percent = tk.IntVar(value=int(round(float(config["behavior"]["mp_threshold"]) * 100)))
         self.delivery = tk.BooleanVar(value=input_delivery(config) == "background")
@@ -502,6 +503,33 @@ class ControlPanel:
             )
         self._threshold_control(settings, self.hp_threshold_percent, "HP 自动喝药阈值")
         self._threshold_control(settings, self.mp_threshold_percent, "MP 自动喝药阈值")
+        self.potion_button = tk.Checkbutton(
+            settings,
+            text="独立自动喝药：关闭",
+            variable=self.standalone_potion,
+            command=self._toggle_standalone_potion,
+            indicatoron=False,
+            bg=BUTTON_BG,
+            fg=FG,
+            selectcolor="#163844",
+            activebackground=BUTTON_ACTIVE,
+            activeforeground=FG,
+            relief="flat",
+            font=FONT,
+            cursor="hand2",
+            takefocus=False,
+        )
+        self.potion_button.pack(fill="x", padx=8, pady=(6, 2), ipady=5)
+        tk.Label(
+            settings,
+            text="会话开关；挂机暂停时仍监测血蓝，仅在游戏位于前台时发送药键。挂机运行时的自动喝药不受此开关影响。",
+            bg=PANEL,
+            fg=MUTED,
+            font=FONT_SMALL,
+            wraplength=360,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=(0, 5))
         tk.Checkbutton(
             settings,
             text="没有目标时左右巡逻",
@@ -1528,6 +1556,7 @@ class ControlPanel:
     def _tick(self) -> None:
         if self.worker_errors:
             return
+        now = time.monotonic()
         armed = self.bot.armed
         state = STATE_LABELS.get(self.bot.state, self.bot.state)
         hp = self.bot.ui_hp
@@ -1553,8 +1582,17 @@ class ControlPanel:
             text=f"显示 Debug 框：{debug_mode}",
             fg=ACCENT if self.bot.calibration_overlay_visible else MUTED,
         )
-        notice = self.bot.notice if self.bot.notice and self.bot.notice_until >= time.monotonic() else ""
+        potion_enabled = self.bot.auto_potion.standalone_enabled
+        potion_state = self.bot.auto_potion.display_state(now)
+        self.standalone_potion.set(potion_enabled)
+        self.potion_button.configure(
+            text=f"独立自动喝药：{potion_state}",
+            fg=ACCENT if potion_enabled else FG,
+        )
+        notice = self.bot.notice if self.bot.notice and self.bot.notice_until >= now else ""
         text = f"{mode}｜{state}｜血 {hp:.0%} 蓝 {mp:.0%}"
+        if potion_enabled:
+            text += f"｜独立喝药 {potion_state}"
         if notice:
             text += f"\n{notice}"
         self.status.set(text)
@@ -1651,7 +1689,8 @@ class ControlPanel:
     def _capture_target_range(self) -> None:
         player_box = None
         raw_box = None
-        anchor = self.bot.last_player_anchor
+        player_track = getattr(self.bot, "player_track", None)
+        anchor = player_track.anchor if player_track is not None else None
         if anchor is not None:
             player_box = anchor.box
             raw_box = anchor.raw_box
@@ -1717,6 +1756,12 @@ class ControlPanel:
             self.debug_boxes.set(self.bot.calibration_overlay_visible)
             return
         self.bot.set_calibration_overlay_visible(bool(self.debug_boxes.get()))
+
+    def _toggle_standalone_potion(self) -> None:
+        if self.busy:
+            self.standalone_potion.set(self.bot.auto_potion.standalone_enabled)
+            return
+        self.bot.request_standalone_potion(bool(self.standalone_potion.get()))
 
     def _save_settings(self) -> None:
         self._persist_settings(apply_runtime=True, notify=True, show_error=True)

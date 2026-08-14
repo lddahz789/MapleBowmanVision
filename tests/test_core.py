@@ -1497,6 +1497,8 @@ class CoreTests(unittest.TestCase):
         self.assertIn("--enable-input", script)
 
     def test_apply_config_switches_delivery_without_sendinput(self):
+        from mbv.player_tracking import PlayerTrackState
+
         instance = bot.BowmanBot.__new__(bot.BowmanBot)
         instance.armed = False
         instance.delivery = "foreground"
@@ -1506,13 +1508,13 @@ class CoreTests(unittest.TestCase):
         instance.config_lock = __import__("threading").Lock()
         instance.action_lock = __import__("threading").RLock()
         instance.f8_requested = __import__("threading").Event()
-        instance.last_player_auxiliary_at = 123.0
+        instance.player_track = PlayerTrackState(last_auxiliary_at=123.0)
         config = json.loads(json.dumps(self.config))
         config.setdefault("input", {})["delivery"] = "background"
         instance.apply_config(config)
         self.assertEqual(instance.delivery, "background")
         self.assertTrue(instance.background_input)
-        self.assertEqual(instance.last_player_auxiliary_at, 0.0)
+        self.assertEqual(instance.player_track.last_auxiliary_at, 0.0)
         self.assertEqual(instance.keyboard.delivery, "background")
 
     def test_apply_config_clears_pending_toggle_and_keeps_bot_paused(self):
@@ -1529,7 +1531,6 @@ class CoreTests(unittest.TestCase):
         instance.action_lock = threading.RLock()
         instance.f8_requested = threading.Event()
         instance.f8_requested.set()
-        instance.last_player_auxiliary_at = 123.0
         instance.log = MagicMock()
         instance.notify = MagicMock()
         config = json.loads(json.dumps(self.config))

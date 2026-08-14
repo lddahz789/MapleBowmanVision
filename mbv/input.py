@@ -286,9 +286,18 @@ class Keyboard:
 
     def tap(self, key: str, seconds: float = 0.035) -> None:
         code = vk_for(key)
-        self._dispatch(code, False)
-        time.sleep(max(0.01, seconds))
-        self._dispatch(code, True, was_down=True)
+        try:
+            self._dispatch(code, False)
+            time.sleep(max(0.01, seconds))
+        except BaseException:
+            # 后台投递可能已先发出 WM_KEYDOWN、再在 SendInput 阶段报错；仍要尽力补发抬键。
+            try:
+                self._dispatch(code, True, was_down=True)
+            except BaseException:
+                pass
+            raise
+        else:
+            self._dispatch(code, True, was_down=True)
 
     def release_all(self) -> None:
         with self._lock:
