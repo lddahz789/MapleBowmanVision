@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import MagicMock, call, patch
 
+import cv2
 import numpy as np
 
 
@@ -23,7 +24,11 @@ from mbv.vision import (  # noqa: E402
     SceneFeatures,
     Template,
     find_detections,
+    load_templates,
+    nameplate_identity_similarity,
+    player_anchor_from_detection,
     player_tracking_roi,
+    verify_nameplate_identities,
 )
 from mbv.window import WindowInfo  # noqa: E402
 
@@ -90,6 +95,78 @@ class PlayerTrackingTests(unittest.TestCase):
         self.assertEqual(left, (0, 0, 360, 210))
         self.assertEqual(right, (640, 290, 360, 210))
 
+    def test_nameplate_identity_similarity_uses_name_glyphs_not_shared_plate(self):
+        template = np.full((24, 64, 3), (180, 70, 20), dtype=np.uint8)
+        same = template.copy()
+        other = template.copy()
+        cv2.putText(template, "AB", (18, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.putText(same, "AB", (18, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.putText(other, "XY", (18, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+        same_score = nameplate_identity_similarity(template, same)
+        other_score = nameplate_identity_similarity(template, other)
+
+        self.assertGreater(same_score, 0.9)
+        self.assertLess(other_score, same_score - 0.25)
+
+    def test_nameplate_identity_similarity_tolerates_one_pixel_candidate_shift(self):
+        template = np.full((24, 64, 3), (180, 70, 20), dtype=np.uint8)
+        shifted = np.full_like(template, (180, 70, 20))
+        cv2.putText(template, "AB", (18, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.putText(shifted, "AB", (19, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+        self.assertGreater(nameplate_identity_similarity(template, shifted), 0.85)
+
+    def test_nameplate_identity_verification_scores_each_candidate_at_full_resolution(self):
+        template_image = np.full((24, 64, 3), (180, 70, 20), dtype=np.uint8)
+        own = template_image.copy()
+        other = template_image.copy()
+        cv2.putText(template_image, "AB", (18, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.putText(own, "AB", (18, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.putText(other, "XY", (18, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        scene = np.zeros((80, 160, 3), dtype=np.uint8)
+        scene[10:34, 10:74] = own
+        scene[45:69, 80:144] = other
+        template = Template("player.png", template_image, np.full((24, 64), 255, dtype=np.uint8))
+
+        verified = verify_nameplate_identities(
+            scene,
+            [
+                Detection((10, 10, 64, 24), 0.9, "player.png"),
+                Detection((80, 45, 64, 24), 0.99, "player.png"),
+            ],
+            [template],
+        )
+
+        self.assertGreater(verified[0].identity_score, 0.9)
+        self.assertLess(verified[1].identity_score, verified[0].identity_score - 0.25)
+
+    def test_template_anchor_metadata_is_loaded_and_controls_player_feet(self):
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            path = directory / "player.png"
+            image = np.full((12, 18, 4), 255, dtype=np.uint8)
+            ok, encoded = cv2.imencode(".png", image)
+            self.assertTrue(ok)
+            encoded.tofile(path)
+            path.with_suffix(".anchor.json").write_text(
+                json.dumps({"version": 1, "anchor_offset": [7.0, 26.0]}),
+                encoding="utf-8",
+            )
+
+            template = load_templates(directory)[0]
+            detection = Detection(
+                (100, 80, 18, 12),
+                0.95,
+                template.name,
+                anchor_offset=template.anchor_offset,
+            )
+            anchor = player_anchor_from_detection(detection, "姓名板", 300, 0.07, 0.076)
+
+        self.assertEqual(template.anchor_offset, (7.0, 26.0))
+        self.assertAlmostEqual(anchor.box[0] + anchor.box[2] / 2.0, 107.0, delta=0.5)
+        self.assertEqual(anchor.box[1], 106)
+
     def test_track_state_predicts_motion_and_resets_velocity_on_source_change(self):
         state = PlayerTrackState()
         first = PlayerAnchor((90, 80, 20, 1), 0.9, "姓名板", (90, 80, 20, 10))
@@ -105,6 +182,23 @@ class PlayerTrackingTests(unittest.TestCase):
         state.record(head, 11.0, velocity_alpha=1.0, max_displacement=100.0)
         self.assertEqual(state.velocity, (0.0, 0.0))
 
+    def test_auxiliary_record_does_not_extend_identity_grace(self):
+        state = PlayerTrackState()
+        nameplate = PlayerAnchor((90, 80, 20, 1), 0.9, "姓名板", (90, 80, 20, 10))
+        head = PlayerAnchor((92, 80, 20, 1), 0.9, "头部", (92, 40, 20, 20))
+        state.record(nameplate, 10.0, velocity_alpha=1.0, max_displacement=100.0)
+        state.record(
+            head,
+            10.2,
+            velocity_alpha=1.0,
+            max_displacement=100.0,
+            identity_confirmed=False,
+        )
+
+        self.assertEqual(state.last_identity_at, 10.0)
+        self.assertEqual(state.mode, "OCCLUDED")
+        self.assertFalse(state.identity_within_grace(10.4, 0.35))
+
     def _tracker_bot(self) -> runtime_bot.BowmanBot:
         instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
         instance.player_track = PlayerTrackState()
@@ -119,7 +213,7 @@ class PlayerTrackingTests(unittest.TestCase):
         instance.player_track.last_global_at = 10.0
         instance.player_track.last_auxiliary_at = 10.0
         instance._detect_player_nameplate.return_value = (
-            [Detection((92, 80, 20, 10), 0.95, "player.png")],
+            [Detection((92, 80, 20, 10), 0.95, "player.png", identity_score=0.96)],
             0.95,
             "player.png",
         )
@@ -139,7 +233,7 @@ class PlayerTrackingTests(unittest.TestCase):
         instance.player_track.last_global_at = 10.0
         instance.player_track.last_auxiliary_at = 10.0
         instance.player_track.misses = 1
-        recovered = Detection((94, 80, 20, 10), 0.96, "player.png")
+        recovered = Detection((94, 80, 20, 10), 0.96, "player.png", identity_score=0.97)
         instance._detect_player_nameplate.side_effect = [
             ([], -1.0, None),
             ([recovered], 0.96, "player.png"),
@@ -166,21 +260,80 @@ class PlayerTrackingTests(unittest.TestCase):
         instance.player_track.last_global_at = 10.0
         instance.player_track.last_auxiliary_at = 10.0
         instance.player_track.misses = 1
-        teleported = Detection((340, 150, 20, 10), 0.98, "player.png")
+        teleported = Detection(
+            (340, 150, 20, 10),
+            0.98,
+            "player.png",
+            identity_score=0.96,
+        )
         instance._detect_player_nameplate.side_effect = [
             ([], -1.0, None),
+            ([teleported], 0.98, "player.png"),
             ([teleported], 0.98, "player.png"),
         ]
         instance._detect_player_auxiliary.side_effect = [
             ([], -1.0, [], -1.0),
             ([], -1.0, [], -1.0),
+            ([], -1.0, [], -1.0),
         ]
+        scene = SceneFeatures(np.zeros((200, 400, 3), dtype=np.uint8))
+
+        first = instance._track_player(scene, self.config["vision"], 10.1)
+        anchor = instance._track_player(scene, self.config["vision"], 10.2)
+
+        self.assertIsNone(first)
+        self.assertEqual(anchor.raw_box, teleported.box)
+        self.assertEqual(instance.player_track.misses, 0)
+
+    def test_occluded_player_does_not_switch_to_unverified_nearby_nameplate(self):
+        instance = self._tracker_bot()
+        prior = PlayerAnchor((90, 80, 20, 1), 0.9, "姓名板", (90, 80, 20, 10))
+        instance.player_track.record(prior, 10.0, velocity_alpha=1.0, max_displacement=100.0)
+        instance.player_track.last_global_at = 10.0
+        instance.player_track.misses = 1
+        other = Detection(
+            (105, 80, 20, 10),
+            0.99,
+            "other.png",
+            identity_score=0.25,
+        )
+        instance._detect_player_nameplate.side_effect = [
+            ([other], 0.99, "other.png"),
+            ([other], 0.99, "other.png"),
+        ]
+        instance._detect_player_auxiliary.return_value = (
+            [Detection((105, 46, 20, 20), 0.95, "other-head.png")],
+            0.95,
+            [Detection((105, 95, 20, 10), 0.95, "common-title.png")],
+            0.95,
+        )
         scene = SceneFeatures(np.zeros((200, 400, 3), dtype=np.uint8))
 
         anchor = instance._track_player(scene, self.config["vision"], 10.1)
 
-        self.assertEqual(anchor.raw_box, teleported.box)
-        self.assertEqual(instance.player_track.misses, 0)
+        self.assertIsNone(anchor)
+        self.assertIs(instance.player_track.anchor, prior)
+        self.assertEqual(instance.player_track.misses, 2)
+
+    def test_global_reacquisition_never_uses_head_or_title_without_identity(self):
+        instance = self._tracker_bot()
+        prior = PlayerAnchor((20, 80, 20, 1), 0.9, "姓名板", (20, 80, 20, 10))
+        instance.player_track.record(prior, 10.0, velocity_alpha=1.0, max_displacement=100.0)
+        instance.player_track.last_global_at = 10.0
+        instance.player_track.misses = 2
+        instance._detect_player_nameplate.return_value = ([], -1.0, None)
+        instance._detect_player_auxiliary.return_value = (
+            [Detection((300, 120, 20, 20), 0.99, "other-head.png")],
+            0.99,
+            [Detection((300, 170, 20, 10), 0.99, "common-title.png")],
+            0.99,
+        )
+        scene = SceneFeatures(np.zeros((200, 400, 3), dtype=np.uint8))
+
+        anchor = instance._track_player(scene, self.config["vision"], 10.2)
+
+        self.assertIsNone(anchor)
+        self.assertIs(instance.player_track.anchor, prior)
 
     def test_failed_global_fallback_hides_stale_anchor_from_actions(self):
         instance = self._tracker_bot()
@@ -208,7 +361,7 @@ class PlayerTrackingTests(unittest.TestCase):
         instance.player_track.record(prior, 10.0, velocity_alpha=1.0, max_displacement=100.0)
         instance.player_track.last_global_at = 10.0
         instance.player_track.misses = 2
-        teleported = Detection((340, 150, 20, 10), 0.98, "player.png")
+        teleported = Detection((340, 150, 20, 10), 0.98, "player.png", identity_score=0.96)
         instance._detect_player_nameplate.return_value = (
             [teleported],
             0.98,
@@ -217,8 +370,10 @@ class PlayerTrackingTests(unittest.TestCase):
         instance._detect_player_auxiliary.return_value = ([], -1.0, [], -1.0)
         scene = SceneFeatures(np.zeros((200, 400, 3), dtype=np.uint8))
 
-        anchor = instance._track_player(scene, self.config["vision"], 10.2)
+        first = instance._track_player(scene, self.config["vision"], 10.2)
+        anchor = instance._track_player(scene, self.config["vision"], 10.3)
 
+        self.assertIsNone(first)
         self.assertEqual(anchor.raw_box, teleported.box)
         self.assertEqual(instance.player_track.misses, 0)
 
@@ -228,8 +383,8 @@ class PlayerTrackingTests(unittest.TestCase):
         instance.player_track.record(prior, 10.0, velocity_alpha=1.0, max_displacement=100.0)
         instance.player_track.last_global_at = 10.0
         instance.player_track.misses = 2
-        wrong = Detection((100, 80, 20, 10), 0.99, "wrong.png")
-        own_nameplate = Detection((300, 150, 20, 10), 0.90, "player.png")
+        wrong = Detection((100, 80, 20, 10), 0.99, "wrong.png", identity_score=0.25)
+        own_nameplate = Detection((300, 150, 20, 10), 0.90, "player.png", identity_score=0.96)
         own_head = Detection((300, 116, 20, 20), 0.88, "head.png")
         own_title = Detection((300, 165, 20, 10), 0.87, "title.png")
         instance._detect_player_nameplate.return_value = (
@@ -245,7 +400,9 @@ class PlayerTrackingTests(unittest.TestCase):
         )
         scene = SceneFeatures(np.zeros((200, 400, 3), dtype=np.uint8))
 
-        anchor = instance._track_player(scene, self.config["vision"], 10.2)
+        config = json.loads(json.dumps(self.config["vision"]))
+        config["player_reacquire_confirm_frames"] = 1
+        anchor = instance._track_player(scene, config, 10.2)
 
         self.assertEqual(anchor.raw_box, own_nameplate.box)
         self.assertEqual(anchor.source, "姓名板")
@@ -258,8 +415,8 @@ class PlayerTrackingTests(unittest.TestCase):
         instance.player_track.record(prior, 10.0, velocity_alpha=1.0, max_displacement=100.0)
         instance.player_track.last_global_at = 10.0
         instance.player_track.last_auxiliary_at = 10.0
-        wrong_near_old = Detection((60, 80, 20, 10), 0.99, "other.png")
-        own_at_prediction = Detection((68, 80, 20, 10), 0.92, "player.png")
+        wrong_near_old = Detection((60, 80, 20, 10), 0.99, "other.png", identity_score=0.94)
+        own_at_prediction = Detection((68, 80, 20, 10), 0.92, "player.png", identity_score=0.96)
         instance._detect_player_nameplate.return_value = (
             [wrong_near_old, own_at_prediction],
             0.99,
@@ -278,7 +435,7 @@ class PlayerTrackingTests(unittest.TestCase):
         instance.player_track.last_global_at = 10.0
         instance.player_track.last_auxiliary_at = 10.0
         instance._detect_player_nameplate.return_value = (
-            [Detection((90, 80, 20, 10), 0.95, "player.png")],
+            [Detection((90, 80, 20, 10), 0.95, "player.png", identity_score=0.96)],
             0.95,
             "player.png",
         )
@@ -300,6 +457,11 @@ class PlayerTrackingTests(unittest.TestCase):
             "player_global_verify_interval_seconds",
             "player_prediction_horizon_seconds",
             "player_velocity_alpha",
+            "player_name_identity_threshold",
+            "player_name_identity_margin",
+            "player_reacquire_confirm_frames",
+            "player_occlusion_grace_seconds",
+            "player_auxiliary_max_jump",
         ):
             config["vision"].pop(key, None)
         with TemporaryDirectory() as temporary:
@@ -310,6 +472,8 @@ class PlayerTrackingTests(unittest.TestCase):
         self.assertEqual(loaded["vision"]["player_local_miss_limit"], 2)
         self.assertEqual(loaded["vision"]["player_global_verify_interval_seconds"], 1.5)
         self.assertEqual(loaded["vision"]["player_local_roi_width"], 0.36)
+        self.assertEqual(loaded["vision"]["player_reacquire_confirm_frames"], 2)
+        self.assertEqual(loaded["vision"]["player_name_identity_threshold"], 0.58)
 
 
 class AutoPotionTests(unittest.TestCase):

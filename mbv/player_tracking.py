@@ -6,8 +6,8 @@ from mbv.vision import PlayerAnchor
 
 
 def _anchor_point(anchor: PlayerAnchor) -> tuple[float, float]:
-    raw_x, _raw_y, raw_width, _raw_height = anchor.raw_box
-    return raw_x + raw_width / 2.0, float(anchor.box[1])
+    anchor_x, feet_y, anchor_width, _anchor_height = anchor.box
+    return anchor_x + anchor_width / 2.0, float(feet_y)
 
 
 @dataclass
@@ -20,6 +20,10 @@ class PlayerTrackState:
     last_global_at: float = 0.0
     misses: int = 0
     velocity: tuple[float, float] = (0.0, 0.0)
+    mode: str = "SEARCH_SELF"
+    last_identity_at: float = 0.0
+    pending_anchor: PlayerAnchor | None = None
+    pending_count: int = 0
 
     def anchor_within_hold(self, now: float, hold_seconds: float) -> PlayerAnchor | None:
         if self.anchor is not None and now - self.last_seen_at <= max(0.0, float(hold_seconds)):
@@ -47,6 +51,7 @@ class PlayerTrackState:
         *,
         velocity_alpha: float,
         max_displacement: float,
+        identity_confirmed: bool = True,
     ) -> None:
         previous = self.anchor
         previous_at = self.last_seen_at
@@ -69,9 +74,53 @@ class PlayerTrackState:
         self.last_seen_at = now
         self.misses = 0
         self.velocity = next_velocity
+        if identity_confirmed:
+            self.mode = "LOCKED"
+            self.last_identity_at = now
+            self.pending_anchor = None
+            self.pending_count = 0
+        else:
+            self.mode = "OCCLUDED"
+
+    def identity_within_grace(self, now: float, grace_seconds: float) -> bool:
+        return self.last_identity_at > 0.0 and now - self.last_identity_at <= max(0.0, float(grace_seconds))
+
+    def consider_reacquisition(
+        self,
+        anchor: PlayerAnchor,
+        required_frames: int,
+        max_distance: float,
+    ) -> PlayerAnchor | None:
+        required = max(1, int(required_frames))
+        if required <= 1:
+            self.pending_anchor = None
+            self.pending_count = 0
+            return anchor
+        current_x, current_y = _anchor_point(anchor)
+        same_candidate = False
+        if self.pending_anchor is not None:
+            previous_x, previous_y = _anchor_point(self.pending_anchor)
+            distance = ((current_x - previous_x) ** 2 + (current_y - previous_y) ** 2) ** 0.5
+            same_candidate = distance <= max(4.0, float(max_distance))
+        if same_candidate:
+            self.pending_count += 1
+        else:
+            self.pending_count = 1
+        self.pending_anchor = anchor
+        self.mode = "REACQUIRE"
+        if self.pending_count < required:
+            return None
+        confirmed = self.pending_anchor
+        self.pending_anchor = None
+        self.pending_count = 0
+        return confirmed
 
     def mark_miss(self) -> None:
         self.misses += 1
+        if self.pending_count > 0:
+            self.mode = "REACQUIRE"
+        else:
+            self.mode = "OCCLUDED" if self.anchor is not None else "SEARCH_SELF"
 
     def reset(self) -> None:
         self.anchor = None
@@ -80,3 +129,7 @@ class PlayerTrackState:
         self.last_global_at = 0.0
         self.misses = 0
         self.velocity = (0.0, 0.0)
+        self.mode = "SEARCH_SELF"
+        self.last_identity_at = 0.0
+        self.pending_anchor = None
+        self.pending_count = 0

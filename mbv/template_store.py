@@ -358,10 +358,18 @@ def trash_template(
     if actual_category:
         destination /= actual_category
     destination /= filename
+    metadata_source = source.with_suffix(".anchor.json")
+    metadata_destination = destination.with_suffix(".anchor.json")
+    moved_metadata = False
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(source), str(destination))
+        if metadata_source.is_file():
+            shutil.move(str(metadata_source), str(metadata_destination))
+            moved_metadata = True
     except Exception:
+        if moved_metadata and metadata_destination.exists() and not metadata_source.exists():
+            shutil.move(str(metadata_destination), str(metadata_source))
         if destination.exists() and not source.exists():
             source.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(destination), str(source))

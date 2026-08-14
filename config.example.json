@@ -82,7 +82,12 @@
     "player_local_miss_limit": 2,
     "player_global_verify_interval_seconds": 1.5,
     "player_prediction_horizon_seconds": 0.2,
-    "player_velocity_alpha": 0.35
+    "player_velocity_alpha": 0.35,
+    "player_name_identity_threshold": 0.58,
+    "player_name_identity_margin": 0.08,
+    "player_reacquire_confirm_frames": 2,
+    "player_occlusion_grace_seconds": 0.35,
+    "player_auxiliary_max_jump": 0.06
   },
   "keys": {
     "attack": "shift",

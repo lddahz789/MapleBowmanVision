@@ -857,6 +857,30 @@ class CoreTests(unittest.TestCase):
         self.assertIs(selected.target, near_left)
         self.assertIsNone(selected.chase_target)
 
+    def test_stationary_attack_searches_left_forward_range_while_facing_right(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import TargetSelectionContext
+
+        strategy = get_strategy("stationary_attack")
+        player = (180, 110, 40, 1)
+        left_only_when_facing_left = bot.Detection((75, 100, 20, 20), 0.92, "left.png")
+        selected = strategy.select_targets(
+            TargetSelectionContext(
+                detections=[left_only_when_facing_left],
+                player_box=player,
+                player_raw_box=(180, 70, 40, 40),
+                player_anchor=(200.0, 110.0),
+                scene_width=400,
+                scene_height=240,
+                facing="right",
+                target_area={"forward": 0.4, "back": 0.1, "up": 0.2, "down": 0.2},
+                settings={},
+            )
+        )
+
+        self.assertIs(selected.target, left_only_when_facing_left)
+        self.assertIsNone(selected.chase_target)
+
     def test_stationary_attack_only_attacks_or_stops(self):
         from mbv.strategies import get_strategy
         from mbv.strategies.base import StrategyActionContext
@@ -1180,6 +1204,23 @@ class CoreTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertTrue(np.all(first_decoded == 20))
         self.assertTrue(np.all(second_decoded == 220))
+
+    def test_captured_player_template_persists_independent_foot_anchor(self):
+        from mbv import calibrate as runtime_calibrate
+
+        image = np.full((12, 18, 4), 200, dtype=np.uint8)
+        with TemporaryDirectory() as temporary:
+            path = runtime_calibrate._save_captured_template(
+                image,
+                Path(temporary),
+                "nameplate",
+                "玩家姓名板",
+                anchor_offset=(9.5, -6.0),
+            )
+            metadata = json.loads(path.with_suffix(".anchor.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(metadata["version"], 1)
+        self.assertEqual(metadata["anchor_offset"], [9.5, -6.0])
 
     def test_template_preview_keeps_aspect_ratio_and_flattens_alpha(self):
         from mbv.panel import template_preview_image

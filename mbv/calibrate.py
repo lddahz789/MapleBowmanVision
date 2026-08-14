@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -413,12 +414,12 @@ def capture_strategy_area(
     return area
 
 
-def capture_frozen_selection(
+def _capture_frozen_selection_details(
     window: WindowInfo,
     title: str,
     cancel_message: str,
     parent: Any = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]]:
     """截图一次并在该静态帧上框选，保证显示内容与保存内容完全一致。"""
     focus_game_window(window)
     with mss.MSS() as sct:
@@ -440,10 +441,58 @@ def capture_frozen_selection(
     bottom = min(frame_height, y + h)
     if right - left < 4 or bottom - top < 4:
         raise RuntimeError("静态帧框选区域过小，请重新采集")
-    return frame[top:bottom, left:right].copy()
+    rectangle = (left, top, right - left, bottom - top)
+    return frame[top:bottom, left:right].copy(), frame, rectangle
 
 
-def _save_captured_template(image: np.ndarray, directory: Path, prefix: str, label: str) -> Path:
+def capture_frozen_selection(
+    window: WindowInfo,
+    title: str,
+    cancel_message: str,
+    parent: Any = None,
+) -> np.ndarray:
+    image, _frame, _rectangle = _capture_frozen_selection_details(
+        window,
+        title,
+        cancel_message,
+        parent=parent,
+    )
+    return image
+
+
+def _capture_player_template_with_anchor(
+    window: WindowInfo,
+    title: str,
+    cancel_message: str,
+    parent: Any = None,
+) -> tuple[np.ndarray, tuple[float, float]]:
+    image, frame, rectangle = _capture_frozen_selection_details(
+        window,
+        title,
+        cancel_message,
+        parent=parent,
+    )
+    result = interactive_overlay(
+        window,
+        "在同一静态帧上点击自己双脚落点的中心，回车确认",
+        "point",
+        guide_rect=rectangle,
+        parent=parent,
+        frozen_frame=frame,
+    )
+    if result.cancelled or result.point is None:
+        raise RuntimeError("已取消角色脚底锚点采集")
+    left, top, _width, _height = rectangle
+    return image, (float(result.point[0] - left), float(result.point[1] - top))
+
+
+def _save_captured_template(
+    image: np.ndarray,
+    directory: Path,
+    prefix: str,
+    label: str,
+    anchor_offset: tuple[float, float] | None = None,
+) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     stem = f"{prefix}-{stamp}"
@@ -456,6 +505,19 @@ def _save_captured_template(image: np.ndarray, directory: Path, prefix: str, lab
     if not ok:
         raise RuntimeError(f"无法保存{label}模板图片")
     encoded.tofile(path)
+    if anchor_offset is not None:
+        metadata = {
+            "version": 1,
+            "anchor_offset": [float(anchor_offset[0]), float(anchor_offset[1])],
+        }
+        try:
+            path.with_suffix(".anchor.json").write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            path.unlink(missing_ok=True)
+            raise
     print(f"{label}模板已保存：{path}")
     return path
 
@@ -546,7 +608,7 @@ def nameplate_template_alpha(image: np.ndarray) -> np.ndarray:
 def capture_player_template(config_path: Path, parent: Any = None) -> Path:
     config = load_config(config_path)
     window = find_game_window(config)
-    image = capture_frozen_selection(
+    image, anchor_offset = _capture_player_template_with_anchor(
         window,
         "紧贴框选自己姓名板的第一行蓝色板（含名字），不要包含角色、宠物或怪物",
         "已取消玩家模板框选",
@@ -555,7 +617,13 @@ def capture_player_template(config_path: Path, parent: Any = None) -> Path:
     alpha = nameplate_template_alpha(image)
     bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
     bgra[:, :, 3] = alpha
-    return _save_captured_template(bgra, PLAYER_ASSET_DIR, "nameplate", "玩家姓名板")
+    return _save_captured_template(
+        bgra,
+        PLAYER_ASSET_DIR,
+        "nameplate",
+        "玩家姓名板",
+        anchor_offset=anchor_offset,
+    )
 
 
 def capture_player_aux_template(config_path: Path, kind: str, parent: Any = None) -> Path:
@@ -578,11 +646,16 @@ def capture_player_aux_template(config_path: Path, kind: str, parent: Any = None
     prompt, directory, prefix, label = specs[kind]
     config = load_config(config_path)
     window = find_game_window(config)
-    image = capture_frozen_selection(window, prompt, f"已取消{label}模板框选", parent=parent)
+    image, anchor_offset = _capture_player_template_with_anchor(
+        window,
+        prompt,
+        f"已取消{label}模板框选",
+        parent=parent,
+    )
     alpha = player_template_alpha(image) if kind == "head" else nameplate_template_alpha(image)
     bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
     bgra[:, :, 3] = alpha
-    return _save_captured_template(bgra, directory, prefix, label)
+    return _save_captured_template(bgra, directory, prefix, label, anchor_offset=anchor_offset)
 
 
 def capture_key_name(config: dict[str, Any], parent: Any = None) -> str:

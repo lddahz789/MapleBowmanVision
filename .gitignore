@@ -15,8 +15,11 @@ assets/monster_filters/*.png
 assets/monster_filters/**/*.png
 assets/template_trash/
 assets/player/*.png
+assets/player/*.anchor.json
 assets/player_head/*.png
+assets/player_head/*.anchor.json
 assets/player_title/*.png
+assets/player_title/*.anchor.json
 
 # Editor and OS files
 .vscode/

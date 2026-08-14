@@ -42,6 +42,7 @@ from mbv.vision import (
     roi_pixels,
     smooth_player_attack_anchor,
     suppress_monster_detections,
+    verify_nameplate_identities,
 )
 from mbv.win32 import (
     HOTKEY_ID_EXIT,
@@ -855,7 +856,7 @@ class BowmanBot:
         vision: dict[str, Any],
         search_roi: tuple[int, int, int, int] | None,
     ) -> tuple[list[Detection], float, str | None]:
-        return find_detections(
+        detections, score, template_name = find_detections(
             scene,
             self.player_templates,
             float(vision.get("player_template_threshold", 0.76)),
@@ -866,6 +867,7 @@ class BowmanBot:
             structure_weight=0.55,
             search_roi=search_roi,
         )
+        return verify_nameplate_identities(scene.scene, detections, self.player_templates), score, template_name
 
     def _detect_player_auxiliary(
         self,
@@ -903,7 +905,7 @@ class BowmanBot:
         vision: dict[str, Any],
         now: float,
     ) -> PlayerAnchor | None:
-        """优先在预测位置附近识别玩家，定期或连续丢失时恢复全图三路定位。"""
+        """名字确认身份，头部/称号只做短时局部补位；看不清本人时宁可暂停。"""
         # 配置热更新会原子替换 tracker；本帧始终使用同一个实例，旧结果不会回写新状态。
         track = self.player_track
         scene_height, scene_width = scene.scene.shape[:2]
@@ -930,11 +932,17 @@ class BowmanBot:
                 float(vision.get("player_local_roi_down", 0.18)),
             )
 
-        nameplate_detections, _nameplate_score, _template_name = self._detect_player_nameplate(
+        raw_nameplate_detections, _nameplate_score, _template_name = self._detect_player_nameplate(
             scene,
             vision,
             search_roi,
         )
+        identity_threshold = float(vision.get("player_name_identity_threshold", 0.58))
+        nameplate_detections = [
+            detection
+            for detection in raw_nameplate_detections
+            if detection.identity_score is not None and detection.identity_score >= identity_threshold
+        ]
         if global_scan:
             track.last_global_at = now
         anchor_args = (
@@ -951,9 +959,6 @@ class BowmanBot:
             *anchor_args,
             reference_point=predicted_point if previous_anchor is not None else None,
         )
-        confirmed_global_reacquisition = bool(
-            global_scan and track.misses >= miss_limit and nameplate_detections
-        )
         run_auxiliary = should_run_player_auxiliary_detections(
             previous_anchor,
             nameplate_anchor,
@@ -966,6 +971,8 @@ class BowmanBot:
                 )
             ),
         ) or global_scan
+        head_detections: list[Detection] = []
+        title_detections: list[Detection] = []
         if run_auxiliary:
             head_detections, _head_score, title_detections, _title_score = self._detect_player_auxiliary(
                 scene,
@@ -973,59 +980,110 @@ class BowmanBot:
                 search_roi,
             )
             track.last_auxiliary_at = now
-            groups = [
-                ("姓名板", nameplate_detections),
-                ("头部", head_detections),
-                ("称号勋章", title_detections),
-            ]
-            if confirmed_global_reacquisition:
-                anchor = choose_fused_player_anchor(groups, None, *anchor_args)
-            else:
-                anchor = choose_fused_player_anchor(
-                    groups,
-                    previous_anchor,
-                    *anchor_args,
-                    reference_point=predicted_point if previous_anchor is not None else None,
-                )
-        else:
+        anchor: PlayerAnchor | None = None
+        identity_confirmed = False
+        if nameplate_anchor is not None and previous_anchor is not None:
             anchor = nameplate_anchor
-
-        if anchor is None and search_roi is not None and track.misses + 1 >= miss_limit:
-            # 连续局部丢失后在同一帧升级为全图三路重定位。
-            nameplate_detections, _nameplate_score, _template_name = self._detect_player_nameplate(
-                scene,
-                vision,
-                None,
+            identity_confirmed = True
+        elif nameplate_detections:
+            # 通过了名字验证但离旧位置很远：视为传送/换层，连续多帧确认后才能换锁。
+            ordered = sorted(
+                nameplate_detections,
+                key=lambda detection: float(detection.identity_score or 0.0),
+                reverse=True,
             )
-            head_detections, _head_score, title_detections, _title_score = self._detect_player_auxiliary(
-                scene,
-                vision,
-                None,
+            margin = float(vision.get("player_name_identity_margin", 0.08))
+            unambiguous = len(ordered) == 1 or (
+                float(ordered[0].identity_score or 0.0)
+                - float(ordered[1].identity_score or 0.0)
+                >= margin
             )
-            track.last_global_at = now
-            track.last_auxiliary_at = now
-            if nameplate_detections:
-                # 连续丢失后解除旧位置门限，但仍保留三路投票，避免高分错误姓名板压过真实位置。
-                anchor = choose_fused_player_anchor(
-                    [
-                        ("姓名板", nameplate_detections),
-                        ("头部", head_detections),
-                        ("称号勋章", title_detections),
-                    ],
+            if unambiguous:
+                candidate = choose_fused_player_anchor(
+                    [("姓名板", [ordered[0]])],
                     None,
                     *anchor_args,
                 )
-            else:
-                # 头部和称号更容易与其他玩家相似，仍沿用旧位置先验。
-                anchor = choose_fused_player_anchor(
-                    [
-                        ("头部", head_detections),
-                        ("称号勋章", title_detections),
-                    ],
+                if candidate is not None:
+                    anchor = track.consider_reacquisition(
+                        candidate,
+                        int(vision.get("player_reacquire_confirm_frames", 2)),
+                        float(vision.get("player_anchor_agreement", 0.07))
+                        * max(scene_width, scene_height),
+                    )
+                    identity_confirmed = anchor is not None
+        elif (
+            previous_anchor is not None
+            and not global_scan
+            and not raw_nameplate_detections
+            and track.identity_within_grace(
+                now,
+                float(vision.get("player_occlusion_grace_seconds", 0.35)),
+            )
+        ):
+            # 头部和称号不是唯一身份，只能在刚确认过本人后、很小的预测邻域内短时补位。
+            auxiliary_args = (
+                scene_width,
+                scene_height,
+                float(vision.get("player_head_feet_offset", 0.07)),
+                float(vision.get("player_title_feet_offset", 0.076)),
+                float(vision.get("player_auxiliary_max_jump", 0.06)),
+                float(vision.get("player_anchor_agreement", 0.07)),
+            )
+            anchor = choose_fused_player_anchor(
+                [("头部", head_detections), ("称号勋章", title_detections)],
+                previous_anchor,
+                *auxiliary_args,
+                reference_point=predicted_point,
+            )
+
+        if anchor is None and search_roi is not None and track.misses + 1 >= miss_limit:
+            # 连续局部丢失后只允许通过本人名字做全图重定位，辅助模板不得建立新身份。
+            raw_nameplate_detections, _nameplate_score, _template_name = self._detect_player_nameplate(
+                scene,
+                vision,
+                None,
+            )
+            nameplate_detections = [
+                detection
+                for detection in raw_nameplate_detections
+                if detection.identity_score is not None and detection.identity_score >= identity_threshold
+            ]
+            track.last_global_at = now
+            if nameplate_detections:
+                ordered = sorted(
+                    nameplate_detections,
+                    key=lambda detection: float(detection.identity_score or 0.0),
+                    reverse=True,
+                )
+                margin = float(vision.get("player_name_identity_margin", 0.08))
+                unambiguous = len(ordered) == 1 or (
+                    float(ordered[0].identity_score or 0.0)
+                    - float(ordered[1].identity_score or 0.0)
+                    >= margin
+                )
+                nearby_candidate = choose_fused_player_anchor(
+                    [("姓名板", [ordered[0]])] if unambiguous else [],
                     previous_anchor,
                     *anchor_args,
-                    reference_point=predicted_point if previous_anchor is not None else None,
                 )
+                if nearby_candidate is not None:
+                    anchor = nearby_candidate
+                    identity_confirmed = True
+                elif unambiguous:
+                    candidate = choose_fused_player_anchor(
+                        [("姓名板", [ordered[0]])],
+                        None,
+                        *anchor_args,
+                    )
+                    if candidate is not None:
+                        anchor = track.consider_reacquisition(
+                            candidate,
+                            int(vision.get("player_reacquire_confirm_frames", 2)),
+                            float(vision.get("player_anchor_agreement", 0.07))
+                            * max(scene_width, scene_height),
+                        )
+                        identity_confirmed = anchor is not None
 
         if anchor is not None:
             track.record(
@@ -1034,6 +1092,7 @@ class BowmanBot:
                 velocity_alpha=float(vision.get("player_velocity_alpha", 0.35)),
                 max_displacement=float(vision.get("player_anchor_max_jump", 0.18))
                 * max(scene_width, scene_height),
+                identity_confirmed=identity_confirmed,
             )
             return anchor
         track.mark_miss()

@@ -145,6 +145,11 @@ def load_config(path: Path) -> dict[str, Any]:
     config["vision"].setdefault("player_global_verify_interval_seconds", 1.5)
     config["vision"].setdefault("player_prediction_horizon_seconds", 0.2)
     config["vision"].setdefault("player_velocity_alpha", 0.35)
+    config["vision"].setdefault("player_name_identity_threshold", 0.58)
+    config["vision"].setdefault("player_name_identity_margin", 0.08)
+    config["vision"].setdefault("player_reacquire_confirm_frames", 2)
+    config["vision"].setdefault("player_occlusion_grace_seconds", 0.35)
+    config["vision"].setdefault("player_auxiliary_max_jump", 0.06)
     return config
 
 

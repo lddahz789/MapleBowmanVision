@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
 import math
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, Callable
@@ -10,6 +11,7 @@ import cv2
 import numpy as np
 
 from mbv.paths import ASSET_DIR
+
 
 def roi_pixels(shape: tuple[int, ...], roi: dict[str, float]) -> tuple[int, int, int, int]:
     height, width = shape[:2]
@@ -105,6 +107,7 @@ class Template:
     name: str
     image: np.ndarray
     foreground_mask: np.ndarray | None = None
+    anchor_offset: tuple[float, float] | None = None
     _feature_cache: dict[float, tuple[np.ndarray, np.ndarray, np.ndarray]] = field(
         default_factory=dict, repr=False, compare=False
     )
@@ -137,6 +140,8 @@ class Detection:
     box: tuple[int, int, int, int]
     score: float
     name: str
+    identity_score: float | None = None
+    anchor_offset: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +176,105 @@ def opponent_colors(image: np.ndarray) -> np.ndarray:
     return np.dstack((blue - green, red - green)).astype(np.float32)
 
 
+def nameplate_identity_mask(image: np.ndarray) -> np.ndarray:
+    """提取姓名板中亮、低饱和度的名字字形，排除共用蓝板和两端装饰。"""
+    if image.size == 0:
+        return np.zeros(image.shape[:2], dtype=np.uint8)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    _hue, saturation, value = cv2.split(hsv)
+    height, width = image.shape[:2]
+    bright_threshold = max(145, int(np.percentile(value, 82)))
+    mask = ((value >= bright_threshold) & (saturation <= 115)).astype(np.uint8) * 255
+    # 宽姓名板的两端通常是所有玩家共用的装饰；短姓名板本身已接近名字区域。
+    margin_ratio = 0.18 if width >= height * 2.1 else 0.05
+    margin_x = min(width // 3, int(round(width * margin_ratio)))
+    margin_y = min(height // 4, max(1, int(round(height * 0.06))))
+    if margin_x:
+        mask[:, :margin_x] = 0
+        mask[:, width - margin_x :] = 0
+    if margin_y:
+        mask[:margin_y, :] = 0
+        mask[height - margin_y :, :] = 0
+    return mask
+
+
+def nameplate_identity_similarity(template: np.ndarray, candidate: np.ndarray) -> float:
+    """比较姓名字形的重合度；共享蓝板本身不会贡献身份分。"""
+    if template.size == 0 or candidate.size == 0:
+        return 0.0
+    if candidate.shape[:2] != template.shape[:2]:
+        candidate = cv2.resize(candidate, (template.shape[1], template.shape[0]), interpolation=cv2.INTER_AREA)
+    expected = nameplate_identity_mask(template) > 0
+    actual = nameplate_identity_mask(candidate) > 0
+    expected_count = int(np.count_nonzero(expected))
+    if expected_count < 3 or int(np.count_nonzero(actual)) < 3:
+        return 0.0
+    best = 0.0
+    for shift_y in (-1, 0, 1):
+        for shift_x in (-1, 0, 1):
+            shifted = np.zeros_like(actual)
+            source_y1 = max(0, -shift_y)
+            source_y2 = actual.shape[0] - max(0, shift_y)
+            source_x1 = max(0, -shift_x)
+            source_x2 = actual.shape[1] - max(0, shift_x)
+            target_y1 = max(0, shift_y)
+            target_y2 = target_y1 + max(0, source_y2 - source_y1)
+            target_x1 = max(0, shift_x)
+            target_x2 = target_x1 + max(0, source_x2 - source_x1)
+            shifted[target_y1:target_y2, target_x1:target_x2] = actual[
+                source_y1:source_y2,
+                source_x1:source_x2,
+            ]
+            shifted_count = int(np.count_nonzero(shifted))
+            intersection = int(np.count_nonzero(expected & shifted))
+            score = (2.0 * intersection) / max(1, expected_count + shifted_count)
+            best = max(best, float(score))
+    return best
+
+
+def verify_nameplate_identities(
+    scene: np.ndarray,
+    detections: list[Detection],
+    templates: list[Template],
+) -> list[Detection]:
+    """在原分辨率上为姓名板候选补充名字字形分和模板脚底元数据。"""
+    by_name = {template.name: template for template in templates}
+    height, width = scene.shape[:2]
+    verified: list[Detection] = []
+    for detection in detections:
+        template = by_name.get(detection.name)
+        if template is None:
+            verified.append(replace(detection, identity_score=0.0))
+            continue
+        x, y, w, h = detection.box
+        left, top = max(0, x), max(0, y)
+        right, bottom = min(width, x + w), min(height, y + h)
+        if right - left != template.image.shape[1] or bottom - top != template.image.shape[0]:
+            score = 0.0
+        else:
+            score = nameplate_identity_similarity(template.image, scene[top:bottom, left:right])
+        verified.append(
+            replace(
+                detection,
+                identity_score=score,
+                anchor_offset=template.anchor_offset,
+            )
+        )
+    return verified
+
+
+def _load_template_anchor(path: Path) -> tuple[float, float] | None:
+    metadata_path = path.with_suffix(".anchor.json")
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        offset = payload.get("anchor_offset")
+        if payload.get("version") != 1 or not isinstance(offset, list) or len(offset) != 2:
+            return None
+        return float(offset[0]), float(offset[1])
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def load_templates(directory: Path = ASSET_DIR, *, recursive: bool = False) -> list[Template]:
     templates: list[Template] = []
     directory.mkdir(parents=True, exist_ok=True)
@@ -188,7 +292,7 @@ def load_templates(directory: Path = ASSET_DIR, *, recursive: bool = False) -> l
         if image is not None and image.shape[0] >= 4 and image.shape[1] >= 4:
             mask = alpha if alpha is not None and int(np.count_nonzero(alpha)) > 0 else template_foreground_mask(image)
             name = path.relative_to(directory).as_posix() if recursive else path.name
-            templates.append(Template(name, image, mask))
+            templates.append(Template(name, image, mask, _load_template_anchor(path)))
     return templates
 
 
@@ -452,6 +556,7 @@ def find_detections(
                     ),
                     float(result[y, x]),
                     template.name,
+                    anchor_offset=template.anchor_offset,
                 )
             )
 
@@ -524,11 +629,8 @@ def player_attack_anchor(
     player_box: tuple[int, int, int, int],
     raw_box: tuple[int, int, int, int] | None = None,
 ) -> tuple[float, float]:
-    """稳定战斗锚点：原始检测框只提供 X，三路统一后的脚底锚点提供 Y。"""
+    """稳定战斗锚点：统一定位框中心提供 X，顶边提供脚底 Y。"""
     px, feet_y, pw, _ph = player_box
-    if raw_box is not None:
-        rx, _ry, rw, _rh = raw_box
-        return rx + rw / 2.0, float(feet_y)
     return px + pw / 2.0, float(feet_y)
 
 
@@ -647,6 +749,42 @@ def choose_nearest_target(
     )
 
 
+def choose_nearest_bidirectional_target(
+    detections: list[Detection],
+    player_box: tuple[int, int, int, int] | None,
+    scene_width: int,
+    scene_height: int,
+    attack_box: dict[str, float],
+    raw_box: tuple[int, int, int, int] | None = None,
+    player_anchor: tuple[float, float] | None = None,
+) -> Detection | None:
+    """取左右两个面向索敌区的并集，供会主动向目标转身的原地攻击策略使用。"""
+    if player_box is None:
+        return None
+    player_x, player_y = player_anchor or player_anchor_center(player_box, raw_box)
+    left_rect = attack_rect_from_player(
+        (player_x, player_y),
+        scene_width,
+        scene_height,
+        attack_box,
+        "left",
+    )
+    right_rect = attack_rect_from_player(
+        (player_x, player_y),
+        scene_width,
+        scene_height,
+        attack_box,
+        "right",
+    )
+    return _choose_nearest_eligible(
+        detections,
+        player_x,
+        player_y,
+        lambda mx, my: point_in_attack_rect(mx, my, left_rect)
+        or point_in_attack_rect(mx, my, right_rect),
+    )
+
+
 def choose_nearest_same_level_target(
     detections: list[Detection],
     player_box: tuple[int, int, int, int] | None,
@@ -714,16 +852,22 @@ def player_anchor_from_detection(
     title_feet_offset: float,
 ) -> PlayerAnchor:
     x, y, w, h = detection.box
-    if source == "姓名板":
-        feet_y = y
-    elif source == "头部":
-        feet_y = y + h + int(round(float(head_feet_offset) * scene_height))
-    elif source == "称号勋章":
-        feet_y = y - int(round(float(title_feet_offset) * scene_height))
+    if detection.anchor_offset is not None:
+        anchor_x = x + float(detection.anchor_offset[0])
+        feet_y = y + int(round(float(detection.anchor_offset[1])))
     else:
-        raise ValueError(f"未知玩家定位来源：{source}")
+        anchor_x = x + w / 2.0
+        if source == "姓名板":
+            feet_y = y
+        elif source == "头部":
+            feet_y = y + h + int(round(float(head_feet_offset) * scene_height))
+        elif source == "称号勋章":
+            feet_y = y - int(round(float(title_feet_offset) * scene_height))
+        else:
+            raise ValueError(f"未知玩家定位来源：{source}")
     feet_y = max(0, min(scene_height - 1, feet_y))
-    return PlayerAnchor((x, feet_y, w, 1), detection.score, source, detection.box)
+    anchor_left = int(round(anchor_x - w / 2.0))
+    return PlayerAnchor((anchor_left, feet_y, w, 1), detection.score, source, detection.box)
 
 
 def choose_fused_player_anchor(

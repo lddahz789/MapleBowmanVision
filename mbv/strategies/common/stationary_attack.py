@@ -9,7 +9,7 @@ from mbv.strategies.base import (
     TargetSelection,
     TargetSelectionContext,
 )
-from mbv.vision import choose_nearest_target
+from mbv.vision import choose_nearest_bidirectional_target
 
 
 class StationaryAttackStrategy:
@@ -27,13 +27,12 @@ class StationaryAttackStrategy:
     default_settings: dict[str, Any] = {}
 
     def select_targets(self, context: TargetSelectionContext) -> TargetSelection:
-        target = choose_nearest_target(
+        target = choose_nearest_bidirectional_target(
             context.detections,
             context.player_box,
             context.scene_width,
             context.scene_height,
             context.target_area,
-            facing=context.facing,
             raw_box=context.player_raw_box,
             player_anchor=context.player_anchor,
         )

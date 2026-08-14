@@ -102,6 +102,27 @@ class TemplateStoreTests(unittest.TestCase):
                 self.assertEqual(recovered.read_bytes(), f"deleted-{kind}".encode())
                 recovered.resolve().relative_to(self.trash.resolve())
 
+    def test_player_template_soft_delete_moves_anchor_metadata_with_image(self):
+        roots = self._template_roots()
+        self.player.mkdir(parents=True)
+        source = self.player / "player.png"
+        metadata = source.with_suffix(".anchor.json")
+        source.write_bytes(b"player-image")
+        metadata.write_text('{"version": 1, "anchor_offset": [4.0, -8.0]}', encoding="utf-8")
+
+        recovered = trash_template(
+            "player",
+            source.name,
+            roots=roots,
+            trash_root=self.trash,
+        )
+
+        recovered_metadata = recovered.with_suffix(".anchor.json")
+        self.assertFalse(source.exists())
+        self.assertFalse(metadata.exists())
+        self.assertEqual(recovered.read_bytes(), b"player-image")
+        self.assertTrue(recovered_metadata.is_file())
+
     def test_generic_template_api_rejects_unsafe_kind_category_and_filename(self):
         roots = self._template_roots()
         self.player.mkdir(parents=True)
