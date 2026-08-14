@@ -138,6 +138,13 @@ def load_config(path: Path) -> dict[str, Any]:
     config["vision"].setdefault("monster_filter_overlap", 0.5)
     config["vision"].setdefault("player_anchor_smoothing_alpha", 0.25)
     config["vision"].setdefault("player_anchor_smoothing_snap", 0.08)
+    config["vision"].setdefault("player_local_roi_width", 0.36)
+    config["vision"].setdefault("player_local_roi_up", 0.24)
+    config["vision"].setdefault("player_local_roi_down", 0.18)
+    config["vision"].setdefault("player_local_miss_limit", 2)
+    config["vision"].setdefault("player_global_verify_interval_seconds", 1.5)
+    config["vision"].setdefault("player_prediction_horizon_seconds", 0.2)
+    config["vision"].setdefault("player_velocity_alpha", 0.35)
     return config
 
 

@@ -19,6 +19,8 @@ from mbv.paths import (
     PLAYER_HEAD_ASSET_DIR,
     PLAYER_TITLE_ASSET_DIR,
 )
+from mbv.player_tracking import PlayerTrackState
+from mbv.potion import AutoPotionController, PotionAction
 from mbv.strategies import active_strategy, missing_recognition_data, strategy_settings
 from mbv.strategies.base import StrategyActionContext, TargetSelectionContext, horizontal_overlap_ratio
 from mbv.vision import (
@@ -36,6 +38,7 @@ from mbv.vision import (
     monster_templates_for_category,
     player_attack_anchor,
     player_marker,
+    player_tracking_roi,
     roi_pixels,
     smooth_player_attack_anchor,
     suppress_monster_detections,
@@ -161,8 +164,6 @@ class BowmanBot:
         self.marker_last_seen = time.monotonic()
         self.last_target_seen = 0.0
         self.last_attack = 0.0
-        self.last_hp = 0.0
-        self.last_mp = 0.0
         self.last_jump = 0.0
         self.last_jump_attack = 0.0
         self.last_pickup = 0.0
@@ -173,6 +174,7 @@ class BowmanBot:
         self.f7_requested = threading.Event()
         self.f8_requested = threading.Event()
         self.f9_requested = threading.Event()
+        self.potion_mode_requested: bool | None = None
         self.calibration_overlay_visible = True
         self.calibration_overlay_item: str | None = None
         self.notice = ""
@@ -182,10 +184,9 @@ class BowmanBot:
         self.last_detection_name: str | None = None
         self.last_detection_at = 0.0
         self.last_detections: list[Detection] = []
-        self.last_player_anchor: PlayerAnchor | None = None
+        self.player_track = PlayerTrackState()
         self.last_attack_anchor: tuple[float, float] | None = None
-        self.last_player_at = 0.0
-        self.last_player_auxiliary_at = 0.0
+        self.auto_potion = AutoPotionController()
         self.integrity_ok = True
         self.vision_suspended = threading.Event()
         self.window: WindowInfo | None = None
@@ -385,6 +386,105 @@ class BowmanBot:
     def request_toggle(self) -> None:
         self.f8_requested.set()
 
+    def request_standalone_potion(self, enabled: bool) -> None:
+        with self.action_lock:
+            self.potion_mode_requested = bool(enabled)
+
+    def _calibration_item_complete(self, key: str) -> bool:
+        calibration = self.config.get("calibration", {})
+        items = calibration.get("items", {}) if isinstance(calibration, dict) else {}
+        if isinstance(items, dict) and key in items:
+            value = items[key]
+            return bool(value.get("complete")) if isinstance(value, dict) else bool(value)
+        return bool(calibration.get("status_regions_complete")) if isinstance(calibration, dict) else False
+
+    def _set_standalone_potion(self, window: WindowInfo, enabled: bool) -> None:
+        with self.action_lock:
+            if not enabled:
+                was_enabled = self.auto_potion.standalone_enabled
+                self.auto_potion.set_standalone_enabled(False)
+                if was_enabled:
+                    self.notify("独立自动喝药已关闭", 3.0)
+                return
+            if self.auto_potion.standalone_enabled:
+                return
+            if self.vision_suspended.is_set():
+                self.notify("采集工具打开期间不能开启独立自动喝药。", 4.0)
+                return
+            if not self.input_authorized:
+                self.notify("按键未授权，请从唯一入口 Start.bat 启动。", 5.0)
+                return
+            if not self.integrity_ok:
+                self.notify("自动喝药无法启动：助手权限低于游戏。", 5.0)
+                return
+            if not user32.IsWindow(window.hwnd) or user32.IsIconic(window.hwnd):
+                self.notify("自动喝药无法启动：游戏窗口已关闭或最小化。", 5.0)
+                return
+            missing = [
+                label
+                for key, label in (("hp_bar", "血条"), ("mp_bar", "蓝条"))
+                if not self._calibration_item_complete(key)
+            ]
+            if missing:
+                self.notify(f"自动喝药需要先采集：{'、'.join(missing)}。", 5.0)
+                return
+            self.auto_potion.set_standalone_enabled(True)
+            if int(user32.GetForegroundWindow()) != window.hwnd:
+                self.auto_potion.waiting_foreground = True
+                self.notify("独立自动喝药已开启；切回游戏窗口后生效。", 5.0)
+            else:
+                self.notify("独立自动喝药已开启；暂停挂机时仍会生效。", 5.0)
+            self.player_track = PlayerTrackState()
+            self.last_attack_anchor = None
+            self.last_detections = []
+            self.last_detection_at = 0.0
+
+    def _try_auto_potion(
+        self,
+        window: WindowInfo,
+        hp: float,
+        mp: float,
+        now: float,
+    ) -> bool:
+        standalone = not self.armed
+        if standalone and not self.auto_potion.standalone_enabled:
+            return False
+        if not self.input_authorized or not self.integrity_ok:
+            if standalone:
+                self.auto_potion.set_unavailable("权限不足")
+            return False
+        if not user32.IsWindow(window.hwnd) or user32.IsIconic(window.hwnd):
+            if standalone:
+                self.auto_potion.set_unavailable("窗口不可用")
+            return False
+        if standalone and int(user32.GetForegroundWindow()) != window.hwnd:
+            self.auto_potion.unavailable_reason = ""
+            self.auto_potion.waiting_foreground = True
+            return False
+        self.auto_potion.unavailable_reason = ""
+        self.auto_potion.waiting_foreground = False
+        action: PotionAction | None = self.auto_potion.decide(
+            hp,
+            mp,
+            now,
+            self.config["behavior"],
+            self.config["keys"],
+        )
+        if action is None:
+            return False
+        if self.armed:
+            self.stop_move()
+        self.keyboard.tap(action.key)
+        self.auto_potion.record(action, now)
+        if self.armed:
+            self.state = action.state
+        self.log.write(
+            f"{action.kind}_potion",
+            fill=round(action.fill, 3),
+            standalone=standalone,
+        )
+        return True
+
     def toggle_calibration_overlay(self) -> None:
         self.set_calibration_overlay_visible(not self.calibration_overlay_visible)
 
@@ -409,6 +509,11 @@ class BowmanBot:
         with self.action_lock:
             self.vision_suspended.set()
             self.f8_requested.clear()
+            if hasattr(self, "potion_mode_requested"):
+                self.potion_mode_requested = None
+            auto_potion = getattr(self, "auto_potion", None)
+            if auto_potion is not None:
+                auto_potion.set_standalone_enabled(False)
             if self.armed:
                 self.disarm("打开采集工具")
             self.keyboard.release_all()
@@ -439,7 +544,7 @@ class BowmanBot:
         self.last_detection_name = None
         self.last_detection_at = 0.0
         self.last_attack_anchor = None
-        self.last_player_auxiliary_at = 0.0
+        self.player_track = PlayerTrackState()
         self.log.write(
             "templates_reloaded",
             category=self.active_monster_category,
@@ -453,6 +558,11 @@ class BowmanBot:
     def apply_config(self, config: dict[str, Any]) -> None:
         with self.action_lock:
             self.f8_requested.clear()
+            if hasattr(self, "potion_mode_requested"):
+                self.potion_mode_requested = None
+            auto_potion = getattr(self, "auto_potion", None)
+            if auto_potion is not None:
+                auto_potion.set_standalone_enabled(False)
             with self.config_lock:
                 was_armed = self.armed
                 if was_armed:
@@ -471,7 +581,8 @@ class BowmanBot:
                 self.active_monster_category = str(
                     config["vision"].get("active_monster_category", "")
                 ).strip()
-                self.last_player_auxiliary_at = 0.0
+                self.player_track = PlayerTrackState()
+                self.last_attack_anchor = None
 
     def reload_from_disk(self, config_path: Path) -> None:
         self.apply_config(load_config(config_path))
@@ -632,6 +743,9 @@ class BowmanBot:
         combat_height: int = 1,
     ) -> None:
         with self.action_lock:
+            if not self.armed:
+                self._try_auto_potion(window, hp, mp, now)
+                return
             self._act(
                 window,
                 hp,
@@ -680,19 +794,7 @@ class BowmanBot:
         if marker is None and now - self.marker_last_seen >= float(behavior["max_marker_lost_seconds"]):
             self.disarm("小地图玩家标记丢失")
             return
-        if hp <= float(behavior["hp_threshold"]) and now - self.last_hp >= float(behavior["potion_cooldown_seconds"]):
-            self.stop_move()
-            self.keyboard.tap(keys["hp_potion"])
-            self.last_hp = now
-            self.state = "HP_POTION"
-            self.log.write("hp_potion", fill=round(hp, 3))
-            return
-        if mp <= float(behavior["mp_threshold"]) and now - self.last_mp >= float(behavior["potion_cooldown_seconds"]):
-            self.stop_move()
-            self.keyboard.tap(keys["mp_potion"])
-            self.last_mp = now
-            self.state = "MP_POTION"
-            self.log.write("mp_potion", fill=round(mp, 3))
+        if self._try_auto_potion(window, hp, mp, now):
             return
         decision = self.strategy.decide(
             StrategyActionContext(
@@ -747,6 +849,198 @@ class BowmanBot:
             self.stop_move()
             self.state = decision.state
 
+    def _detect_player_nameplate(
+        self,
+        scene: SceneFeatures,
+        vision: dict[str, Any],
+        search_roi: tuple[int, int, int, int] | None,
+    ) -> tuple[list[Detection], float, str | None]:
+        return find_detections(
+            scene,
+            self.player_templates,
+            float(vision.get("player_template_threshold", 0.76)),
+            float(vision.get("player_detection_scale", 0.5)),
+            max_per_template=8,
+            nms_iou=0.35,
+            max_detections=8,
+            structure_weight=0.55,
+            search_roi=search_roi,
+        )
+
+    def _detect_player_auxiliary(
+        self,
+        scene: SceneFeatures,
+        vision: dict[str, Any],
+        search_roi: tuple[int, int, int, int] | None,
+    ) -> tuple[list[Detection], float, list[Detection], float]:
+        head_detections, head_score, _head_template_name = find_detections(
+            scene,
+            self.player_head_templates,
+            float(vision.get("player_head_threshold", 0.76)),
+            float(vision.get("player_detection_scale", 0.5)),
+            max_per_template=8,
+            nms_iou=0.35,
+            max_detections=8,
+            structure_weight=0.35,
+            search_roi=search_roi,
+        )
+        title_detections, title_score, _title_template_name = find_detections(
+            scene,
+            self.player_title_templates,
+            float(vision.get("player_title_threshold", 0.70)),
+            float(vision.get("player_detection_scale", 0.5)),
+            max_per_template=8,
+            nms_iou=0.35,
+            max_detections=8,
+            structure_weight=0.55,
+            search_roi=search_roi,
+        )
+        return head_detections, head_score, title_detections, title_score
+
+    def _track_player(
+        self,
+        scene: SceneFeatures,
+        vision: dict[str, Any],
+        now: float,
+    ) -> PlayerAnchor | None:
+        """优先在预测位置附近识别玩家，定期或连续丢失时恢复全图三路定位。"""
+        # 配置热更新会原子替换 tracker；本帧始终使用同一个实例，旧结果不会回写新状态。
+        track = self.player_track
+        scene_height, scene_width = scene.scene.shape[:2]
+        player_hold = float(vision.get("player_hold_seconds", 0.8))
+        previous_anchor = track.anchor_within_hold(now, player_hold)
+        miss_limit = max(1, int(vision.get("player_local_miss_limit", 2)))
+        global_scan = previous_anchor is None or track.needs_global_scan(
+            now,
+            float(vision.get("player_global_verify_interval_seconds", 1.5)),
+            miss_limit,
+        )
+        predicted_point = track.predicted_point(
+            now,
+            float(vision.get("player_prediction_horizon_seconds", 0.2)),
+        )
+        search_roi = None
+        if not global_scan and predicted_point is not None:
+            search_roi = player_tracking_roi(
+                predicted_point,
+                scene_width,
+                scene_height,
+                float(vision.get("player_local_roi_width", 0.36)),
+                float(vision.get("player_local_roi_up", 0.24)),
+                float(vision.get("player_local_roi_down", 0.18)),
+            )
+
+        nameplate_detections, _nameplate_score, _template_name = self._detect_player_nameplate(
+            scene,
+            vision,
+            search_roi,
+        )
+        if global_scan:
+            track.last_global_at = now
+        anchor_args = (
+            scene_width,
+            scene_height,
+            float(vision.get("player_head_feet_offset", 0.07)),
+            float(vision.get("player_title_feet_offset", 0.076)),
+            float(vision.get("player_anchor_max_jump", 0.18)),
+            float(vision.get("player_anchor_agreement", 0.07)),
+        )
+        nameplate_anchor = choose_fused_player_anchor(
+            [("姓名板", nameplate_detections)],
+            previous_anchor,
+            *anchor_args,
+            reference_point=predicted_point if previous_anchor is not None else None,
+        )
+        confirmed_global_reacquisition = bool(
+            global_scan and track.misses >= miss_limit and nameplate_detections
+        )
+        run_auxiliary = should_run_player_auxiliary_detections(
+            previous_anchor,
+            nameplate_anchor,
+            now,
+            track.last_auxiliary_at,
+            float(
+                vision.get(
+                    "player_auxiliary_interval_seconds",
+                    DEFAULT_PLAYER_AUXILIARY_INTERVAL_SECONDS,
+                )
+            ),
+        ) or global_scan
+        if run_auxiliary:
+            head_detections, _head_score, title_detections, _title_score = self._detect_player_auxiliary(
+                scene,
+                vision,
+                search_roi,
+            )
+            track.last_auxiliary_at = now
+            groups = [
+                ("姓名板", nameplate_detections),
+                ("头部", head_detections),
+                ("称号勋章", title_detections),
+            ]
+            if confirmed_global_reacquisition:
+                anchor = choose_fused_player_anchor(groups, None, *anchor_args)
+            else:
+                anchor = choose_fused_player_anchor(
+                    groups,
+                    previous_anchor,
+                    *anchor_args,
+                    reference_point=predicted_point if previous_anchor is not None else None,
+                )
+        else:
+            anchor = nameplate_anchor
+
+        if anchor is None and search_roi is not None and track.misses + 1 >= miss_limit:
+            # 连续局部丢失后在同一帧升级为全图三路重定位。
+            nameplate_detections, _nameplate_score, _template_name = self._detect_player_nameplate(
+                scene,
+                vision,
+                None,
+            )
+            head_detections, _head_score, title_detections, _title_score = self._detect_player_auxiliary(
+                scene,
+                vision,
+                None,
+            )
+            track.last_global_at = now
+            track.last_auxiliary_at = now
+            if nameplate_detections:
+                # 连续丢失后解除旧位置门限，但仍保留三路投票，避免高分错误姓名板压过真实位置。
+                anchor = choose_fused_player_anchor(
+                    [
+                        ("姓名板", nameplate_detections),
+                        ("头部", head_detections),
+                        ("称号勋章", title_detections),
+                    ],
+                    None,
+                    *anchor_args,
+                )
+            else:
+                # 头部和称号更容易与其他玩家相似，仍沿用旧位置先验。
+                anchor = choose_fused_player_anchor(
+                    [
+                        ("头部", head_detections),
+                        ("称号勋章", title_detections),
+                    ],
+                    previous_anchor,
+                    *anchor_args,
+                    reference_point=predicted_point if previous_anchor is not None else None,
+                )
+
+        if anchor is not None:
+            track.record(
+                anchor,
+                now,
+                velocity_alpha=float(vision.get("player_velocity_alpha", 0.35)),
+                max_displacement=float(vision.get("player_anchor_max_jump", 0.18))
+                * max(scene_width, scene_height),
+            )
+            return anchor
+        track.mark_miss()
+        if track.misses >= miss_limit:
+            return None
+        return track.anchor_within_hold(now, player_hold)
+
     def run(self, overlay: RuntimeOverlay) -> None:
         window = find_game_window(self.config)
         self.window = window
@@ -798,6 +1092,11 @@ class BowmanBot:
                         if self.f8_requested.is_set():
                             self.f8_requested.clear()
                             self.toggle(window)
+                    with self.action_lock:
+                        potion_mode_requested = self.potion_mode_requested
+                        self.potion_mode_requested = None
+                        if potion_mode_requested is not None:
+                            self._set_standalone_potion(window, potion_mode_requested)
                     if self.f7_requested.is_set():
                         self.f7_requested.clear()
                         self.toggle_calibration_overlay()
@@ -810,6 +1109,8 @@ class BowmanBot:
                         capture_failures = 0
                     except mss.exception.ScreenShotError as exc:
                         capture_failures += 1
+                        if self.auto_potion.standalone_enabled:
+                            self.auto_potion.set_unavailable("画面不可用")
                         if capture_failures == 1 or capture_failures % 30 == 0:
                             self.log.write("capture_retry", failures=capture_failures, error=str(exc))
                         if self.armed:
@@ -835,23 +1136,30 @@ class BowmanBot:
                     if marker is not None:
                         self.marker = marker
                         self.marker_last_seen = now
+                    # 独立喝药模式只需要血蓝条；保留同一截图循环，但跳过昂贵的战斗模板匹配。
+                    lightweight_potion_only = bool(
+                        not self.armed and self.auto_potion.standalone_enabled
+                    )
                     # 四路模板检测共用同一份场景特征，避免每帧重复缩放、颜色转换和 Canny。
                     scene = SceneFeatures(combat_img)
-                    detected_monsters, detected_score, detected_name = find_detections(
-                        scene,
-                        self.templates,
-                        float(vision["monster_template_threshold"]),
-                        float(vision.get("monster_detection_scale", 1.0)),
-                    )
+                    if lightweight_potion_only:
+                        detected_monsters, detected_score, detected_name = [], -1.0, None
+                    else:
+                        detected_monsters, detected_score, detected_name = find_detections(
+                            scene,
+                            self.templates,
+                            float(vision["monster_template_threshold"]),
+                            float(vision.get("monster_detection_scale", 1.0)),
+                        )
                     raw_monster_count = len(detected_monsters)
                     hold_seconds = float(vision.get("monster_hold_seconds", 0.0))
                     held_monsters = (
                         self.last_detections
-                        if now - self.last_detection_at <= hold_seconds
+                        if not lightweight_potion_only and now - self.last_detection_at <= hold_seconds
                         else []
                     )
                     filter_sources = [*detected_monsters, *held_monsters]
-                    if self.monster_filter_templates and filter_sources:
+                    if not lightweight_potion_only and self.monster_filter_templates and filter_sources:
                         active_categories = {
                             monster_template_category(detection.name).casefold()
                             for detection in filter_sources
@@ -906,107 +1214,12 @@ class BowmanBot:
                     else:
                         monsters = detected_monsters
 
-                    player_hold = float(vision.get("player_hold_seconds", 0.8))
-                    previous_player_anchor = player_anchor_within_hold(
-                        self.last_player_anchor,
-                        self.last_player_at,
-                        now,
-                        player_hold,
+                    active_player_anchor = (
+                        None if lightweight_potion_only else self._track_player(scene, vision, now)
                     )
-                    if previous_player_anchor is None:
-                        self.last_player_anchor = None
-
-                    player_detections, player_score, _player_template_name = find_detections(
-                        scene,
-                        self.player_templates,
-                        float(vision.get("player_template_threshold", 0.76)),
-                        float(vision.get("player_detection_scale", 0.5)),
-                        max_per_template=8,
-                        nms_iou=0.35,
-                        max_detections=8,
-                        structure_weight=0.55,
-                    )
-                    player_anchor_args = (
-                        combat_img.shape[1],
-                        combat_img.shape[0],
-                        float(vision.get("player_head_feet_offset", 0.07)),
-                        float(vision.get("player_title_feet_offset", 0.076)),
-                        float(vision.get("player_anchor_max_jump", 0.18)),
-                        float(vision.get("player_anchor_agreement", 0.07)),
-                    )
-                    nameplate_anchor = choose_fused_player_anchor(
-                        [("姓名板", player_detections)],
-                        previous_player_anchor,
-                        *player_anchor_args,
-                    )
-                    run_player_auxiliary = should_run_player_auxiliary_detections(
-                        previous_player_anchor,
-                        nameplate_anchor,
-                        now,
-                        self.last_player_auxiliary_at,
-                        float(
-                            vision.get(
-                                "player_auxiliary_interval_seconds",
-                                DEFAULT_PLAYER_AUXILIARY_INTERVAL_SECONDS,
-                            )
-                        ),
-                    )
-                    if run_player_auxiliary:
-                        head_detections, head_score, _head_template_name = find_detections(
-                            scene,
-                            self.player_head_templates,
-                            float(vision.get("player_head_threshold", 0.76)),
-                            float(vision.get("player_detection_scale", 0.5)),
-                            max_per_template=8,
-                            nms_iou=0.35,
-                            max_detections=8,
-                            structure_weight=0.35,
-                        )
-                        title_detections, title_score, _title_template_name = find_detections(
-                            scene,
-                            self.player_title_templates,
-                            float(vision.get("player_title_threshold", 0.70)),
-                            float(vision.get("player_detection_scale", 0.5)),
-                            max_per_template=8,
-                            nms_iou=0.35,
-                            max_detections=8,
-                            structure_weight=0.55,
-                        )
-                        self.last_player_auxiliary_at = now
-                        player_anchor = choose_fused_player_anchor(
-                            [
-                                ("姓名板", player_detections),
-                                ("头部", head_detections),
-                                ("称号勋章", title_detections),
-                            ],
-                            previous_player_anchor,
-                            *player_anchor_args,
-                        )
-                    else:
-                        head_score = -1.0
-                        title_score = -1.0
-                        player_anchor = nameplate_anchor
-                    if player_anchor is not None:
-                        self.last_player_anchor = player_anchor
-                        self.last_player_at = now
-                    if player_anchor is not None:
-                        active_player_anchor = player_anchor
-                    elif now - self.last_player_at <= player_hold:
-                        active_player_anchor = self.last_player_anchor
-                    else:
-                        active_player_anchor = None
                     player_box = active_player_anchor.box if active_player_anchor is not None else None
                     player_source = active_player_anchor.source if active_player_anchor is not None else ""
-                    source_scores = {
-                        "姓名板": player_score,
-                        "头部": head_score,
-                        "称号勋章": title_score,
-                    }
-                    active_player_score = (
-                        active_player_anchor.score
-                        if active_player_anchor is not None
-                        else source_scores.get(player_source, -1.0)
-                    )
+                    active_player_score = active_player_anchor.score if active_player_anchor is not None else -1.0
 
                     player_raw_box = active_player_anchor.raw_box if active_player_anchor is not None else None
                     instant_attack_anchor = (
@@ -1152,7 +1365,13 @@ class BowmanBot:
                             }
                         )
                     state_label = STATE_LABELS.get(self.state, self.state)
-                    if not self.player_templates:
+                    if not self.armed and self.auto_potion.standalone_enabled:
+                        potion_state = self.auto_potion.display_state(now)
+                        banner = (
+                            f"独立喝药｜{potion_state}｜仅游戏前台发药键"
+                            "｜F8 启动挂机｜F9 / Ctrl+Shift+Q 退出"
+                        )
+                    elif not self.player_templates:
                         banner = "缺少玩家姓名板模板｜请在控制面板采集姓名板"
                     elif self.input_authorized:
                         if not self.integrity_ok:
@@ -1210,6 +1429,7 @@ class BowmanBot:
         finally:
             self.stop_hotkey_monitor()
             hotkey_thread.join(timeout=1.0)
+            self.auto_potion.set_standalone_enabled(False)
             self.disarm("程序退出")
             overlay.close()
             self.log.write("session_end")

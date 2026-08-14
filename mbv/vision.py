@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, Callable
@@ -26,6 +27,21 @@ def roi_pixels(shape: tuple[int, ...], roi: dict[str, float]) -> tuple[int, int,
 def crop(frame: np.ndarray, roi: dict[str, float]) -> tuple[np.ndarray, tuple[int, int, int, int]]:
     x, y, w, h = roi_pixels(frame.shape, roi)
     return frame[y : y + h, x : x + w], (x, y, w, h)
+
+
+def clipped_search_roi(
+    search_roi: tuple[int, int, int, int] | None,
+    shape: tuple[int, ...],
+) -> tuple[int, int, int, int] | None:
+    if search_roi is None:
+        return None
+    height, width = shape[:2]
+    x, y, w, h = (int(value) for value in search_roi)
+    left = max(0, min(width, x))
+    top = max(0, min(height, y))
+    right = max(left, min(width, x + max(0, w)))
+    bottom = max(top, min(height, y + max(0, h)))
+    return left, top, right - left, bottom - top
 
 
 def normalized_roi(selected: tuple[int, int, int, int], shape: tuple[int, ...]) -> dict[str, float]:
@@ -181,32 +197,92 @@ class SceneFeatures:
 
     def __init__(self, scene: np.ndarray) -> None:
         self.scene = scene
-        self._scaled: dict[float, np.ndarray] = {}
-        self._opponent: dict[float, np.ndarray] = {}
-        self._edges: dict[float, np.ndarray] = {}
+        self._scaled: dict[tuple[float, tuple[int, int, int, int] | None], np.ndarray] = {}
+        self._opponent: dict[tuple[float, tuple[int, int, int, int] | None], np.ndarray] = {}
+        self._edges: dict[tuple[float, tuple[int, int, int, int] | None], np.ndarray] = {}
 
-    def scaled(self, scale: float) -> np.ndarray:
-        cached = self._scaled.get(scale)
+    def _scaled_bounds(
+        self,
+        scale: float,
+        search_roi: tuple[int, int, int, int],
+    ) -> tuple[int, int, int, int]:
+        full_height, full_width = self.scaled(scale).shape[:2]
+        x, y, w, h = search_roi
+        left = max(0, min(full_width, int(math.floor(x * scale))))
+        top = max(0, min(full_height, int(math.floor(y * scale))))
+        right = max(left, min(full_width, int(math.ceil((x + w) * scale))))
+        bottom = max(top, min(full_height, int(math.ceil((y + h) * scale))))
+        return left, top, right, bottom
+
+    def scaled_origin(
+        self,
+        scale: float,
+        search_roi: tuple[int, int, int, int] | None = None,
+    ) -> tuple[int, int]:
+        clipped_roi = clipped_search_roi(search_roi, self.scene.shape)
+        if clipped_roi is None:
+            return 0, 0
+        left, top, _right, _bottom = self._scaled_bounds(scale, clipped_roi)
+        return left, top
+
+    def scaled(
+        self,
+        scale: float,
+        search_roi: tuple[int, int, int, int] | None = None,
+    ) -> np.ndarray:
+        clipped_roi = clipped_search_roi(search_roi, self.scene.shape)
+        key = (scale, clipped_roi)
+        cached = self._scaled.get(key)
         if cached is None:
-            if scale < 0.999:
+            if clipped_roi is not None:
+                full = self.scaled(scale)
+                left, top, right, bottom = self._scaled_bounds(scale, clipped_roi)
+                cached = full[top:bottom, left:right]
+            elif scale < 0.999:
                 cached = cv2.resize(self.scene, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             else:
                 cached = self.scene
-            self._scaled[scale] = cached
+            self._scaled[key] = cached
         return cached
 
-    def opponent(self, scale: float) -> np.ndarray:
-        cached = self._opponent.get(scale)
+    def opponent(
+        self,
+        scale: float,
+        search_roi: tuple[int, int, int, int] | None = None,
+    ) -> np.ndarray:
+        clipped_roi = clipped_search_roi(search_roi, self.scene.shape)
+        key = (scale, clipped_roi)
+        cached = self._opponent.get(key)
         if cached is None:
-            cached = opponent_colors(self.scaled(scale))
-            self._opponent[scale] = cached
+            full_cached = self._opponent.get((scale, None))
+            if clipped_roi is not None and full_cached is not None:
+                left, top, right, bottom = self._scaled_bounds(scale, clipped_roi)
+                cached = full_cached[top:bottom, left:right]
+            else:
+                cached = opponent_colors(self.scaled(scale, clipped_roi))
+            self._opponent[key] = cached
         return cached
 
-    def edges(self, scale: float) -> np.ndarray:
-        cached = self._edges.get(scale)
+    def edges(
+        self,
+        scale: float,
+        search_roi: tuple[int, int, int, int] | None = None,
+    ) -> np.ndarray:
+        clipped_roi = clipped_search_roi(search_roi, self.scene.shape)
+        key = (scale, clipped_roi)
+        cached = self._edges.get(key)
         if cached is None:
-            cached = cv2.Canny(cv2.cvtColor(self.scaled(scale), cv2.COLOR_BGR2GRAY), 55, 140)
-            self._edges[scale] = cached
+            full_cached = self._edges.get((scale, None))
+            if clipped_roi is not None and full_cached is not None:
+                left, top, right, bottom = self._scaled_bounds(scale, clipped_roi)
+                cached = full_cached[top:bottom, left:right]
+            else:
+                cached = cv2.Canny(
+                    cv2.cvtColor(self.scaled(scale, clipped_roi), cv2.COLOR_BGR2GRAY),
+                    55,
+                    140,
+                )
+            self._edges[key] = cached
         return cached
 
 
@@ -299,17 +375,25 @@ def find_detections(
     nms_iou: float = 0.38,
     max_detections: int = 24,
     structure_weight: float = 0.0,
+    search_roi: tuple[int, int, int, int] | None = None,
 ) -> tuple[list[Detection], float, str | None]:
     """返回画面中的全部模板目标，并通过 NMS 合并同一目标的重复框。
 
     scene 可传 SceneFeatures，让同一帧的多组检测（怪物、姓名板、头部、称号）复用场景特征。
+    search_roi 使用原场景像素坐标；局部匹配结果仍返回原场景坐标。
     """
+    if not templates:
+        return [], -1.0, None
     features = scene if isinstance(scene, SceneFeatures) else SceneFeatures(scene)
+    clipped_roi = clipped_search_roi(search_roi, features.scene.shape)
+    if clipped_roi is not None and (clipped_roi[2] <= 0 or clipped_roi[3] <= 0):
+        return [], -1.0, None
     scale = max(0.4, min(1.0, float(detection_scale)))
-    source = features.scaled(scale)
-    source_opponent = features.opponent(scale)
+    scaled_origin_x, scaled_origin_y = features.scaled_origin(scale, clipped_roi)
+    source = features.scaled(scale, clipped_roi)
+    source_opponent = features.opponent(scale, clipped_roi)
     structure_weight = max(0.0, min(0.9, float(structure_weight)))
-    source_edges = features.edges(scale) if structure_weight > 0 else None
+    source_edges = features.edges(scale, clipped_roi) if structure_weight > 0 else None
     best_score = -1.0
     best_name = None
     candidates: list[Detection] = []
@@ -361,8 +445,8 @@ def find_detections(
             candidates.append(
                 Detection(
                     (
-                        int(round(x / scale)),
-                        int(round(y / scale)),
+                        int(round((scaled_origin_x + x) / scale)),
+                        int(round((scaled_origin_y + y) / scale)),
                         template.image.shape[1],
                         template.image.shape[0],
                     ),
@@ -378,6 +462,29 @@ def find_detections(
             if len(kept) >= max_detections:
                 break
     return kept, best_score, best_name
+
+
+def player_tracking_roi(
+    point: tuple[float, float],
+    scene_width: int,
+    scene_height: int,
+    width_ratio: float = 0.36,
+    up_ratio: float = 0.24,
+    down_ratio: float = 0.18,
+) -> tuple[int, int, int, int]:
+    """围绕预测脚底点生成局部玩家搜索区，靠边时平移而不是缩小。"""
+    width = max(1, int(scene_width))
+    height = max(1, int(scene_height))
+    roi_width = min(width, max(1, int(round(width * max(0.05, min(1.0, float(width_ratio)))))))
+    up = max(1, int(round(height * max(0.02, min(1.0, float(up_ratio))))))
+    down = max(1, int(round(height * max(0.02, min(1.0, float(down_ratio))))))
+    roi_height = min(height, up + down)
+    center_x, feet_y = point
+    left = int(round(center_x - roi_width / 2.0))
+    top = int(round(feet_y - up))
+    left = max(0, min(width - roi_width, left))
+    top = max(0, min(height - roi_height, top))
+    return left, top, roi_width, roi_height
 
 
 def find_monster(
@@ -628,10 +735,15 @@ def choose_fused_player_anchor(
     title_feet_offset: float,
     max_jump: float,
     agreement_distance: float = 0.07,
+    reference_point: tuple[float, float] | None = None,
 ) -> PlayerAnchor | None:
     """融合三路锚点：先看跨来源相互支持度，再看来源优先级和上帧距离。"""
-    previous_center = None
-    if previous is not None:
+    previous_center = (
+        (float(reference_point[0]), float(reference_point[1]))
+        if reference_point is not None
+        else None
+    )
+    if previous_center is None and previous is not None:
         previous_center = (
             previous.box[0] + previous.box[2] / 2.0,
             previous.box[1],

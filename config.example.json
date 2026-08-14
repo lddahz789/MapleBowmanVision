@@ -75,7 +75,14 @@
     "player_anchor_max_jump": 0.18,
     "player_anchor_agreement": 0.07,
     "player_anchor_smoothing_alpha": 0.25,
-    "player_anchor_smoothing_snap": 0.08
+    "player_anchor_smoothing_snap": 0.08,
+    "player_local_roi_width": 0.36,
+    "player_local_roi_up": 0.24,
+    "player_local_roi_down": 0.18,
+    "player_local_miss_limit": 2,
+    "player_global_verify_interval_seconds": 1.5,
+    "player_prediction_horizon_seconds": 0.2,
+    "player_velocity_alpha": 0.35
   },
   "keys": {
     "attack": "shift",
