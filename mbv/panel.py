@@ -29,6 +29,7 @@ from mbv.calibrate import (
 from mbv.config import load_config, save_config, template_counts
 from mbv.input import input_delivery, vk_for
 from mbv.overlay import RuntimeOverlay, _exclude_from_capture, _top_level_hwnd, prevent_window_activate
+from mbv.performance import format_performance_summary
 from mbv.strategies import active_strategy, get_strategy, list_strategies
 from mbv.strategies.base import StrategyCaptureField
 from mbv.template_store import (
@@ -125,8 +126,15 @@ class ControlPanel:
         self._loading_settings = True
         self._autosave_after_id: str | None = None
         self._autosave_reconfigure = False
+        self._performance_after_id: str | None = None
+        performance_monitor = config["performance_monitor"]
+        self._performance_interval_ms = int(
+            round(float(performance_monitor["refresh_interval_seconds"]) * 1000)
+        )
         self.status = tk.StringVar(value="正在连接游戏窗口…")
         self.counts = tk.StringVar(value="")
+        self.performance_visible = tk.BooleanVar(value=bool(performance_monitor["visible"]))
+        self.performance_text = tk.StringVar(value="等待性能数据…")
         self.monster_category = tk.StringVar(value=UNCATEGORIZED_LABEL)
         self.monster_category_summary = tk.StringVar(value="")
         self._monster_category_lookup: dict[str, str] = {UNCATEGORIZED_LABEL: ""}
@@ -140,6 +148,9 @@ class ControlPanel:
         )
         self.fallback_patrol = tk.BooleanVar(value=bool(config["behavior"].get("fallback_patrol")))
         self.pickup_lost = tk.BooleanVar(value=bool(config["behavior"].get("pickup_after_target_lost")))
+        self.minimap_assist = tk.BooleanVar(
+            value=bool(config["vision"].get("player_minimap_assist_enabled", True))
+        )
         selected_strategy = active_strategy(config)
         self.profession_name = tk.StringVar(value=selected_strategy.profession)
         self.strategy_name = tk.StringVar(value=selected_strategy.display_name)
@@ -166,6 +177,7 @@ class ControlPanel:
         self.worker.start()
         self.overlay.start_polling()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
+        self._schedule_performance_refresh(delay_ms=0)
         self.root.after(250, self._tick)
 
     def _run_bot(self) -> None:
@@ -229,6 +241,8 @@ class ControlPanel:
             justify="left",
             wraplength=400,
         ).pack(fill="x", padx=14, pady=(0, 6))
+
+        self._build_performance_monitor(left_shell)
 
         scroll_shell = tk.Frame(left_shell, bg=BG)
         scroll_shell.pack(fill="both", expand=True)
@@ -504,6 +518,30 @@ class ControlPanel:
                     else lambda text, field_path=key: self._preview_common_setting(field_path, text)
                 ),
             )
+        tk.Checkbutton(
+            settings,
+            text="屏幕三路定位都丢失时，用小地图判断是否仍在原地",
+            variable=self.minimap_assist,
+            command=self._schedule_settings_save,
+            bg=PANEL,
+            fg=FG,
+            selectcolor=ENTRY_BG,
+            activebackground=PANEL,
+            activeforeground=FG,
+            font=FONT,
+            anchor="w",
+            takefocus=False,
+        ).pack(fill="x", padx=8, pady=(5, 2))
+        tk.Label(
+            settings,
+            text="与上次可靠视觉命中时的本人标记相比，2 像素内且不超过 0.2 秒会短时沿用旧位置；不会滚动续时。标记移动、丢失或多重命中会立即停用这次沿用；若屏幕视觉仍未恢复则暂停动作。",
+            bg=PANEL,
+            fg=MUTED,
+            font=FONT_SMALL,
+            wraplength=360,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=(0, 4))
         self._threshold_control(settings, self.hp_threshold_percent, "HP 自动喝药阈值")
         self._threshold_control(settings, self.mp_threshold_percent, "MP 自动喝药阈值")
         self.potion_button = tk.Checkbutton(
@@ -620,6 +658,135 @@ class ControlPanel:
         self._compact_button(footer, "保存配置", self._save_settings).pack(side="right", padx=6, pady=12, ipadx=12, ipady=7)
 
         self._refresh_strategy_choices()
+
+    def _build_performance_monitor(self, parent: tk.Misc) -> None:
+        self._performance_shell = tk.Frame(parent, bg=BG)
+        self._performance_shell.pack(fill="x", padx=14, pady=(0, 7))
+
+        self._performance_card = tk.Frame(
+            self._performance_shell,
+            bg="#0b1218",
+            highlightbackground="#263642",
+            highlightthickness=1,
+        )
+        tk.Label(
+            self._performance_card,
+            text="性能监控",
+            bg="#0b1218",
+            fg=ACCENT,
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(side="left", padx=(8, 6), pady=6)
+        tk.Label(
+            self._performance_card,
+            textvariable=self.performance_text,
+            bg="#0b1218",
+            fg=FG,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=400,
+        ).pack(side="left", fill="x", expand=True, pady=6)
+        tk.Button(
+            self._performance_card,
+            text="×",
+            command=lambda: self._set_performance_monitor_visible(False),
+            bg="#0b1218",
+            fg=MUTED,
+            activebackground=BUTTON_ACTIVE,
+            activeforeground=FG,
+            relief="flat",
+            bd=0,
+            font=FONT,
+            cursor="hand2",
+            takefocus=False,
+        ).pack(side="right", padx=(4, 6), pady=2)
+
+        self._performance_collapsed_button = tk.Button(
+            self._performance_shell,
+            text="显示性能监控",
+            command=lambda: self._set_performance_monitor_visible(True),
+            bg=BUTTON_BG,
+            fg=MUTED,
+            activebackground=BUTTON_ACTIVE,
+            activeforeground=FG,
+            relief="flat",
+            bd=0,
+            font=FONT_SMALL,
+            cursor="hand2",
+            takefocus=False,
+        )
+        self._render_performance_monitor_visibility()
+
+    def _render_performance_monitor_visibility(self) -> None:
+        self._performance_card.pack_forget()
+        self._performance_collapsed_button.pack_forget()
+        if bool(self.performance_visible.get()):
+            self._performance_card.pack(fill="x")
+        else:
+            self._performance_collapsed_button.pack(anchor="e", ipadx=6, ipady=2)
+
+    def _set_performance_monitor_visible(self, visible: bool, *, persist: bool = True) -> None:
+        self.performance_visible.set(bool(visible))
+        self._render_performance_monitor_visibility()
+        if visible:
+            self._schedule_performance_refresh(delay_ms=0)
+        else:
+            self._cancel_performance_refresh()
+        if persist:
+            self._schedule_settings_save()
+
+    def _cancel_performance_refresh(self) -> None:
+        after_id = getattr(self, "_performance_after_id", None)
+        if after_id is None:
+            return
+        self._performance_after_id = None
+        try:
+            self.root.after_cancel(after_id)
+        except tk.TclError:
+            pass
+
+    def _schedule_performance_refresh(self, *, delay_ms: int | None = None) -> None:
+        self._cancel_performance_refresh()
+        visible = getattr(self, "performance_visible", None)
+        if visible is None or not bool(visible.get()):
+            return
+        delay = self._performance_interval_ms if delay_ms is None else max(0, int(delay_ms))
+        try:
+            self._performance_after_id = self.root.after(delay, self._refresh_performance_monitor)
+        except tk.TclError:
+            self._performance_after_id = None
+
+    def _refresh_performance_monitor(self) -> None:
+        self._performance_after_id = None
+        visible = getattr(self, "performance_visible", None)
+        if visible is None or not bool(visible.get()):
+            return
+        summary = "性能数据暂不可用"
+        try:
+            performance = object.__getattribute__(self.bot, "performance")
+            snapshot_method = object.__getattribute__(performance, "snapshot")
+            if callable(snapshot_method):
+                summary = str(format_performance_summary(snapshot_method()))
+        except Exception:
+            pass
+        performance_text = getattr(self, "performance_text", None)
+        if performance_text is not None:
+            performance_text.set(summary)
+        self._schedule_performance_refresh()
+
+    def _load_performance_monitor_settings(self, config: dict[str, Any]) -> None:
+        performance_monitor = config["performance_monitor"]
+        visible = bool(performance_monitor["visible"])
+        self.performance_visible.set(visible)
+        self._performance_interval_ms = int(
+            round(float(performance_monitor["refresh_interval_seconds"]) * 1000)
+        )
+        self._render_performance_monitor_visibility()
+        if visible:
+            self._schedule_performance_refresh(delay_ms=0)
+        else:
+            self._cancel_performance_refresh()
 
     def _compact_button(
         self,
@@ -937,6 +1104,10 @@ class ControlPanel:
             self.mp_threshold_percent.set(int(round(float(config["behavior"]["mp_threshold"]) * 100)))
             self.fallback_patrol.set(bool(config["behavior"].get("fallback_patrol")))
             self.pickup_lost.set(bool(config["behavior"].get("pickup_after_target_lost")))
+            minimap_assist = getattr(self, "minimap_assist", None)
+            if minimap_assist is not None:
+                minimap_assist.set(bool(config["vision"].get("player_minimap_assist_enabled", True)))
+            self._load_performance_monitor_settings(config)
         finally:
             self._loading_settings = previous_loading
 
@@ -1818,6 +1989,15 @@ class ControlPanel:
             config["input"]["delivery"] = "background" if self.delivery.get() else "foreground"
             config.setdefault("window", {})
             config["window"]["topmost_while_armed"] = bool(self.topmost_while_armed.get())
+            performance_monitor = config.setdefault("performance_monitor", {})
+            performance_visible = getattr(self, "performance_visible", None)
+            if performance_visible is not None:
+                performance_monitor["visible"] = bool(performance_visible.get())
+            interval_ms = int(getattr(self, "_performance_interval_ms", 1000))
+            performance_monitor["refresh_interval_seconds"] = max(500, min(5000, interval_ms)) / 1000.0
+            minimap_assist = getattr(self, "minimap_assist", None)
+            if minimap_assist is not None:
+                config["vision"]["player_minimap_assist_enabled"] = bool(minimap_assist.get())
             config["behavior"]["fallback_patrol"] = bool(self.fallback_patrol.get())
             config["behavior"]["pickup_after_target_lost"] = bool(self.pickup_lost.get())
             config["behavior"]["hp_threshold"] = max(0, min(100, int(self.hp_threshold_percent.get()))) / 100.0
@@ -1834,6 +2014,7 @@ class ControlPanel:
                     "behavior.fallback_patrol",
                     "behavior.pickup_after_target_lost",
                     "window.topmost_while_armed",
+                    "vision.player_minimap_assist_enabled",
                 ):
                     self.bot.preview_config_setting(key, self._nested(config, key))
             if notify:
@@ -1847,11 +2028,13 @@ class ControlPanel:
     def quit(self) -> None:
         if not self._persist_settings(apply_runtime=False, notify=False, show_error=True):
             return
+        self._cancel_performance_refresh()
         self.bot.request_exit()
         self.overlay.close()
         self.root.after(200, self._destroy)
 
     def _destroy(self) -> None:
+        self._cancel_performance_refresh()
         self._persist_settings(apply_runtime=False, notify=False, show_error=False)
         try:
             self.root.destroy()

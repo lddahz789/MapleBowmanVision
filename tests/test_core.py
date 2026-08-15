@@ -1636,6 +1636,7 @@ class CoreTests(unittest.TestCase):
             panel.mp_threshold_percent.set(33)
             panel.fallback_patrol.set(True)
             panel.pickup_lost.set(True)
+            panel.minimap_assist.set(False)
 
             self.assertTrue(
                 panel._persist_settings(apply_runtime=False, notify=False, show_error=False)
@@ -1655,6 +1656,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(reloaded["behavior"]["mp_threshold"], 0.33)
         self.assertTrue(reloaded["behavior"]["fallback_patrol"])
         self.assertTrue(reloaded["behavior"]["pickup_after_target_lost"])
+        self.assertFalse(reloaded["vision"]["player_minimap_assist_enabled"])
 
     def test_frozen_selection_displays_and_crops_the_same_captured_frame(self):
         frame = np.arange(8 * 10 * 3, dtype=np.uint8).reshape((8, 10, 3))

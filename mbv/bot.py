@@ -19,6 +19,7 @@ from mbv.paths import (
     PLAYER_HEAD_ASSET_DIR,
     PLAYER_TITLE_ASSET_DIR,
 )
+from mbv.performance import PerformanceMonitor
 from mbv.player_tracking import PlayerTrackState
 from mbv.potion import AutoPotionController, PotionAction
 from mbv.strategies import active_strategy, missing_recognition_data, strategy_settings
@@ -38,7 +39,7 @@ from mbv.vision import (
     monster_template_category,
     monster_templates_for_category,
     player_attack_anchor,
-    player_marker,
+    player_marker_observation,
     player_tracking_roi,
     roi_pixels,
     smooth_player_attack_anchor,
@@ -173,6 +174,7 @@ class BowmanBot:
         self.player_head_templates = load_templates(PLAYER_HEAD_ASSET_DIR)
         self.player_title_templates = load_templates(PLAYER_TITLE_ASSET_DIR)
         self.log = SessionLog()
+        self.performance = PerformanceMonitor(max(2.0, float(config["capture"]["fps"])))
         self.armed = False
         self.state = "PAUSED"
         self.direction: str | None = None
@@ -524,6 +526,9 @@ class BowmanBot:
     def suspend_vision(self) -> None:
         with self.action_lock:
             self.vision_suspended.set()
+            performance = getattr(self, "performance", None)
+            if performance is not None:
+                performance.set_suspended(True)
             self.f8_requested.clear()
             if hasattr(self, "potion_mode_requested"):
                 self.potion_mode_requested = None
@@ -536,6 +541,9 @@ class BowmanBot:
 
     def resume_vision(self) -> None:
         self.vision_suspended.clear()
+        performance = getattr(self, "performance", None)
+        if performance is not None:
+            performance.set_suspended(False)
 
     def reload_templates(self) -> None:
         monster_templates = monster_templates_for_category(
@@ -926,11 +934,42 @@ class BowmanBot:
         scene: SceneFeatures,
         vision: dict[str, Any],
         now: float,
+        marker: tuple[float, float] | None = None,
+        *,
+        marker_unambiguous: bool = False,
+        marker_size: tuple[int, int] | None = None,
     ) -> PlayerAnchor | None:
-        """名字确认身份，头部/称号只做短时局部补位；看不清本人时宁可暂停。"""
+        """名字确认身份；视觉暂失时，小地图只证明旧视觉位置是否仍可短时沿用。"""
         # 配置热更新会原子替换 tracker；本帧始终使用同一个实例，旧结果不会回写新状态。
         track = self.player_track
+        had_minimap_reference = track.minimap_stationary_reference is not None
+        track.clear_minimap_evidence()
         scene_height, scene_width = scene.scene.shape[:2]
+        map_width, map_height = marker_size if marker_size is not None else (0, 0)
+        minimap_assist_enabled = bool(vision.get("player_minimap_assist_enabled", True))
+        minimap_guard_active = (
+            minimap_assist_enabled
+            and had_minimap_reference
+            and track.has_nameplate_identity()
+        )
+        stationary_anchor = None
+        if not minimap_assist_enabled and (
+            had_minimap_reference or track.minimap_stationary_blocked
+        ):
+            # 关闭开关意味着放弃这次遮挡期的证据；稍后重新开启也不能复活旧基准。
+            track.invalidate_minimap_assist()
+        elif minimap_guard_active:
+            # 始终与上次真实视觉命中的固定 marker 比较，不与上一帧滚动比较。
+            stationary_anchor = track.minimap_stationary_anchor(
+                marker,
+                now,
+                scene_width,
+                scene_height,
+                map_width,
+                map_height,
+                max_seconds=float(vision.get("player_minimap_assist_max_seconds", 0.2)),
+                marker_unambiguous=marker_unambiguous,
+            )
         player_hold = float(vision.get("player_hold_seconds", 0.8))
         previous_anchor = track.anchor_within_hold(now, player_hold)
         miss_limit = max(1, int(vision.get("player_local_miss_limit", 2)))
@@ -1032,6 +1071,7 @@ class BowmanBot:
                         int(vision.get("player_reacquire_confirm_frames", 2)),
                         float(vision.get("player_anchor_agreement", 0.07))
                         * max(scene_width, scene_height),
+                        kind="nameplate",
                     )
                     identity_confirmed = anchor is not None
         elif (
@@ -1083,6 +1123,7 @@ class BowmanBot:
                     int(vision.get("player_auxiliary_reacquire_confirm_frames", 3)),
                     float(vision.get("player_anchor_agreement", 0.07))
                     * max(scene_width, scene_height),
+                    kind="startup_aux",
                 )
                 identity_confirmed = anchor is not None
 
@@ -1131,10 +1172,13 @@ class BowmanBot:
                             int(vision.get("player_reacquire_confirm_frames", 2)),
                             float(vision.get("player_anchor_agreement", 0.07))
                             * max(scene_width, scene_height),
+                            kind="nameplate",
                         )
                         identity_confirmed = anchor is not None
 
         if anchor is not None:
+            # 当前帧已有真实视觉锚点，静止证据只保留给纯视觉丢失分支。
+            track.clear_minimap_evidence()
             track.record(
                 anchor,
                 now,
@@ -1143,8 +1187,28 @@ class BowmanBot:
                 * max(scene_width, scene_height),
                 identity_confirmed=identity_confirmed,
             )
+            if minimap_assist_enabled:
+                track.record_minimap_stationary_reference(
+                    anchor,
+                    marker,
+                    now,
+                    scene_width,
+                    scene_height,
+                    map_width,
+                    map_height,
+                    head_continuous=previous_anchor is not None,
+                    marker_unambiguous=marker_unambiguous,
+                )
             return anchor
         track.mark_miss()
+        if minimap_guard_active:
+            if stationary_anchor is not None:
+                return stationary_anchor
+            # 位移、歧义、丢失、尺寸变化或过期时立即隐藏旧锚点，不能再由通用 hold 绕过。
+            return None
+        if minimap_assist_enabled and track.minimap_stationary_blocked:
+            # 失效门禁会一直保持到真实视觉重新命中；不能在下一帧因基准已清空而复活旧 hold。
+            return None
         if track.misses >= miss_limit:
             return None
         return track.anchor_within_hold(now, player_hold)
@@ -1160,6 +1224,7 @@ class BowmanBot:
         self.keyboard.bind_window(window.hwnd)
         fps = max(2.0, float(self.config["capture"]["fps"]))
         frame_period = 1.0 / fps
+        self.performance.update_target_fps(fps)
         vision = self.config["vision"]
         print(f"游戏窗口：{window.title}（{window.width}×{window.height}）")
         print(f"已载入怪物模板：{len(self.templates)} 个")
@@ -1193,6 +1258,8 @@ class BowmanBot:
             with mss.MSS() as sct:
                 while True:
                     loop_start = time.monotonic()
+                    frame_started_ns = time.perf_counter_ns()
+                    stages_ns: dict[str, int] = {}
                     if self.f9_requested.is_set():
                         self.f9_requested.clear()
                         break
@@ -1212,11 +1279,13 @@ class BowmanBot:
                         time.sleep(0.05)
                         continue
                     vision = self.config["vision"]
+                    capture_started_ns = time.perf_counter_ns()
                     try:
                         frame = capture_client(sct, window)
                         capture_failures = 0
                     except mss.exception.ScreenShotError as exc:
                         capture_failures += 1
+                        self.performance.record_capture_failure(exc)
                         if self.auto_potion.standalone_enabled:
                             self.auto_potion.set_unavailable("画面不可用")
                         if capture_failures == 1 or capture_failures % 30 == 0:
@@ -1225,6 +1294,8 @@ class BowmanBot:
                             self.disarm("游戏画面暂时无法截取")
                         time.sleep(0.1)
                         continue
+                    stages_ns["capture"] = time.perf_counter_ns() - capture_started_ns
+                    preprocess_started_ns = time.perf_counter_ns()
                     hp_img, hp_rect = crop(frame, self.config["regions"]["hp_bar"])
                     mp_img, mp_rect = crop(frame, self.config["regions"]["mp_bar"])
                     minimap_img, minimap_rect = crop(frame, self.config["regions"]["minimap"])
@@ -1233,13 +1304,14 @@ class BowmanBot:
                     mp = bar_fill(mp_img, vision["mp_hsv_ranges"])
                     self.ui_hp = hp
                     self.ui_mp = mp
-                    marker, _mask = player_marker(
+                    marker_observation, _mask = player_marker_observation(
                         minimap_img,
                         vision["player_hsv_ranges"],
                         int(vision["player_blob_min_area"]),
                         int(vision["player_blob_max_area"]),
                         self.marker,
                     )
+                    marker = marker_observation.point
                     now = time.monotonic()
                     if marker is not None:
                         self.marker = marker
@@ -1250,6 +1322,8 @@ class BowmanBot:
                     )
                     # 四路模板检测共用同一份场景特征，避免每帧重复缩放、颜色转换和 Canny。
                     scene = SceneFeatures(combat_img)
+                    stages_ns["preprocess"] = time.perf_counter_ns() - preprocess_started_ns
+                    monster_started_ns = time.perf_counter_ns()
                     if lightweight_potion_only:
                         detected_monsters, detected_score, detected_name = [], -1.0, None
                     else:
@@ -1323,8 +1397,20 @@ class BowmanBot:
                     else:
                         monsters = detected_monsters
 
+                    if not lightweight_potion_only:
+                        stages_ns["monster"] = time.perf_counter_ns() - monster_started_ns
+                    player_started_ns = time.perf_counter_ns()
                     active_player_anchor = (
-                        None if lightweight_potion_only else self._track_player(scene, vision, now)
+                        None
+                        if lightweight_potion_only
+                        else self._track_player(
+                            scene,
+                            vision,
+                            now,
+                            marker,
+                            marker_unambiguous=marker_observation.unambiguous,
+                            marker_size=(minimap_img.shape[1], minimap_img.shape[0]),
+                        )
                     )
                     player_box = active_player_anchor.box if active_player_anchor is not None else None
                     player_source = active_player_anchor.source if active_player_anchor is not None else ""
@@ -1343,6 +1429,9 @@ class BowmanBot:
                         float(vision.get("player_anchor_smoothing_snap", 0.08))
                         * max(combat_img.shape[1], combat_img.shape[0]),
                     )
+                    if not lightweight_potion_only:
+                        stages_ns["player"] = time.perf_counter_ns() - player_started_ns
+                    targeting_started_ns = time.perf_counter_ns()
                     facing = self.direction or "right"
                     target_selection = self.strategy.select_targets(
                         TargetSelectionContext(
@@ -1377,6 +1466,8 @@ class BowmanBot:
                         if "close_overlap_threshold" in settings:
                             close_overlap_ratio = horizontal_overlap_ratio(player_box, selected_target.box)
                             close_overlap_threshold = float(settings["close_overlap_threshold"])
+                    stages_ns["targeting"] = time.perf_counter_ns() - targeting_started_ns
+                    action_started_ns = time.perf_counter_ns()
                     self.act(
                         window,
                         hp,
@@ -1390,6 +1481,8 @@ class BowmanBot:
                         now,
                         combat_height=combat_img.shape[0],
                     )
+                    stages_ns["action"] = time.perf_counter_ns() - action_started_ns
+                    hud_started_ns = time.perf_counter_ns()
                     current_window = client_window(window.hwnd, window.title)
                     monster_box = None
                     chase_screen_box = None
@@ -1466,6 +1559,8 @@ class BowmanBot:
                             }
                         )
                     state_label = STATE_LABELS.get(self.state, self.state)
+                    if player_source == "小地图静止确认":
+                        state_label = "小地图显示角色未移动（沿用上次视觉位置）"
                     if not self.armed and self.auto_potion.standalone_enabled:
                         potion_state = self.auto_potion.display_state(now)
                         banner = (
@@ -1523,10 +1618,23 @@ class BowmanBot:
                             "monster_threshold": float(vision["monster_template_threshold"]),
                         }
                     )
+                    stages_ns["hud"] = time.perf_counter_ns() - hud_started_ns
+                    frame_finished_ns = time.perf_counter_ns()
+                    self.performance.record_frame(
+                        started_ns=frame_started_ns,
+                        finished_ns=frame_finished_ns,
+                        stages_ns=stages_ns,
+                        mode="potion_only" if lightweight_potion_only else "full",
+                        target_fps=fps,
+                    )
                     elapsed = time.monotonic() - loop_start
                     if elapsed < frame_period:
                         time.sleep(frame_period - elapsed)
+        except BaseException as exc:
+            self.performance.mark_error(exc)
+            raise
         finally:
+            self.performance.stop()
             self.stop_hotkey_monitor()
             hotkey_thread.join(timeout=1.0)
             self.auto_potion.set_standalone_enabled(False)

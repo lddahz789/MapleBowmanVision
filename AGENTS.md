@@ -43,6 +43,7 @@ mbv/
   paths.py           # ROOT、assets、logs
   template_store.py  # 五类采集图片、怪物分类与可恢复删除
   config.py          # load/save、SessionLog
+  performance.py     # FPS、分段耗时、CPU/内存滚动快照
   win32.py           # ctypes、完整性级别
   input.py           # Keyboard、VK、SendInput/PostMessage
   window.py          # 找窗口、客户区截图
@@ -63,7 +64,7 @@ assets/{monsters,player,player_head,player_title}/
 
 1. `cli.main` → 默认 `panel.run_control_panel`；`--overlay-only` 则只开 HUD。
 2. 面板线程跑 `BowmanBot.run`：`mss` 截客户区 → 裁 HP/MP/小地图/战斗区。
-3. 玩家：姓名板模板优先，失败则头部、称号；多路互相校验，避免锁别人。`PlayerAnchor.box` 顶边是脚底高度，水平中心是角色 X；攻击框锚在检测框几何中心（`raw_box` 优先）。
+3. 玩家：姓名板模板优先，失败则头部、称号；姓名板和头部暂时丢失且称号也无有效位置时，小地图只用于确认本人是否仍在上次可靠视觉位置。`PlayerAnchor.box` 顶边是脚底高度，水平中心是角色 X；攻击框锚在检测框几何中心（`raw_box` 优先）。
 4. 怪物：战斗区模板匹配；当前职业策略在同一批检测结果中决定攻击、追踪或按小地图位置返回平台安全点。
 5. `input.delivery=background`：始终 `SendInput` 扫描码；失焦时额外 Post/Send 消息，且不要先松开扫描码。`foreground`：仅 SendInput，失焦停机。
 6. 挂机需要管理员完整性 ≥ 游戏（UAC）。`Start.bat` 启动时提权并授权输入，但只进入待命；必须再点“启动挂机”或按 F8 才会发键。
@@ -77,10 +78,12 @@ assets/{monsters,player,player_head,player_title}/
 - **冻结帧采集**：`capture_frozen_selection` 先截图，把帧传给 `interactive_overlay(..., frozen_frame=)`，裁切同一帧。不要改回「先框再截第二张图」。
 - **小地图标记采集**：点选时用 `magnified_roi_preview` 放大小地图，但 HSV 必须通过 `map_magnified_point` 映射回原始冻结帧，再用 `analyze_player_marker_sample` 提取点击附近的连续亮色并做唯一性验证；不得直接从插值预览或固定 `5×5` 背景中位数取色。保存采集位置供首帧消歧。
 - **姓名板身份去重与遮挡补位**：名字字形阈值只使用模板 Alpha 有效区；多模板候选先分别保留并计算身份分，再用 `deduplicate_nameplate_detections` 跨模板去重。不得让身份无效但原始相关分较高的模板提前压掉有效模板。姓名板已确认本人后，头部/称号可在预测位置和辅助最大位移约束内连续续跟踪。首次或完全丢失时，普通辅助命中不得认人；只有达到 `player_auxiliary_identity_threshold` 且连续多帧位置一致的辅助模板才可建立受限身份。
+- **小地图静止确认**：以最近一次可靠姓名板命中，或姓名板身份已建立后的连续头部命中，固定记录 `(唯一实时小地图标记, 视觉 PlayerAnchor, 小地图尺寸)`；不得与上一帧滚动比较，配置初始标记、称号及仅靠辅助模板建立的启动身份都不能建基准。两路视觉暂失且称号也无有效位置时，当前标记距固定基准不超过 2 像素且不超过 0.2 秒，才可返回 `小地图静止确认` 锚点；该返回不得调用 `track.record()`、刷新身份/视觉时间、速度或基准。移动、缺失、多候选、尺寸变化或超时必须同帧清基准并阻断通用 hold，移动后回原点也不能复活。
 - **职业策略**：策略只放 `mbv/strategies/`，必须实现注册元数据、目标选择和动作决策；不得在 `mbv/bot.py` 增加按职业分支。完整规范见 `STRATEGIES.md`。
 - **通用索敌区**：所有职业策略共享 `targeting.box.{forward,back,up,down}`，相对稳定战斗锚点并随朝向翻转。不得把索敌框放回某个职业的策略设置；旧策略/`behavior.bow_attack_box` 只用于一次性兼容迁移。
 - **独立校准**：战斗识别区与小地图平台安全点相互独立。`capture_platform_center` 必须像玩家标记采集一样放大小地图并映射回原始冻结帧，坐标相对小地图内部归一化且写入 `platform_center_space=minimap`；重采小地图会使玩家标记和平台安全点失效，重采战斗区不得使平台安全点失效。旧战斗画面平台中心不能换算，必须要求重采。
 - **Debug 框 / F7**：`BowmanBot.set_calibration_overlay_visible` / `toggle_calibration_overlay`；HUD 用 `overlay_draw_plan`。与采集时 `overlay.hide()` 独立。
+- **性能监控**：视觉 worker 每个成功帧只向 `PerformanceMonitor` 提交一次聚合数据；Tk 主线程低频读取冻结快照。整帧耗时不含末尾 FPS 节流，轻量喝药未执行的检测阶段不得补零，禁止从 worker 直接更新 Tk。
 - **面板不抢焦点**：`prevent_window_activate` 只设 `WS_EX_NOACTIVATE`。
 - **配置持久化**：挂机配置的鼠标控件要自动写入个人 `config.json`；`ControlPanel.quit/_destroy` 退出前再调用统一 `_persist_settings`。新增策略参数不能只改运行内存或 Entry。
 - **配置**：`load_config` 要求 `version == 1`，并补输入、识别锚点和 `strategy`；旧弓箭框迁移只能缩放一次。
@@ -111,6 +114,7 @@ Start.bat
 | 校准、采模板、冻结帧 | `mbv/calibrate.py`、`mbv/overlay.py` |
 | HUD 颜色、Debug 框、F7 | `mbv/overlay.py`、`mbv/bot.py`、`mbv/panel.py` |
 | 面板按钮、配置项 | `mbv/panel.py` |
+| FPS、耗时、CPU/内存性能监控 | `mbv/performance.py`、`mbv/bot.py`、`mbv/panel.py` |
 | 公共安全、补药、动作执行 | `mbv/bot.py` |
 | 职业目标选择、回位、攻击/巡逻决策 | `mbv/strategies/`、`STRATEGIES.md` |
 | 启动参数 | `mbv/cli.py` |

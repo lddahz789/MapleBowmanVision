@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -73,6 +74,19 @@ def load_config(path: Path) -> dict[str, Any]:
         raise RuntimeError("不支持的配置文件版本")
     config.setdefault("window", {})
     config["window"].setdefault("topmost_while_armed", True)
+    performance_monitor = config.get("performance_monitor")
+    if not isinstance(performance_monitor, dict):
+        performance_monitor = {}
+        config["performance_monitor"] = performance_monitor
+    if not isinstance(performance_monitor.get("visible"), bool):
+        performance_monitor["visible"] = True
+    try:
+        refresh_interval = float(performance_monitor.get("refresh_interval_seconds", 1.0))
+    except (TypeError, ValueError):
+        refresh_interval = 1.0
+    if refresh_interval != refresh_interval:  # NaN
+        refresh_interval = 1.0
+    performance_monitor["refresh_interval_seconds"] = max(0.5, min(5.0, refresh_interval))
     config.setdefault("input", {})
     config["input"].setdefault("delivery", "foreground")
     input_delivery(config)
@@ -165,6 +179,21 @@ def load_config(path: Path) -> dict[str, Any]:
     config["vision"].setdefault("player_auxiliary_max_jump", 0.06)
     config["vision"].setdefault("player_auxiliary_identity_threshold", 0.90)
     config["vision"].setdefault("player_auxiliary_reacquire_confirm_frames", 3)
+    if not isinstance(config["vision"].get("player_minimap_assist_enabled"), bool):
+        config["vision"]["player_minimap_assist_enabled"] = True
+    raw_minimap_assist_seconds = config["vision"].get("player_minimap_assist_max_seconds", 0.2)
+    try:
+        if isinstance(raw_minimap_assist_seconds, bool):
+            raise TypeError
+        minimap_assist_seconds = float(raw_minimap_assist_seconds)
+    except (TypeError, ValueError):
+        minimap_assist_seconds = 0.2
+    if not math.isfinite(minimap_assist_seconds):
+        minimap_assist_seconds = 0.2
+    config["vision"]["player_minimap_assist_max_seconds"] = max(
+        0.1,
+        min(0.2, minimap_assist_seconds),
+    )
     return config
 
 

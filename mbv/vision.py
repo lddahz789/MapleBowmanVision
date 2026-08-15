@@ -76,13 +76,27 @@ def bar_fill(image: np.ndarray, ranges: list[dict[str, list[int]]]) -> float:
     return float(np.mean(column_coverage >= 0.28))
 
 
-def player_marker(
+@dataclass(frozen=True)
+class PlayerMarkerObservation:
+    """小地图玩家色块的本帧观测；候选不唯一时不得用于屏幕位置辅助。"""
+
+    point: tuple[float, float] | None
+    candidate_count: int
+    distance_from_previous: float | None
+
+    @property
+    def unambiguous(self) -> bool:
+        return self.point is not None and self.candidate_count == 1
+
+
+def player_marker_observation(
     image: np.ndarray,
     ranges: list[dict[str, list[int]]],
     min_area: int,
     max_area: int,
     previous: tuple[float, float] | None,
-) -> tuple[tuple[float, float] | None, np.ndarray]:
+) -> tuple[PlayerMarkerObservation, np.ndarray]:
+    """返回玩家标记及候选数量，保留原有按上一位置消歧的显示行为。"""
     mask = hsv_mask(image, ranges)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
     count, _labels, stats, centers = cv2.connectedComponentsWithStats(mask, 8)
@@ -94,12 +108,34 @@ def player_marker(
             cx, cy = centers[index]
             choices.append((float(cx / width), float(cy / height), area))
     if not choices:
-        return None, mask
+        return PlayerMarkerObservation(None, 0, None), mask
     if previous is None:
         chosen = max(choices, key=lambda item: item[2])
+        distance = None
     else:
-        chosen = min(choices, key=lambda item: (item[0] - previous[0]) ** 2 + (item[1] - previous[1]) ** 2)
-    return (chosen[0], chosen[1]), mask
+        chosen = min(
+            choices,
+            key=lambda item: (item[0] - previous[0]) ** 2 + (item[1] - previous[1]) ** 2,
+        )
+        distance = math.hypot(chosen[0] - previous[0], chosen[1] - previous[1])
+    return PlayerMarkerObservation((chosen[0], chosen[1]), len(choices), distance), mask
+
+
+def player_marker(
+    image: np.ndarray,
+    ranges: list[dict[str, list[int]]],
+    min_area: int,
+    max_area: int,
+    previous: tuple[float, float] | None,
+) -> tuple[tuple[float, float] | None, np.ndarray]:
+    observation, mask = player_marker_observation(
+        image,
+        ranges,
+        min_area,
+        max_area,
+        previous,
+    )
+    return observation.point, mask
 
 
 @dataclass

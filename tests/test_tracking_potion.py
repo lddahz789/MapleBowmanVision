@@ -541,6 +541,8 @@ class PlayerTrackingTests(unittest.TestCase):
             "player_auxiliary_max_jump",
             "player_auxiliary_identity_threshold",
             "player_auxiliary_reacquire_confirm_frames",
+            "player_minimap_assist_enabled",
+            "player_minimap_assist_max_seconds",
         ):
             config["vision"].pop(key, None)
         with TemporaryDirectory() as temporary:
@@ -555,6 +557,8 @@ class PlayerTrackingTests(unittest.TestCase):
         self.assertEqual(loaded["vision"]["player_name_identity_threshold"], 0.50)
         self.assertEqual(loaded["vision"]["player_auxiliary_identity_threshold"], 0.90)
         self.assertEqual(loaded["vision"]["player_auxiliary_reacquire_confirm_frames"], 3)
+        self.assertTrue(loaded["vision"]["player_minimap_assist_enabled"])
+        self.assertEqual(loaded["vision"]["player_minimap_assist_max_seconds"], 0.2)
 
 
 class AutoPotionTests(unittest.TestCase):

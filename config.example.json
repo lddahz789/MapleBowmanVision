@@ -19,6 +19,10 @@
     "fps": 12,
     "preview_scale": 0.5
   },
+  "performance_monitor": {
+    "visible": true,
+    "refresh_interval_seconds": 1.0
+  },
   "regions": {
     "hp_bar": {"x": 0.0, "y": 0.0, "w": 0.1, "h": 0.05},
     "mp_bar": {"x": 0.1, "y": 0.0, "w": 0.1, "h": 0.05},
@@ -90,7 +94,9 @@
     "player_reacquire_confirm_frames": 2,
     "player_auxiliary_max_jump": 0.06,
     "player_auxiliary_identity_threshold": 0.9,
-    "player_auxiliary_reacquire_confirm_frames": 3
+    "player_auxiliary_reacquire_confirm_frames": 3,
+    "player_minimap_assist_enabled": true,
+    "player_minimap_assist_max_seconds": 0.2
   },
   "keys": {
     "attack": "shift",

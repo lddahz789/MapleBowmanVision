@@ -376,15 +376,20 @@ class RuntimeOverlay:
         player_box = state.get("player_box")
         if player_box and debug_item_enabled(state, "player"):
             x, y, w, h = player_box
-            canvas.create_rectangle(x, y, x + w, y + h, outline="#00e5ff", width=3)
             player_score = float(state.get("player_score", -1))
             player_source = str(state.get("player_source", "玩家定位"))
+            stationary = player_source == "小地图静止确认"
+            player_color = "#ffb347" if stationary else "#00e5ff"
+            rectangle_options = {"outline": player_color, "width": 3}
+            if stationary:
+                rectangle_options["dash"] = (4, 3)
+            canvas.create_rectangle(x, y, x + w, y + h, **rectangle_options)
             canvas.create_text(
                 x,
                 max(35, y - 20),
                 anchor="nw",
                 text=f"玩家·{player_source} {player_score:.2f}" if player_score >= 0 else f"玩家·{player_source}",
-                fill="#00e5ff",
+                fill=player_color,
                 font=font,
             )
 
