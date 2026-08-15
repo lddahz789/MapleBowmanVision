@@ -24,6 +24,7 @@ from mbv.calibrate import (
     capture_player_aux_template,
     capture_player_template,
     capture_recognition_region,
+    capture_strategy_region,
     capture_template,
 )
 from mbv.config import load_config, save_config, template_counts
@@ -148,6 +149,9 @@ class ControlPanel:
         )
         self.fallback_patrol = tk.BooleanVar(value=bool(config["behavior"].get("fallback_patrol")))
         self.pickup_lost = tk.BooleanVar(value=bool(config["behavior"].get("pickup_after_target_lost")))
+        self.player_lost_recovery = tk.BooleanVar(
+            value=bool(config["behavior"].get("player_lost_recovery_enabled", True))
+        )
         self.minimap_assist = tk.BooleanVar(
             value=bool(config["vision"].get("player_minimap_assist_enabled", True))
         )
@@ -164,9 +168,11 @@ class ControlPanel:
         self._targeting_entries: dict[str, tk.Entry] = {}
         self._strategy_entries: dict[str, tk.Entry] = {}
         self._strategy_toggles: dict[str, tk.BooleanVar] = {}
+        self._strategy_choices: dict[str, tuple[tk.StringVar, dict[str, str]]] = {}
         self._capture_status_vars: dict[str, tk.StringVar] = {}
         self._capture_status_labels: dict[str, tk.Label] = {}
         self._capture_buttons: dict[str, tk.Button] = {}
+        self._debug_item_buttons: dict[str, tuple[tk.Button, str]] = {}
         self._build()
         self._refresh_counts()
         self._load_entries(config)
@@ -378,6 +384,13 @@ class ControlPanel:
             "管理怪物模板",
             lambda: self._manage_templates("monster"),
         ).pack(side="left", fill="x", expand=True, padx=(2, 0))
+        monster_debug_button = self._compact_button(
+            capture,
+            "怪物框：开",
+            lambda: self._show_capture_item("怪物识别", "monster"),
+        )
+        monster_debug_button.pack(fill="x", padx=8, pady=2, ipady=2)
+        self._debug_item_buttons["monster"] = (monster_debug_button, "怪物框")
         tk.Label(
             capture,
             textvariable=self.monster_category_summary,
@@ -498,6 +511,7 @@ class ControlPanel:
             ("keys.hp_potion", "HP 药键", None, None, None),
             ("keys.mp_potion", "MP 药键", None, None, None),
             ("behavior.attack_interval_seconds", "攻击间隔秒", 0.01, 0.01, 10.0),
+            ("behavior.player_lost_move_seconds", "姓名板丢失单向位移秒", 0.05, 0.05, 2.0),
             ("behavior.max_runtime_minutes", "最长运行分钟，0=不限", 1.0, 0.0, 10080.0),
             ("vision.monster_template_threshold", "怪物识别阈值", 0.01, 0.0, 1.0),
             ("vision.monster_structure_weight", "怪物轮廓权重", 0.05, 0.0, 0.9),
@@ -519,6 +533,20 @@ class ControlPanel:
                     else lambda text, field_path=key: self._preview_common_setting(field_path, text)
                 ),
             )
+        tk.Checkbutton(
+            settings,
+            text="姓名板丢失时交替左右位移",
+            variable=self.player_lost_recovery,
+            command=self._schedule_settings_save,
+            bg=PANEL,
+            fg=FG,
+            selectcolor=ENTRY_BG,
+            activebackground=PANEL,
+            activeforeground=FG,
+            font=FONT,
+            anchor="w",
+            takefocus=False,
+        ).pack(fill="x", padx=8, pady=(5, 2))
         tk.Checkbutton(
             settings,
             text="屏幕三路定位都丢失时，用小地图判断是否仍在原地",
@@ -613,7 +641,7 @@ class ControlPanel:
         ).pack(fill="x", padx=8, pady=2)
         tk.Label(
             self._content,
-            text="F7 显隐 Debug 框｜F8 启动/暂停｜F9 或 Ctrl+Shift+Q 退出。每个采集项独立保存，失败时只需重采当前项。",
+            text="F7 总开关 Debug 框｜各区域按钮可独立控制对应框｜F8 启动/暂停｜F9 或 Ctrl+Shift+Q 退出。",
             bg=BG,
             fg=MUTED,
             font=FONT_SMALL,
@@ -843,6 +871,7 @@ class ControlPanel:
         button.pack(side="right", padx=5, pady=4, ipadx=5)
         if show:
             show_button.pack(side="right", padx=(2, 0), pady=4, ipadx=3)
+            self._debug_item_buttons[key] = (show_button, "框")
         self._capture_buttons[key] = button
         return button
 
@@ -850,8 +879,27 @@ class ControlPanel:
         command()
 
     def _show_capture_item(self, label: str, key: str) -> None:
-        self.debug_boxes.set(True)
-        self.bot.set_calibration_overlay_item(key)
+        visible = self.bot.toggle_calibration_overlay_item(key)
+        self.debug_boxes.set(self.bot.calibration_overlay_visible)
+        self._refresh_debug_item_buttons()
+        self.bot.notify(f"{label} Debug 框已{'开启' if visible else '关闭'}", 2.0)
+
+    def _refresh_debug_item_buttons(self) -> None:
+        stale: list[str] = []
+        for key, (button, label) in self._debug_item_buttons.items():
+            try:
+                visible = self.bot.calibration_overlay_item_visible(key)
+                button.configure(
+                    text=f"{label}：{'开' if visible else '关'}",
+                    bg="#12313b" if visible else BUTTON_BG,
+                    fg=ACCENT if visible else MUTED,
+                    activebackground="#194858" if visible else BUTTON_ACTIVE,
+                    activeforeground=ACCENT if visible else FG,
+                )
+            except tk.TclError:
+                stale.append(key)
+        for key in stale:
+            self._debug_item_buttons.pop(key, None)
 
     def _refresh_strategy_choices(self) -> None:
         profession = self.profession_name.get()
@@ -1105,6 +1153,9 @@ class ControlPanel:
             self.mp_threshold_percent.set(int(round(float(config["behavior"]["mp_threshold"]) * 100)))
             self.fallback_patrol.set(bool(config["behavior"].get("fallback_patrol")))
             self.pickup_lost.set(bool(config["behavior"].get("pickup_after_target_lost")))
+            self.player_lost_recovery.set(
+                bool(config["behavior"].get("player_lost_recovery_enabled", True))
+            )
             minimap_assist = getattr(self, "minimap_assist", None)
             if minimap_assist is not None:
                 minimap_assist.set(bool(config["vision"].get("player_minimap_assist_enabled", True)))
@@ -1119,10 +1170,14 @@ class ControlPanel:
         return get_strategy(key)
 
     def _render_strategy_settings(self, config: dict[str, Any]) -> None:
+        for item in list_strategies():
+            for field in item.capture_fields:
+                self._debug_item_buttons.pop(field.recognition_key, None)
         for child in self.strategy_settings_body.winfo_children():
             child.destroy()
         self._strategy_entries.clear()
         self._strategy_toggles.clear()
+        self._strategy_choices.clear()
         strategy = self._selected_strategy()
         self.strategy_description.set(strategy.description)
         prefix = f"strategy.options.{strategy.key}."
@@ -1174,12 +1229,236 @@ class ControlPanel:
                 maximum=field.maximum,
                 on_adjust=lambda text, path=field.path: self._preview_strategy_setting(path, text),
             )
+        for field in strategy.choice_fields:
+            row = tk.Frame(self.strategy_settings_body, bg=PANEL)
+            row.pack(fill="x", padx=8, pady=2)
+            tk.Label(
+                row,
+                text=field.label,
+                bg=PANEL,
+                fg=MUTED,
+                font=FONT_SMALL,
+                width=18,
+                anchor="w",
+            ).pack(side="left")
+            value_to_label = dict(field.choices)
+            label_to_value = {label: value for value, label in field.choices}
+            selected_value = str(self._nested(config, prefix + field.path))
+            variable = tk.StringVar(value=value_to_label.get(selected_value, selected_value))
+            combo = ttk.Combobox(
+                row,
+                textvariable=variable,
+                state="readonly",
+                values=list(label_to_value),
+                font=FONT,
+            )
+            combo.pack(side="right", fill="x", expand=True)
+            combo.bind(
+                "<<ComboboxSelected>>",
+                lambda _event, path=field.path, selected=variable, choices=label_to_value:
+                    self._preview_strategy_choice(path, selected, choices),
+            )
+            self._strategy_choices[prefix + field.path] = (variable, label_to_value)
         for field in strategy.capture_fields:
-            self._row_button(
-                self.strategy_settings_body,
+            row = tk.Frame(self.strategy_settings_body, bg=PANEL)
+            row.pack(fill="x", padx=8, pady=3)
+            capture_button = self._compact_button(
+                row,
                 field.button_label,
                 lambda selected=field: self._capture_strategy_area(selected),
             )
+            capture_button.pack(side="left", fill="x", expand=True, ipady=3)
+            debug_button = self._compact_button(
+                row,
+                "框：开",
+                lambda selected=field: self._show_capture_item(
+                    selected.debug_label,
+                    selected.recognition_key,
+                ),
+            )
+            debug_button.pack(side="right", padx=(5, 0), ipadx=4, ipady=3)
+            self._debug_item_buttons[field.recognition_key] = (debug_button, "框")
+            if field.multiple and field.settings_path:
+                self._render_strategy_regions(config, strategy.key, field)
+        self._refresh_debug_item_buttons()
+
+    def _render_strategy_regions(
+        self,
+        config: dict[str, Any],
+        strategy_key: str,
+        field: StrategyCaptureField,
+    ) -> None:
+        if not field.settings_path:
+            return
+        raw_regions = self._nested(
+            config,
+            f"strategy.options.{strategy_key}.{field.settings_path}",
+        )
+        regions = raw_regions if isinstance(raw_regions, list) else []
+        if not regions:
+            tk.Label(
+                self.strategy_settings_body,
+                text="尚未框选索敌区；启用此功能后至少需要一个已启用区域。",
+                bg=PANEL,
+                fg=WARNING,
+                font=FONT_SMALL,
+                anchor="w",
+                wraplength=500,
+            ).pack(fill="x", padx=12, pady=(0, 4))
+            return
+        for index, region in enumerate(regions, start=1):
+            if not isinstance(region, dict):
+                continue
+            region_id = str(region.get("id", f"region_{index}"))
+            card = tk.Frame(
+                self.strategy_settings_body,
+                bg="#0b1218",
+                highlightbackground="#263642",
+                highlightthickness=1,
+            )
+            card.pack(fill="x", padx=8, pady=2)
+            enabled = tk.BooleanVar(value=bool(region.get("enabled", True)))
+            tk.Checkbutton(
+                card,
+                text=str(region.get("name", "")).strip() or f"索敌区 {index}",
+                variable=enabled,
+                command=lambda selected=enabled, selected_id=region_id, selected_key=strategy_key, selected_field=field:
+                    self._update_strategy_region(
+                        selected_key,
+                        selected_field,
+                        selected_id,
+                        enabled=bool(selected.get()),
+                    ),
+                bg="#0b1218",
+                fg=FG,
+                selectcolor=ENTRY_BG,
+                activebackground="#0b1218",
+                activeforeground=FG,
+                font=FONT,
+                anchor="w",
+            ).pack(side="left", fill="x", expand=True, padx=(6, 2), pady=4)
+            tk.Label(
+                card,
+                text=f"优先级 {int(region.get('priority', index))}",
+                bg="#0b1218",
+                fg=MUTED,
+                font=FONT_SMALL,
+            ).pack(side="left", padx=3)
+            for label, command in (
+                (
+                    "改名",
+                    lambda selected_id=region_id, selected_key=strategy_key, selected_field=field:
+                        self._rename_strategy_region(selected_key, selected_field, selected_id),
+                ),
+                (
+                    "优先级",
+                    lambda selected_id=region_id, selected_key=strategy_key, selected_field=field:
+                        self._change_strategy_region_priority(selected_key, selected_field, selected_id),
+                ),
+                (
+                    "重框",
+                    lambda selected_id=region_id, selected_field=field:
+                        self._capture_strategy_area(selected_field, selected_id),
+                ),
+                (
+                    "删除",
+                    lambda selected_id=region_id, selected_key=strategy_key, selected_field=field:
+                        self._delete_strategy_region(selected_key, selected_field, selected_id),
+                ),
+            ):
+                self._compact_button(card, label, command).pack(side="left", padx=2, pady=3, ipadx=2)
+
+    def _update_strategy_region(
+        self,
+        strategy_key: str,
+        field: StrategyCaptureField,
+        region_id: str,
+        **updates: Any,
+    ) -> None:
+        if not field.settings_path:
+            return
+        config = load_config(self.config_path)
+        regions = self._nested(
+            config,
+            f"strategy.options.{strategy_key}.{field.settings_path}",
+        )
+        if not isinstance(regions, list):
+            return
+        for region in regions:
+            if isinstance(region, dict) and str(region.get("id")) == region_id:
+                region.update(updates)
+                break
+        save_config(self.config_path, config)
+        if strategy_key == self.bot.strategy.key:
+            self.bot.apply_config(config)
+        self._load_entries(config)
+
+    def _rename_strategy_region(
+        self,
+        strategy_key: str,
+        field: StrategyCaptureField,
+        region_id: str,
+    ) -> None:
+        name = simpledialog.askstring("重命名索敌区", "输入索敌区名称：", parent=self.root)
+        if name is not None and name.strip():
+            self._update_strategy_region(strategy_key, field, region_id, name=name.strip())
+
+    def _change_strategy_region_priority(
+        self,
+        strategy_key: str,
+        field: StrategyCaptureField,
+        region_id: str,
+    ) -> None:
+        priority = simpledialog.askinteger(
+            "调整索敌区优先级",
+            "输入 0～999；数值越小越优先：",
+            parent=self.root,
+            minvalue=0,
+            maxvalue=999,
+        )
+        if priority is not None:
+            self._update_strategy_region(strategy_key, field, region_id, priority=int(priority))
+
+    def _delete_strategy_region(
+        self,
+        strategy_key: str,
+        field: StrategyCaptureField,
+        region_id: str,
+    ) -> None:
+        if not field.settings_path or not messagebox.askyesno(
+            "删除索敌区",
+            "确定删除这个标飞索敌区吗？",
+            parent=self.root,
+        ):
+            return
+        config = load_config(self.config_path)
+        regions = self._nested(
+            config,
+            f"strategy.options.{strategy_key}.{field.settings_path}",
+        )
+        if not isinstance(regions, list):
+            return
+        remaining = [
+            region
+            for region in regions
+            if not isinstance(region, dict) or str(region.get("id")) != region_id
+        ]
+        self._nested(
+            config,
+            f"strategy.options.{strategy_key}.{field.settings_path}",
+            remaining,
+        )
+        if not remaining:
+            item = config.setdefault("calibration", {}).setdefault("items", {}).setdefault(
+                field.recognition_key,
+                {},
+            )
+            if isinstance(item, dict):
+                item["complete"] = False
+        save_config(self.config_path, config)
+        if strategy_key == self.bot.strategy.key:
+            self.bot.apply_config(config)
+        self._load_entries(config)
 
     def _strategy_changed(self, _event: tk.Event | None = None) -> None:
         try:
@@ -1212,6 +1491,22 @@ class ControlPanel:
         value = bool(variable.get())
         config = load_config(self.config_path)
         self._nested(config, f"strategy.options.{strategy.key}.{path}", value)
+        save_config(self.config_path, config)
+        if strategy.key == self.bot.strategy.key:
+            self.bot.apply_config(config)
+
+    def _preview_strategy_choice(
+        self,
+        path: str,
+        variable: tk.StringVar,
+        choices: dict[str, str],
+    ) -> None:
+        strategy = self._selected_strategy()
+        label = variable.get()
+        if label not in choices:
+            return
+        config = load_config(self.config_path)
+        self._nested(config, f"strategy.options.{strategy.key}.{path}", choices[label])
         save_config(self.config_path, config)
         if strategy.key == self.bot.strategy.key:
             self.bot.apply_config(config)
@@ -1752,14 +2047,17 @@ class ControlPanel:
             color = ACCENT
             self.arm_button.configure(text="启动挂机")
         self.debug_boxes.set(self.bot.calibration_overlay_visible)
-        debug_item = getattr(self.bot, "calibration_overlay_item", None)
-        debug_mode = "单项" if self.bot.calibration_overlay_visible and debug_item else (
-            "全部" if self.bot.calibration_overlay_visible else "关"
+        hidden_items = getattr(self.bot, "calibration_overlay_hidden_items", frozenset())
+        debug_mode = (
+            "关"
+            if not self.bot.calibration_overlay_visible
+            else ("全部" if not hidden_items else "按需")
         )
         self.debug_button.configure(
             text=f"显示 Debug 框：{debug_mode}",
             fg=ACCENT if self.bot.calibration_overlay_visible else MUTED,
         )
+        self._refresh_debug_item_buttons()
         potion_enabled = self.bot.auto_potion.standalone_enabled
         potion_state = self.bot.auto_potion.display_state(now)
         self.standalone_potion.set(potion_enabled)
@@ -1887,16 +2185,43 @@ class ControlPanel:
             action,
         )
 
-    def _capture_strategy_area(self, field: StrategyCaptureField) -> None:
+    def _capture_strategy_area(
+        self,
+        field: StrategyCaptureField,
+        region_id: str | None = None,
+    ) -> None:
         strategy = self._selected_strategy()
+        player_box = None
+        raw_box = None
+        player_track = getattr(self.bot, "player_track", None)
+        anchor = player_track.anchor if player_track is not None else None
+        if anchor is not None:
+            player_box = anchor.box
+            raw_box = anchor.raw_box
+        stable_anchor = self.bot.last_attack_anchor
 
         def action() -> None:
-            capture_strategy_area(
-                self.config_path,
-                field.recognition_key,
-                field.prompt,
-                parent=self.root,
-            )
+            if field.multiple and field.settings_path:
+                capture_strategy_region(
+                    self.config_path,
+                    strategy.key,
+                    field.settings_path,
+                    field.recognition_key,
+                    field.prompt,
+                    parent=self.root,
+                    region_id=region_id,
+                    player_box=player_box,
+                    raw_box=raw_box,
+                    player_anchor=stable_anchor,
+                )
+            else:
+                capture_strategy_area(
+                    self.config_path,
+                    field.recognition_key,
+                    field.prompt,
+                    parent=self.root,
+                    coordinate_space=field.coordinate_space,
+                )
             if field.enable_setting:
                 config = load_config(self.config_path)
                 self._nested(
@@ -1934,6 +2259,7 @@ class ControlPanel:
             self.debug_boxes.set(self.bot.calibration_overlay_visible)
             return
         self.bot.set_calibration_overlay_visible(bool(self.debug_boxes.get()))
+        self._refresh_debug_item_buttons()
 
     def _toggle_standalone_potion(self) -> None:
         if self.busy:
@@ -1981,6 +2307,10 @@ class ControlPanel:
                 self._nested(config, key, value)
             for key, variable in self._strategy_toggles.items():
                 self._nested(config, key, bool(variable.get()))
+            for key, (variable, choices) in self._strategy_choices.items():
+                label = variable.get()
+                if label in choices:
+                    self._nested(config, key, choices[label])
             for key, entry in self._targeting_entries.items():
                 raw = entry.get().strip()
                 current = self._nested(config, key)
@@ -2001,6 +2331,9 @@ class ControlPanel:
                 config["vision"]["player_minimap_assist_enabled"] = bool(minimap_assist.get())
             config["behavior"]["fallback_patrol"] = bool(self.fallback_patrol.get())
             config["behavior"]["pickup_after_target_lost"] = bool(self.pickup_lost.get())
+            config["behavior"]["player_lost_recovery_enabled"] = bool(
+                self.player_lost_recovery.get()
+            )
             config["behavior"]["hp_threshold"] = max(0, min(100, int(self.hp_threshold_percent.get()))) / 100.0
             config["behavior"]["mp_threshold"] = max(0, min(100, int(self.mp_threshold_percent.get()))) / 100.0
             input_delivery(config)
@@ -2014,6 +2347,7 @@ class ControlPanel:
                     "behavior.mp_threshold",
                     "behavior.fallback_patrol",
                     "behavior.pickup_after_target_lost",
+                    "behavior.player_lost_recovery_enabled",
                     "window.topmost_while_armed",
                     "vision.player_minimap_assist_enabled",
                 ):

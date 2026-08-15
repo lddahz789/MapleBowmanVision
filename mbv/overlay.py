@@ -51,9 +51,15 @@ def overlay_draw_plan(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def debug_item_enabled(state: dict[str, Any], item: str) -> bool:
-    """Return whether a Debug layer belongs to the active all/single-item view."""
-    selected = str(state.get("debug_item") or "").strip()
-    return not selected or selected == item
+    """默认显示所有 Debug 层，仅排除用户单独关闭的项目。"""
+    raw_hidden = state.get("debug_hidden_items", ())
+    if isinstance(raw_hidden, str):
+        hidden = {raw_hidden}
+    elif isinstance(raw_hidden, (list, tuple, set, frozenset)):
+        hidden = {str(value) for value in raw_hidden}
+    else:
+        hidden = set()
+    return str(item) not in hidden
 
 
 def _top_level_hwnd(widget: tk.Misc) -> int:
@@ -340,13 +346,16 @@ class RuntimeOverlay:
                 continue
             x, y, w, h = box
             label = str(area.get("label", "策略安全区"))
-            canvas.create_rectangle(x, y, x + w, y + h, outline="#ff66d9", width=2)
-            canvas.create_text(x + 3, y + 3, anchor="nw", text=label, fill="#ff8fe3", font=small)
+            is_target_region = area_key == "throwing_star_target_regions"
+            outline = "#00d9ff" if is_target_region else "#ff66d9"
+            text_color = "#61e8ff" if is_target_region else "#ff8fe3"
+            canvas.create_rectangle(x, y, x + w, y + h, outline=outline, width=2)
+            canvas.create_text(x + 3, y + 3, anchor="nw", text=label, fill=text_color, font=small)
 
         overlap_ratio = state.get("close_overlap_ratio")
         overlap_threshold = state.get("close_overlap_threshold")
         if (
-            not state.get("debug_item")
+            debug_item_enabled(state, "monster")
             and overlap_ratio is not None
             and overlap_threshold is not None
         ):
@@ -368,10 +377,15 @@ class RuntimeOverlay:
                     font=small,
                 )
 
-        if not state.get("debug_item"):
+        if debug_item_enabled(state, "monster"):
+            eligible_candidates = state.get("eligible_monster_boxes")
+            candidate_color = "#727b84" if eligible_candidates is not None else "#b94cff"
             for candidate in state.get("monster_boxes", []):
                 x, y, w, h = candidate
-                canvas.create_rectangle(x, y, x + w, y + h, outline="#b94cff", width=1)
+                canvas.create_rectangle(x, y, x + w, y + h, outline=candidate_color, width=1)
+            for candidate in eligible_candidates or []:
+                x, y, w, h = candidate
+                canvas.create_rectangle(x, y, x + w, y + h, outline="#b94cff", width=2)
 
         player_box = state.get("player_box")
         if player_box and debug_item_enabled(state, "player"):
@@ -394,7 +408,7 @@ class RuntimeOverlay:
             )
 
         chase = state.get("chase_box")
-        if chase and not state.get("debug_item"):
+        if chase and debug_item_enabled(state, "monster"):
             x, y, w, h = chase
             distance = state.get("target_distance_px")
             direction = str(state.get("target_direction", ""))
@@ -412,7 +426,7 @@ class RuntimeOverlay:
             )
 
         monster = state.get("monster_box")
-        if monster and not state.get("debug_item"):
+        if monster and debug_item_enabled(state, "monster"):
             x, y, w, h = monster
             canvas.create_rectangle(x, y, x + w, y + h, outline="#39ff72", width=3)
             distance = state.get("target_distance_px")
@@ -428,7 +442,7 @@ class RuntimeOverlay:
                 fill="#39ff72",
                 font=font,
             )
-        elif not state.get("debug_item") and float(state.get("monster_score", -1)) >= 0:
+        elif debug_item_enabled(state, "monster") and float(state.get("monster_score", -1)) >= 0:
             combat = state.get("combat_roi")
             if combat:
                 x, y, _w, _h = _rect(combat, width, height)

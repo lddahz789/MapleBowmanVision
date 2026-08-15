@@ -548,16 +548,44 @@ class CoreTests(unittest.TestCase):
         self.assertIn("platform_center", bowman.required_recognition_data)
         self.assertEqual(stationary.required_recognition_data, ())
         self.assertEqual(throwing_star.required_recognition_data, ())
-        self.assertEqual(len(throwing_star.capture_fields), 1)
+        self.assertEqual(len(throwing_star.capture_fields), 2)
         self.assertEqual(missing_recognition_data(self.config, bowman), ("platform_center",))
         self.assertEqual(missing_recognition_data(self.config, stationary), ())
-        self.assertEqual(missing_recognition_data(self.config, throwing_star), ())
+        self.assertEqual(
+            missing_recognition_data(self.config, throwing_star),
+            ("throwing_star_target_regions",),
+        )
         ready = json.loads(json.dumps(self.config))
         ready["recognition"]["platform_center_captured"] = True
         self.assertEqual(missing_recognition_data(ready, bowman), ())
+        ready["strategy"]["options"]["throwing_star_safe"]["target_regions"] = [
+            {
+                "id": "region_1",
+                "name": "下层",
+                "enabled": True,
+                "priority": 1,
+                "space": "player_anchor_v1",
+                "offset_x": -0.2,
+                "offset_y": 0.1,
+                "w": 1.0,
+                "h": 0.5,
+            }
+        ]
+        self.assertEqual(missing_recognition_data(ready, throwing_star), ())
         ready["recognition"]["throwing_star_safe_output_area_captured"] = True
         self.assertEqual(missing_recognition_data(ready, throwing_star), ())
+        all_disabled = json.loads(json.dumps(ready))
+        all_disabled["strategy"]["options"]["throwing_star_safe"]["target_regions"][0][
+            "enabled"
+        ] = False
+        self.assertEqual(
+            missing_recognition_data(all_disabled, throwing_star),
+            ("throwing_star_target_regions",),
+        )
         enabled_without_capture = json.loads(json.dumps(self.config))
+        enabled_without_capture["strategy"]["options"]["throwing_star_safe"]["target_regions"] = ready[
+            "strategy"
+        ]["options"]["throwing_star_safe"]["target_regions"]
         enabled_without_capture["strategy"]["options"]["throwing_star_safe"]["use_safe_output_area"] = True
         self.assertEqual(
             missing_recognition_data(enabled_without_capture, throwing_star),
@@ -581,11 +609,148 @@ class CoreTests(unittest.TestCase):
                 scene_height=240,
                 facing="right",
                 target_area={"forward": 0.4, "back": 0.1, "up": 0.1, "down": 0.4},
-                settings={"minimum_target_vertical_gap": 0.02},
+                settings={
+                    "use_target_regions": True,
+                    "use_common_target_box": False,
+                    "only_targets_below_player": True,
+                    "minimum_target_vertical_gap": 0.02,
+                    "target_regions": [
+                        {
+                            "id": "region_1",
+                            "name": "全部",
+                            "enabled": True,
+                            "priority": 1,
+                            "space": "player_anchor_v1",
+                            "offset_x": -0.3,
+                            "offset_y": -0.42,
+                            "w": 1.0,
+                            "h": 1.0,
+                        }
+                    ],
+                },
             )
         )
         self.assertIs(selected.target, below)
         self.assertIsNone(selected.chase_target)
+
+    def test_throwing_star_uses_union_and_region_priority(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import TargetSelectionContext
+
+        strategy = get_strategy("throwing_star_safe")
+        left = bot.Detection((35, 120, 20, 20), 0.8, "left.png")
+        gap = bot.Detection((190, 120, 20, 20), 0.99, "gap.png")
+        right = bot.Detection((305, 120, 20, 20), 0.7, "right.png")
+        settings = {
+            "use_target_regions": True,
+            "use_common_target_box": False,
+            "only_targets_below_player": False,
+            "target_priority_mode": "region_priority_then_distance",
+            "target_regions": [
+                {"id": "left", "name": "左", "enabled": True, "priority": 5, "space": "player_anchor_v1", "offset_x": -0.2, "offset_y": 0.125, "w": 0.15, "h": 0.25},
+                {"id": "right", "name": "右", "enabled": True, "priority": 1, "space": "player_anchor_v1", "offset_x": 0.5, "offset_y": 0.125, "w": 0.2, "h": 0.25},
+            ],
+        }
+        context = TargetSelectionContext(
+            detections=[left, gap, right],
+            player_box=(80, 80, 40, 1),
+            player_raw_box=(80, 40, 40, 40),
+            player_anchor=(100.0, 80.0),
+            scene_width=400,
+            scene_height=240,
+            facing="right",
+            target_area={"forward": 0.1, "back": 0.1, "up": 0.1, "down": 0.1},
+            settings=settings,
+        )
+        prioritized = strategy.select_targets(context)
+        self.assertIs(prioritized.target, right)
+        self.assertEqual(prioritized.eligible_candidate_count, 2)
+        self.assertEqual(prioritized.eligible_detections, (left, right))
+
+        settings["target_priority_mode"] = "nearest"
+        nearest = strategy.select_targets(context)
+        self.assertIs(nearest.target, left)
+
+    def test_throwing_star_common_target_box_is_optional(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import TargetSelectionContext
+
+        strategy = get_strategy("throwing_star_safe")
+        far = bot.Detection((310, 120, 20, 20), 0.9, "far.png")
+        settings = {
+            "use_target_regions": True,
+            "use_common_target_box": False,
+            "only_targets_below_player": False,
+            "target_priority_mode": "nearest",
+            "target_regions": [
+                {"id": "far", "name": "远端", "enabled": True, "priority": 1, "space": "player_anchor_v1", "offset_x": 0.5, "offset_y": 0.125, "w": 0.2, "h": 0.25}
+            ],
+        }
+        context = TargetSelectionContext(
+            detections=[far],
+            player_box=(80, 80, 40, 1),
+            player_raw_box=(80, 40, 40, 40),
+            player_anchor=(100.0, 80.0),
+            scene_width=400,
+            scene_height=240,
+            facing="right",
+            target_area={"forward": 0.1, "back": 0.1, "up": 0.1, "down": 0.1},
+            settings=settings,
+        )
+        self.assertIs(strategy.select_targets(context).target, far)
+        settings["use_common_target_box"] = True
+        limited = strategy.select_targets(context)
+        self.assertIsNone(limited.target)
+        self.assertEqual(limited.eligible_candidate_count, 1)
+
+    def test_throwing_star_target_regions_follow_player_but_do_not_flip(self):
+        from dataclasses import replace
+
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import TargetSelectionContext
+
+        strategy = get_strategy("throwing_star_safe")
+        target = bot.Detection((155, 115, 20, 20), 0.9, "target.png")
+        settings = {
+            "use_target_regions": True,
+            "use_common_target_box": False,
+            "only_targets_below_player": False,
+            "target_priority_mode": "nearest",
+            "target_regions": [
+                {
+                    "id": "right",
+                    "name": "屏幕右侧",
+                    "enabled": True,
+                    "priority": 1,
+                    "space": "player_anchor_v1",
+                    "offset_x": 0.1,
+                    "offset_y": 0.1,
+                    "w": 0.2,
+                    "h": 0.3,
+                }
+            ],
+        }
+        context = TargetSelectionContext(
+            detections=[target],
+            player_box=(80, 80, 40, 1),
+            player_raw_box=(80, 40, 40, 40),
+            player_anchor=(100.0, 80.0),
+            scene_width=400,
+            scene_height=200,
+            facing="right",
+            target_area={"forward": 0.1, "back": 0.1, "up": 0.1, "down": 0.1},
+            settings=settings,
+        )
+
+        self.assertIs(strategy.select_targets(context).target, target)
+        self.assertIs(strategy.select_targets(replace(context, facing="left")).target, target)
+        moved = replace(
+            context,
+            player_box=(160, 80, 40, 1),
+            player_raw_box=(160, 40, 40, 40),
+            player_anchor=(180.0, 80.0),
+        )
+        self.assertIsNone(strategy.select_targets(moved).target)
 
     def test_throwing_star_jumps_toward_safe_area_before_attacking(self):
         from mbv.strategies import get_strategy
@@ -614,7 +779,7 @@ class CoreTests(unittest.TestCase):
                     "minimum_target_vertical_gap": 0.02,
                 },
                 recognition={
-                    "throwing_star_safe_output_area": {"x": 0.4, "y": 0.2, "w": 0.2, "h": 0.1}
+                    "throwing_star_safe_output_area": {"x": 0.4, "y": 0.2, "w": 0.2, "h": 0.1, "space": "minimap"}
                 },
             )
         )
@@ -648,7 +813,7 @@ class CoreTests(unittest.TestCase):
                     "minimum_target_vertical_gap": 0.02,
                 },
                 recognition={
-                    "throwing_star_safe_output_area": {"x": 0.4, "y": 0.2, "w": 0.2, "h": 0.1}
+                    "throwing_star_safe_output_area": {"x": 0.4, "y": 0.2, "w": 0.2, "h": 0.1, "space": "minimap"}
                 },
             )
         )
@@ -690,7 +855,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(instance.last_jump, 10.0)
         self.assertEqual(instance.state, "RETURN_CENTER_DOWN_JUMP")
 
-    def test_throwing_star_attacks_inside_safe_area_without_chasing(self):
+    def test_throwing_star_attacks_or_patrols_inside_safe_area(self):
         from mbv.strategies import get_strategy
         from mbv.strategies.base import StrategyActionContext
 
@@ -717,14 +882,226 @@ class CoreTests(unittest.TestCase):
                 "jump_attack_cooldown_seconds": 0.45,
             },
             recognition={
-                "throwing_star_safe_output_area": {"x": 0.4, "y": 0.2, "w": 0.2, "h": 0.1}
+                "throwing_star_safe_output_area": {"x": 0.4, "y": 0.2, "w": 0.2, "h": 0.1, "space": "minimap"}
             },
         )
         attack = strategy.decide(StrategyActionContext(target_box=(650, 300, 20, 20), **common))
         wait = strategy.decide(StrategyActionContext(target_box=None, **common))
         self.assertEqual(attack.action, "attack")
         self.assertFalse(attack.face_each_attack)
-        self.assertEqual((wait.action, wait.state), ("stop", "TARGET_OUT_OF_RANGE"))
+        self.assertEqual((wait.action, wait.state, wait.direction), ("move", "SAFE_PATROL_RIGHT", "right"))
+
+    def test_throwing_star_safe_patrol_reverses_near_edges(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        strategy = get_strategy("throwing_star_safe")
+        common = dict(
+            chase_box=None,
+            target_box=None,
+            combat_width=1000,
+            combat_height=500,
+            has_monster_candidates=False,
+            now=10.0,
+            last_target_seen=9.0,
+            last_pickup=0.0,
+            last_jump=0.0,
+            behavior=self.config["behavior"],
+            settings={
+                "use_safe_output_area": True,
+                "patrol_inside_safe_area": True,
+                "safe_patrol_edge_margin": 0.02,
+            },
+            recognition={
+                "throwing_star_safe_output_area": {"x": 0.4, "y": 0.2, "w": 0.2, "h": 0.1, "space": "minimap"}
+            },
+        )
+        near_left = strategy.decide(
+            StrategyActionContext(
+                marker=(0.41, 0.25),
+                player_box=(490, 125, 20, 1),
+                player_anchor=(500.0, 125.0),
+                direction="left",
+                **common,
+            )
+        )
+        near_right = strategy.decide(
+            StrategyActionContext(
+                marker=(0.59, 0.25),
+                player_box=(490, 125, 20, 1),
+                player_anchor=(500.0, 125.0),
+                direction="right",
+                **common,
+            )
+        )
+        self.assertEqual((near_left.state, near_left.direction), ("SAFE_PATROL_RIGHT", "right"))
+        self.assertEqual((near_right.state, near_right.direction), ("SAFE_PATROL_LEFT", "left"))
+
+    def test_throwing_star_safe_area_stops_when_minimap_marker_is_missing(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        decision = get_strategy("throwing_star_safe").decide(
+            StrategyActionContext(
+                marker=None,
+                player_box=(490, 125, 20, 1),
+                player_anchor=(500.0, 125.0),
+                target_box=(650, 300, 20, 20),
+                chase_box=None,
+                combat_width=1000,
+                combat_height=500,
+                has_monster_candidates=True,
+                now=10.0,
+                last_target_seen=9.0,
+                last_pickup=0.0,
+                direction="right",
+                behavior=self.config["behavior"],
+                settings={"use_safe_output_area": True},
+                recognition={
+                    "throwing_star_safe_output_area": {
+                        "x": 0.4,
+                        "y": 0.2,
+                        "w": 0.2,
+                        "h": 0.1,
+                        "space": "minimap",
+                    }
+                },
+            )
+        )
+        self.assertEqual((decision.action, decision.state), ("stop", "MARKER_LOST"))
+
+    def test_throwing_star_faces_new_target_before_attacking(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        strategy = get_strategy("throwing_star_safe")
+        common = dict(
+            marker=(0.5, 0.25),
+            player_box=(480, 125, 40, 1),
+            player_anchor=(500.0, 125.0),
+            target_box=(330, 300, 20, 20),
+            chase_box=None,
+            combat_width=1000,
+            combat_height=500,
+            has_monster_candidates=True,
+            now=10.0,
+            last_target_seen=9.0,
+            last_pickup=0.0,
+            last_jump=0.0,
+            behavior=self.config["behavior"],
+            settings={
+                "use_safe_output_area": False,
+                "auto_face_target": True,
+                "use_close_jump_attack": False,
+                "close_overlap_threshold": 0.2,
+            },
+            recognition={},
+        )
+        face = strategy.decide(StrategyActionContext(direction="right", **common))
+        attack = strategy.decide(StrategyActionContext(direction="left", **common))
+
+        self.assertEqual((face.action, face.direction, face.state), ("face", "left", "FACE_TARGET_LEFT"))
+        self.assertEqual(face.face_tap_seconds, 0.025)
+        self.assertTrue(face.target_seen)
+        self.assertEqual(attack.action, "attack")
+
+    def test_face_target_releases_movement_and_only_taps_direction(self):
+        from mbv import bot as runtime_bot
+
+        instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
+        instance.config = {
+            "keys": {"left": "left", "right": "right"},
+            "behavior": {"face_tap_seconds": 0.025},
+        }
+        instance.keyboard = MagicMock()
+        instance.direction = "right"
+        instance.state = "SCANNING"
+        instance.log = MagicMock()
+
+        instance.face_target("left", "FACE_TARGET_LEFT", tap_seconds=0.01)
+
+        instance.keyboard.up.assert_has_calls([call("left"), call("right")])
+        instance.keyboard.tap.assert_called_once_with("left", 0.01)
+        instance.keyboard.down.assert_not_called()
+        self.assertEqual(instance.direction, "left")
+        self.assertEqual(instance.state, "FACE_TARGET_LEFT")
+
+    def test_player_lost_recovery_alternates_timed_left_and_right_moves(self):
+        from mbv import bot as runtime_bot
+
+        instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
+        instance.config = {
+            "keys": {"left": "left", "right": "right"},
+            "behavior": {"player_lost_move_seconds": 0.25},
+        }
+        instance.keyboard = MagicMock()
+        instance.log = MagicMock()
+        instance.state = "SCANNING"
+        instance.direction = "right"
+        instance.player_lost_recovery_direction = None
+        instance.player_lost_recovery_started_at = 0.0
+        instance.player_lost_recovery_next_at = 0.0
+        instance.player_lost_recovery_next_direction = "left"
+
+        instance.recover_player_nameplate(10.0)
+        self.assertEqual(instance.state, "PLAYER_RECOVER_LEFT")
+        instance.keyboard.down.assert_called_once_with("left")
+
+        instance.recover_player_nameplate(10.1)
+        self.assertEqual(instance.keyboard.down.call_count, 1)
+
+        instance.recover_player_nameplate(10.25)
+        instance.keyboard.up.assert_called_with("left")
+        self.assertEqual(instance.state, "PLAYER_SCREEN_LOST")
+
+        instance.recover_player_nameplate(10.34)
+        self.assertEqual(instance.keyboard.down.call_args_list, [call("left"), call("right")])
+        self.assertEqual(instance.state, "PLAYER_RECOVER_RIGHT")
+
+    def test_nameplate_loss_recovery_preempts_profession_strategy(self):
+        from mbv import bot as runtime_bot
+
+        instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
+        instance.armed = True
+        instance.input_authorized = True
+        instance.background_input = True
+        instance.started_at = 1.0
+        instance.marker_last_seen = 10.0
+        instance.last_nameplate_seen_at = 8.0
+        instance.config = {
+            "behavior": {
+                "max_runtime_minutes": 0,
+                "max_marker_lost_seconds": 3.0,
+                "player_lost_recovery_enabled": True,
+            },
+            "vision": {"player_hold_seconds": 0.8},
+            "keys": {"left": "left", "right": "right"},
+        }
+        instance.strategy = MagicMock()
+        instance.recover_player_nameplate = MagicMock()
+        instance._try_auto_potion = MagicMock(return_value=False)
+        window = bot.WindowInfo(12345, "MapleStory", 0, 0, 800, 600)
+
+        with (
+            patch("mbv.bot.user32.IsWindow", return_value=True),
+            patch("mbv.bot.user32.IsIconic", return_value=False),
+        ):
+            instance._act(
+                window,
+                1.0,
+                1.0,
+                (0.5, 0.5),
+                (100, 100, 40, 1),
+                None,
+                None,
+                800,
+                False,
+                10.0,
+                600,
+            )
+
+        instance.recover_player_nameplate.assert_called_once_with(10.0)
+        instance.strategy.decide.assert_not_called()
 
     def test_throwing_star_overlap_threshold_boundary_uses_jump_attack(self):
         from mbv.strategies import get_strategy
@@ -871,7 +1248,7 @@ class CoreTests(unittest.TestCase):
                     "minimum_target_vertical_gap": 0.02,
                 },
                 recognition={
-                    "throwing_star_safe_output_area": {"x": 0.4, "y": 0.2, "w": 0.2, "h": 0.1}
+                    "throwing_star_safe_output_area": {"x": 0.4, "y": 0.2, "w": 0.2, "h": 0.1, "space": "minimap"}
                 },
             )
         )
@@ -1475,7 +1852,7 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(saved["calibration"]["items"]["mp_bar"]["complete"])
         self.assertEqual(saved["calibration"]["window_size"], [1200, 600])
 
-    def test_combat_region_recapture_preserves_minimap_platform_center(self):
+    def test_combat_region_recapture_preserves_minimap_areas(self):
         from mbv import calibrate as runtime_calibrate
 
         result = type("Result", (), {"cancelled": False, "rectangle": (20, 30, 900, 400)})()
@@ -1485,6 +1862,12 @@ class CoreTests(unittest.TestCase):
             ready = json.loads(json.dumps(self.config))
             ready["recognition"]["platform_center_captured"] = True
             ready["calibration"]["items"]["platform_center"] = {"complete": True}
+            ready["recognition"]["throwing_star_safe_output_area_captured"] = True
+            ready["calibration"]["items"]["throwing_star_safe_output_area"] = {"complete": True}
+            ready["strategy"]["options"]["throwing_star_safe"]["target_regions"] = [
+                {"id": "region_1", "name": "角色相对区域", "enabled": True, "priority": 1, "space": "player_anchor_v1", "offset_x": 0.1, "offset_y": 0.2, "w": 0.2, "h": 0.2}
+            ]
+            ready["calibration"]["items"]["throwing_star_target_regions"] = {"complete": True}
             path.write_text(json.dumps(ready), encoding="utf-8")
             with (
                 patch.object(runtime_calibrate, "find_game_window", return_value=window),
@@ -1499,15 +1882,24 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(saved["calibration"]["recognition_region_complete"])
         self.assertTrue(saved["recognition"]["platform_center_captured"])
         self.assertTrue(saved["calibration"]["items"]["platform_center"]["complete"])
+        self.assertTrue(saved["recognition"]["throwing_star_safe_output_area_captured"])
+        self.assertTrue(saved["calibration"]["items"]["throwing_star_safe_output_area"]["complete"])
+        self.assertEqual(
+            saved["strategy"]["options"]["throwing_star_safe"]["target_regions"],
+            [],
+        )
+        self.assertFalse(saved["calibration"]["items"]["throwing_star_target_regions"]["complete"])
 
-    def test_minimap_recapture_invalidates_platform_center_and_player_marker(self):
+    def test_minimap_recapture_invalidates_minimap_dependents(self):
         from mbv import calibrate as runtime_calibrate
 
         result = type("Result", (), {"cancelled": False, "rectangle": (20, 30, 120, 80)})()
         window = bot.WindowInfo(123, "MapleStory", 0, 0, 1000, 500)
         ready = json.loads(json.dumps(self.config))
         ready["recognition"]["platform_center_captured"] = True
+        ready["recognition"]["throwing_star_safe_output_area_captured"] = True
         ready["calibration"]["items"]["platform_center"] = {"complete": True}
+        ready["calibration"]["items"]["throwing_star_safe_output_area"] = {"complete": True}
         ready["calibration"]["items"]["player_marker"] = {"complete": True}
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.json"
@@ -1523,13 +1915,15 @@ class CoreTests(unittest.TestCase):
             saved = bot.load_config(path)
 
         self.assertFalse(saved["recognition"]["platform_center_captured"])
+        self.assertFalse(saved["recognition"]["throwing_star_safe_output_area_captured"])
         self.assertFalse(saved["calibration"]["items"]["platform_center"]["complete"])
+        self.assertFalse(saved["calibration"]["items"]["throwing_star_safe_output_area"]["complete"])
         self.assertFalse(saved["calibration"]["items"]["player_marker"]["complete"])
 
-    def test_strategy_area_capture_is_relative_to_combat_region(self):
+    def test_strategy_area_capture_uses_magnified_minimap(self):
         from mbv import calibrate as runtime_calibrate
 
-        selected = type("Result", (), {"cancelled": False, "rectangle": (400, 100, 200, 100)})()
+        selected = type("Result", (), {"cancelled": False, "rectangle": (300, 150, 400, 100)})()
         window = bot.WindowInfo(123, "MapleStory", 0, 0, 1000, 500)
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.json"
@@ -1539,20 +1933,99 @@ class CoreTests(unittest.TestCase):
                 patch.object(runtime_calibrate, "focus_game_window"),
                 patch.object(runtime_calibrate.mss, "MSS"),
                 patch.object(runtime_calibrate, "capture_client", return_value=np.zeros((500, 1000, 3))),
-                patch.object(runtime_calibrate, "interactive_overlay", return_value=selected),
+                patch.object(
+                    runtime_calibrate,
+                    "magnified_roi_preview",
+                    return_value=(np.ones((500, 1000, 3), dtype=np.uint8), (100, 50, 800, 400), 4.0),
+                ),
+                patch.object(runtime_calibrate, "interactive_overlay", return_value=selected) as overlay,
             ):
                 captured = runtime_calibrate.capture_strategy_area(
                     path,
                     "throwing_star_safe_output_area",
                     "框选安全区",
+                    coordinate_space="minimap",
                 )
             saved = bot.load_config(path)
         self.assertEqual(
             captured,
-            {"x": 0.4, "y": 0.166667, "w": 0.2, "h": 0.222222},
+            {"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.25, "space": "minimap"},
         )
+        self.assertEqual(overlay.call_args.kwargs["guide_rect"], (100, 50, 800, 400))
+        self.assertEqual(int(overlay.call_args.kwargs["frozen_frame"][0, 0, 0]), 1)
         self.assertEqual(saved["recognition"]["throwing_star_safe_output_area"], captured)
         self.assertTrue(saved["recognition"]["throwing_star_safe_output_area_captured"])
+
+    def test_strategy_region_capture_appends_and_reframes_independent_regions(self):
+        from mbv import calibrate as runtime_calibrate
+
+        first = type("Result", (), {"cancelled": False, "rectangle": (100, 100, 200, 90)})()
+        second = type("Result", (), {"cancelled": False, "rectangle": (600, 200, 180, 90)})()
+        reframed = type("Result", (), {"cancelled": False, "rectangle": (150, 120, 220, 100)})()
+        window = bot.WindowInfo(123, "MapleStory", 0, 0, 1000, 500)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(self.config), encoding="utf-8")
+            with (
+                patch.object(runtime_calibrate, "find_game_window", return_value=window),
+                patch.object(runtime_calibrate, "focus_game_window"),
+                patch.object(runtime_calibrate.mss, "MSS"),
+                patch.object(runtime_calibrate, "capture_client", return_value=np.zeros((500, 1000, 3))),
+                patch.object(
+                    runtime_calibrate,
+                    "interactive_overlay",
+                    side_effect=[first, second, reframed],
+                ),
+            ):
+                region_1 = runtime_calibrate.capture_strategy_region(
+                    path,
+                    "throwing_star_safe",
+                    "target_regions",
+                    "throwing_star_target_regions",
+                    "框选索敌区",
+                    player_box=(480, 225, 40, 1),
+                    player_anchor=(500.0, 225.0),
+                )
+                region_2 = runtime_calibrate.capture_strategy_region(
+                    path,
+                    "throwing_star_safe",
+                    "target_regions",
+                    "throwing_star_target_regions",
+                    "框选索敌区",
+                    player_box=(480, 225, 40, 1),
+                    player_anchor=(500.0, 225.0),
+                )
+                runtime_calibrate.capture_strategy_region(
+                    path,
+                    "throwing_star_safe",
+                    "target_regions",
+                    "throwing_star_target_regions",
+                    "重新框选",
+                    region_id=region_1["id"],
+                    player_box=(480, 225, 40, 1),
+                    player_anchor=(500.0, 225.0),
+                )
+            saved = bot.load_config(path)
+
+        regions = saved["strategy"]["options"]["throwing_star_safe"]["target_regions"]
+        self.assertEqual(len(regions), 2)
+        self.assertEqual([item["id"] for item in regions], [region_1["id"], region_2["id"]])
+        self.assertEqual(regions[0]["name"], region_1["name"])
+        self.assertEqual(regions[0]["priority"], region_1["priority"])
+        self.assertEqual(
+            {
+                key: regions[0][key]
+                for key in ("space", "offset_x", "offset_y", "w", "h")
+            },
+            {
+                "space": "player_anchor_v1",
+                "offset_x": -0.35,
+                "offset_y": -0.288889,
+                "w": 0.22,
+                "h": 0.222222,
+            },
+        )
+        self.assertTrue(saved["calibration"]["items"]["throwing_star_target_regions"]["complete"])
 
     def test_old_config_gets_throwing_star_defaults_without_becoming_ready(self):
         legacy = json.loads(json.dumps(self.config))
@@ -1566,17 +2039,94 @@ class CoreTests(unittest.TestCase):
             loaded = bot.load_config(path)
         self.assertEqual(loaded["keys"]["jump"], "alt")
         self.assertFalse(loaded["recognition"]["throwing_star_safe_output_area_captured"])
+        self.assertEqual(loaded["recognition"]["throwing_star_safe_output_area"]["space"], "minimap")
         self.assertEqual(
             loaded["strategy"]["options"]["throwing_star_safe"],
             {
+                "use_target_regions": True,
+                "use_common_target_box": False,
+                "only_targets_below_player": True,
+                "auto_face_target": True,
+                "target_priority_mode": "region_priority_then_distance",
+                "target_regions": [],
+                "target_face_tap_seconds": 0.025,
                 "use_close_jump_attack": True,
                 "use_safe_output_area": False,
+                "patrol_inside_safe_area": True,
                 "jump_interval_seconds": 0.35,
+                "safe_patrol_edge_margin": 0.02,
                 "minimum_target_vertical_gap": 0.02,
                 "close_overlap_threshold": 0.2,
                 "jump_attack_cooldown_seconds": 0.45,
             },
         )
+
+    def test_screen_fixed_safe_output_area_is_invalidated(self):
+        legacy = json.loads(json.dumps(self.config))
+        legacy["recognition"]["throwing_star_safe_output_area"] = {
+            "x": 0.4,
+            "y": 0.2,
+            "w": 0.2,
+            "h": 0.1,
+        }
+        legacy["recognition"]["throwing_star_safe_output_area_captured"] = True
+        legacy["calibration"]["items"]["throwing_star_safe_output_area"] = {
+            "complete": True,
+            "timestamp": "2026-08-15T12:00:00",
+        }
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = bot.load_config(path)
+
+        self.assertFalse(loaded["recognition"]["throwing_star_safe_output_area_captured"])
+        self.assertEqual(
+            loaded["recognition"]["throwing_star_safe_output_area"],
+            {"x": 0.45, "y": 0.35, "w": 0.1, "h": 0.1, "space": "minimap"},
+        )
+        self.assertFalse(loaded["calibration"]["items"]["throwing_star_safe_output_area"]["complete"])
+
+    def test_screen_fixed_throwing_star_regions_are_invalidated(self):
+        legacy = json.loads(json.dumps(self.config))
+        legacy["strategy"]["options"]["throwing_star_safe"]["target_regions"] = [
+            {
+                "id": "legacy",
+                "name": "旧固定区域",
+                "enabled": True,
+                "priority": 1,
+                "x": 0.2,
+                "y": 0.4,
+                "w": 0.3,
+                "h": 0.2,
+            }
+        ]
+        legacy["calibration"]["items"]["throwing_star_target_regions"] = {
+            "complete": True
+        }
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = bot.load_config(path)
+
+        self.assertEqual(
+            loaded["strategy"]["options"]["throwing_star_safe"]["target_regions"],
+            [],
+        )
+        self.assertFalse(
+            loaded["calibration"]["items"]["throwing_star_target_regions"]["complete"]
+        )
+
+    def test_old_config_gets_player_lost_recovery_defaults(self):
+        legacy = json.loads(json.dumps(self.config))
+        legacy["behavior"].pop("player_lost_recovery_enabled", None)
+        legacy["behavior"].pop("player_lost_move_seconds", None)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = bot.load_config(path)
+
+        self.assertTrue(loaded["behavior"]["player_lost_recovery_enabled"])
+        self.assertEqual(loaded["behavior"]["player_lost_move_seconds"], 0.25)
 
     def test_captured_monster_filter_keeps_full_rectangle_mask(self):
         from mbv import calibrate as runtime_calibrate
@@ -1781,6 +2331,35 @@ class CoreTests(unittest.TestCase):
             0.35,
         )
         instance.bot.preview_targeting_setting.assert_called_once_with("box.forward", 0.35)
+
+    def test_strategy_choice_is_persisted_and_applied(self):
+        from mbv.panel import ControlPanel
+        from mbv.strategies import get_strategy
+
+        strategy = get_strategy("throwing_star_safe")
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(self.config), encoding="utf-8")
+            instance = ControlPanel.__new__(ControlPanel)
+            instance.config_path = path
+            instance.bot = MagicMock()
+            instance.bot.strategy = strategy
+            instance._selected_strategy = lambda: strategy
+            variable = MagicMock()
+            variable.get.return_value = "识别分最高"
+
+            instance._preview_strategy_choice(
+                "target_priority_mode",
+                variable,
+                {"识别分最高": "highest_score"},
+            )
+
+            loaded = bot.load_config(path)
+        self.assertEqual(
+            loaded["strategy"]["options"]["throwing_star_safe"]["target_priority_mode"],
+            "highest_score",
+        )
+        instance.bot.apply_config.assert_called_once()
 
     def test_running_panel_persists_common_and_strategy_settings_before_restart(self):
         from mbv.panel import ControlPanel
@@ -2214,8 +2793,10 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(hidden["notice"], "已暂停")
         self.assertTrue(overlay.overlay_draw_plan({})["show_calibration"])
         self.assertTrue(overlay.debug_item_enabled({}, "hp_bar"))
-        self.assertTrue(overlay.debug_item_enabled({"debug_item": "hp_bar"}, "hp_bar"))
-        self.assertFalse(overlay.debug_item_enabled({"debug_item": "hp_bar"}, "mp_bar"))
+        hidden_items = {"debug_hidden_items": ("hp_bar", "monster")}
+        self.assertFalse(overlay.debug_item_enabled(hidden_items, "hp_bar"))
+        self.assertFalse(overlay.debug_item_enabled(hidden_items, "monster"))
+        self.assertTrue(overlay.debug_item_enabled(hidden_items, "mp_bar"))
 
     def test_runtime_overlay_hide_blocks_queued_redraw_until_show(self):
         import game_overlay as overlay
@@ -2280,22 +2861,49 @@ class CoreTests(unittest.TestCase):
         instance.debug_boxes = MagicMock()
         instance.debug_boxes.get.return_value = False
         instance.bot = MagicMock()
+        instance._refresh_debug_item_buttons = MagicMock()
 
         instance._toggle_debug_boxes()
 
         instance.bot.set_calibration_overlay_visible.assert_called_once_with(False)
+        instance._refresh_debug_item_buttons.assert_called_once_with()
 
-    def test_panel_capture_show_uses_single_debug_item_mode(self):
+    def test_panel_capture_show_toggles_only_requested_debug_item(self):
         from mbv.panel import ControlPanel
 
         instance = ControlPanel.__new__(ControlPanel)
         instance.debug_boxes = MagicMock()
         instance.bot = MagicMock()
+        instance.bot.toggle_calibration_overlay_item.return_value = True
+        instance.bot.calibration_overlay_visible = True
+        instance._refresh_debug_item_buttons = MagicMock()
 
         instance._show_capture_item("血条区域", "hp_bar")
 
         instance.debug_boxes.set.assert_called_once_with(True)
-        instance.bot.set_calibration_overlay_item.assert_called_once_with("hp_bar")
+        instance.bot.toggle_calibration_overlay_item.assert_called_once_with("hp_bar")
+        instance._refresh_debug_item_buttons.assert_called_once_with()
+        instance.bot.notify.assert_called_once_with("血条区域 Debug 框已开启", 2.0)
+
+    def test_panel_debug_item_buttons_show_independent_states(self):
+        from mbv import panel
+
+        instance = panel.ControlPanel.__new__(panel.ControlPanel)
+        hp_button = MagicMock()
+        mp_button = MagicMock()
+        instance._debug_item_buttons = {
+            "hp_bar": (hp_button, "框"),
+            "mp_bar": (mp_button, "框"),
+        }
+        instance.bot = MagicMock()
+        instance.bot.calibration_overlay_item_visible.side_effect = lambda key: key == "hp_bar"
+
+        instance._refresh_debug_item_buttons()
+
+        self.assertEqual(hp_button.configure.call_args.kwargs["text"], "框：开")
+        self.assertEqual(hp_button.configure.call_args.kwargs["fg"], panel.ACCENT)
+        self.assertEqual(mp_button.configure.call_args.kwargs["text"], "框：关")
+        self.assertEqual(mp_button.configure.call_args.kwargs["fg"], panel.MUTED)
 
     def test_control_panel_is_single_column_without_decoupling_info_stage(self):
         panel_source = (ROOT / "mbv" / "panel.py").read_text(encoding="utf-8")
@@ -2319,19 +2927,27 @@ class CoreTests(unittest.TestCase):
     def test_toggle_calibration_overlay_is_independent_of_hide(self):
         instance = bot.BowmanBot.__new__(bot.BowmanBot)
         instance.calibration_overlay_visible = True
-        instance.calibration_overlay_item = "hp_bar"
+        instance.calibration_overlay_hidden_items = frozenset({"hp_bar"})
         instance.log = type("Log", (), {"write": lambda *_args, **_kwargs: None})()
+        self.assertFalse(instance.calibration_overlay_item_visible("hp_bar"))
+        self.assertTrue(instance.calibration_overlay_item_visible("mp_bar"))
         instance.toggle_calibration_overlay()
         self.assertFalse(instance.calibration_overlay_visible)
-        self.assertIsNone(instance.calibration_overlay_item)
+        self.assertEqual(instance.calibration_overlay_hidden_items, frozenset({"hp_bar"}))
         instance.toggle_calibration_overlay()
         self.assertTrue(instance.calibration_overlay_visible)
-        instance.set_calibration_overlay_item("mp_bar")
-        self.assertEqual(instance.calibration_overlay_item, "mp_bar")
+        self.assertEqual(instance.calibration_overlay_hidden_items, frozenset({"hp_bar"}))
+        instance.set_calibration_overlay_item_visible("mp_bar", False)
+        self.assertEqual(
+            instance.calibration_overlay_hidden_items,
+            frozenset({"hp_bar", "mp_bar"}),
+        )
+        instance.set_calibration_overlay_item_visible("hp_bar", True)
+        self.assertEqual(instance.calibration_overlay_hidden_items, frozenset({"mp_bar"}))
         self.assertTrue(instance.calibration_overlay_visible)
         instance.set_calibration_overlay_visible(False)
         self.assertFalse(instance.calibration_overlay_visible)
-        self.assertIsNone(instance.calibration_overlay_item)
+        self.assertEqual(instance.calibration_overlay_hidden_items, frozenset({"mp_bar"}))
         self.assertEqual(bot.vk_for("f7"), 0x76)
         self.assertEqual(bot.name_for_vk(0x76), "f7")
 

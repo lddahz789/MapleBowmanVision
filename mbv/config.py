@@ -11,7 +11,7 @@ from mbv.input import input_delivery
 from mbv.paths import LOG_DIR, PLAYER_ASSET_DIR, PLAYER_HEAD_ASSET_DIR, PLAYER_TITLE_ASSET_DIR
 from mbv.strategies import normalize_strategy_config
 from mbv.template_store import list_monster_categories
-from mbv.vision import attack_box_from_config
+from mbv.vision import MINIMAP_REGION_SPACE, attack_box_from_config
 
 class SessionLog:
     def __init__(self) -> None:
@@ -94,6 +94,22 @@ def load_config(path: Path) -> dict[str, Any]:
     config["keys"].setdefault("jump", "alt")
     config["keys"].setdefault("down", "down")
     config.setdefault("behavior", {})
+    behavior = config["behavior"]
+    if not isinstance(behavior.get("player_lost_recovery_enabled"), bool):
+        behavior["player_lost_recovery_enabled"] = True
+    raw_player_lost_move_seconds = behavior.get("player_lost_move_seconds", 0.25)
+    try:
+        if isinstance(raw_player_lost_move_seconds, bool):
+            raise TypeError
+        player_lost_move_seconds = float(raw_player_lost_move_seconds)
+    except (TypeError, ValueError):
+        player_lost_move_seconds = 0.25
+    if not math.isfinite(player_lost_move_seconds):
+        player_lost_move_seconds = 0.25
+    behavior["player_lost_move_seconds"] = max(
+        0.05,
+        min(2.0, player_lost_move_seconds),
+    )
     legacy_bow_attack_box = attack_box_from_config(config["behavior"])
     had_strategy_section = isinstance(config.get("strategy"), dict)
     old_strategy_box = None
@@ -128,11 +144,24 @@ def load_config(path: Path) -> dict[str, Any]:
     else:
         recognition.setdefault("platform_center_captured", False)
     recognition["platform_center_space"] = "minimap"
-    recognition.setdefault(
-        "throwing_star_safe_output_area",
-        {"x": 0.45, "y": 0.35, "w": 0.1, "h": 0.1},
+    default_safe_output_area = {
+        "x": 0.45,
+        "y": 0.35,
+        "w": 0.1,
+        "h": 0.1,
+        "space": MINIMAP_REGION_SPACE,
+    }
+    safe_output_area = recognition.get("throwing_star_safe_output_area")
+    legacy_safe_output_area = not (
+        isinstance(safe_output_area, dict)
+        and safe_output_area.get("space") == MINIMAP_REGION_SPACE
     )
-    recognition.setdefault("throwing_star_safe_output_area_captured", False)
+    if legacy_safe_output_area:
+        # 旧值相对战斗画面，镜头滚动后会漂移，不能无损迁移到小地图。
+        recognition["throwing_star_safe_output_area"] = default_safe_output_area
+        recognition["throwing_star_safe_output_area_captured"] = False
+    else:
+        recognition.setdefault("throwing_star_safe_output_area_captured", False)
     calibration = config.setdefault("calibration", {})
     legacy_calibrated = bool(config.get("calibrated"))
     calibration.setdefault("status_regions_complete", legacy_calibrated)
@@ -158,6 +187,27 @@ def load_config(path: Path) -> dict[str, Any]:
         "throwing_star_safe_output_area",
         {"complete": bool(config["recognition"].get("throwing_star_safe_output_area_captured"))},
     )
+    if legacy_safe_output_area:
+        previous = items.get("throwing_star_safe_output_area", {})
+        previous_timestamp = previous.get("timestamp") if isinstance(previous, dict) else None
+        items["throwing_star_safe_output_area"] = {"complete": False}
+        if previous_timestamp:
+            items["throwing_star_safe_output_area"]["previous_timestamp"] = previous_timestamp
+    throwing_star_regions = config["strategy"]["options"]["throwing_star_safe"].get(
+        "target_regions",
+        [],
+    )
+    target_regions_complete = bool(
+        isinstance(throwing_star_regions, list)
+        and any(
+            isinstance(item, dict) and bool(item.get("enabled", True))
+            for item in throwing_star_regions
+        )
+    )
+    target_regions_item = items.setdefault("throwing_star_target_regions", {})
+    if not isinstance(target_regions_item, dict):
+        items["throwing_star_target_regions"] = target_regions_item = {}
+    target_regions_item["complete"] = target_regions_complete
     refresh_calibrated(config)
     config.setdefault("vision", {})
     monster_threshold = float(config["vision"].get("monster_template_threshold", 0.79))

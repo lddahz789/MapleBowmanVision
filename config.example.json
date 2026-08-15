@@ -33,7 +33,7 @@
     "platform_center": {"x": 0.5, "y": 0.5},
     "platform_center_space": "minimap",
     "platform_center_captured": false,
-    "throwing_star_safe_output_area": {"x": 0.45, "y": 0.35, "w": 0.1, "h": 0.1},
+    "throwing_star_safe_output_area": {"x": 0.45, "y": 0.35, "w": 0.1, "h": 0.1, "space": "minimap"},
     "throwing_star_safe_output_area_captured": false
   },
   "calibration": {
@@ -47,7 +47,8 @@
       "combat_region": {"complete": false},
       "platform_center": {"complete": false},
       "targeting_range": {"complete": false},
-      "throwing_star_safe_output_area": {"complete": false}
+      "throwing_star_safe_output_area": {"complete": false},
+      "throwing_star_target_regions": {"complete": false}
     }
   },
   "vision": {
@@ -129,9 +130,18 @@
       },
       "stationary_attack": {},
       "throwing_star_safe": {
+        "use_target_regions": true,
+        "use_common_target_box": false,
+        "only_targets_below_player": true,
+        "auto_face_target": true,
+        "target_priority_mode": "region_priority_then_distance",
+        "target_regions": [],
+        "target_face_tap_seconds": 0.025,
         "use_close_jump_attack": true,
         "use_safe_output_area": false,
+        "patrol_inside_safe_area": true,
         "jump_interval_seconds": 0.35,
+        "safe_patrol_edge_margin": 0.02,
         "minimum_target_vertical_gap": 0.02,
         "close_overlap_threshold": 0.2,
         "jump_attack_cooldown_seconds": 0.45
@@ -150,6 +160,8 @@
     "patrol_right": 0.84,
     "fallback_patrol": false,
     "pickup_after_target_lost": false,
+    "player_lost_recovery_enabled": true,
+    "player_lost_move_seconds": 0.25,
     "max_marker_lost_seconds": 3.0,
     "max_runtime_minutes": 0
   }

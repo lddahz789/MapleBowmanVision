@@ -22,6 +22,7 @@ class StationaryAttackStrategy:
     )
     required_recognition_data: tuple[str, ...] = ()
     toggle_fields = ()
+    choice_fields = ()
     capture_fields = ()
     setting_fields: tuple[StrategySettingField, ...] = ()
     default_settings: dict[str, Any] = {}

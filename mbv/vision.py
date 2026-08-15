@@ -13,6 +13,9 @@ import numpy as np
 from mbv.paths import ASSET_DIR
 
 
+MINIMAP_REGION_SPACE = "minimap"
+
+
 def roi_pixels(shape: tuple[int, ...], roi: dict[str, float]) -> tuple[int, int, int, int]:
     height, width = shape[:2]
     x = int(round(float(roi["x"]) * width))
@@ -879,6 +882,55 @@ def attack_rect_from_player(
     else:
         left, right = cx - back, cx + forward
     return left, cy - up, right, cy + down
+
+
+PLAYER_RELATIVE_REGION_SPACE = "player_anchor_v1"
+
+
+def player_relative_region_from_rectangle(
+    rectangle: tuple[int, int, int, int],
+    combat_rect: tuple[int, int, int, int],
+    player_anchor: tuple[float, float],
+) -> dict[str, float | str]:
+    """把客户区矩形保存成相对稳定战斗锚点的区域；不随角色面向翻转。"""
+    rx, ry, rw, rh = rectangle
+    cx, cy, cw, ch = combat_rect
+    anchor_x = cx + float(player_anchor[0])
+    anchor_y = cy + float(player_anchor[1])
+    width = max(1.0, float(cw))
+    height = max(1.0, float(ch))
+    return {
+        "space": PLAYER_RELATIVE_REGION_SPACE,
+        "offset_x": round((float(rx) - anchor_x) / width, 6),
+        "offset_y": round((float(ry) - anchor_y) / height, 6),
+        "w": round(float(rw) / width, 6),
+        "h": round(float(rh) / height, 6),
+    }
+
+
+def player_relative_region_rect(
+    player_anchor: tuple[float, float],
+    scene_width: int,
+    scene_height: int,
+    region: dict[str, Any],
+    *,
+    clip: bool = False,
+) -> tuple[float, float, float, float]:
+    """还原角色相对区域（左、上、右、下）；屏幕方向固定，不读取面向。"""
+    if region.get("space") != PLAYER_RELATIVE_REGION_SPACE:
+        raise ValueError("标飞索敌区坐标格式无效，请重新框选")
+    width = max(1.0, float(scene_width))
+    height = max(1.0, float(scene_height))
+    left = float(player_anchor[0]) + float(region["offset_x"]) * width
+    top = float(player_anchor[1]) + float(region["offset_y"]) * height
+    right = left + float(region["w"]) * width
+    bottom = top + float(region["h"]) * height
+    if clip:
+        left = max(0.0, min(width, left))
+        top = max(0.0, min(height, top))
+        right = max(0.0, min(width, right))
+        bottom = max(0.0, min(height, bottom))
+    return _ordered_rect(left, top, right, bottom)
 
 
 def _ordered_rect(left: float, top: float, right: float, bottom: float) -> tuple[float, float, float, float]:

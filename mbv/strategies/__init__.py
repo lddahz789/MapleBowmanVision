@@ -47,10 +47,18 @@ def missing_recognition_data(config: dict[str, Any], strategy: CombatStrategy) -
         if key not in recognition or not bool(recognition.get(f"{key}_captured")):
             missing.append(key)
     for field in strategy.capture_fields:
+        if field.settings_path:
+            captured = settings.get(field.settings_path)
+            has_enabled_item = bool(
+                isinstance(captured, list)
+                and any(isinstance(item, dict) and bool(item.get("enabled", True)) for item in captured)
+            )
+        else:
+            has_enabled_item = bool(recognition.get(f"{field.recognition_key}_captured"))
         if (
             field.enable_setting
             and bool(settings.get(field.enable_setting))
-            and not bool(recognition.get(f"{field.recognition_key}_captured"))
+            and not has_enabled_item
             and field.recognition_key not in missing
         ):
             missing.append(field.recognition_key)
@@ -81,6 +89,9 @@ def normalize_strategy_config(config: dict[str, Any]) -> None:
         if not isinstance(settings, dict):
             options[strategy.key] = settings = {}
         _fill_defaults(settings, strategy.default_settings)
+        normalize = getattr(strategy, "normalize_settings", None)
+        if callable(normalize):
+            normalize(settings)
 
 
 register_strategy(BowmanDynamicStrategy())

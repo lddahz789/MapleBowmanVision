@@ -13,8 +13,10 @@ from mbv.config import load_config, refresh_calibrated, save_config
 from mbv.input import VK
 from mbv.overlay import interactive_overlay
 from mbv.paths import PLAYER_ASSET_DIR, PLAYER_HEAD_ASSET_DIR, PLAYER_TITLE_ASSET_DIR
+from mbv.strategies import list_strategies
 from mbv.template_store import monster_template_directory
 from mbv.vision import (
+    MINIMAP_REGION_SPACE,
     attack_box_from_rectangle,
     monster_template_image,
     nameplate_identity_mask,
@@ -22,6 +24,7 @@ from mbv.vision import (
     normalized_roi,
     player_attack_anchor,
     player_marker,
+    player_relative_region_from_rectangle,
     roi_pixels,
     template_foreground_mask,
 )
@@ -54,6 +57,41 @@ def _invalidate_calibration_item(config: dict[str, Any], key: str) -> None:
         items[key]["previous_timestamp"] = timestamp
 
 
+def _strategy_settings_value(
+    config: dict[str, Any],
+    strategy_key: str,
+    settings_path: str,
+    value: Any | None = None,
+) -> Any:
+    settings = config["strategy"]["options"][strategy_key]
+    parts = settings_path.split(".")
+    cursor = settings
+    for part in parts[:-1]:
+        child = cursor.get(part)
+        if not isinstance(child, dict):
+            cursor[part] = child = {}
+        cursor = child
+    if value is None:
+        return cursor.get(parts[-1])
+    cursor[parts[-1]] = value
+    return value
+
+
+def _invalidate_strategy_combat_areas(config: dict[str, Any]) -> None:
+    """按策略采集元数据失效所有依赖战斗识别区的策略列表，不写职业分支。"""
+    for strategy in list_strategies():
+        for field in strategy.capture_fields:
+            if not field.settings_path:
+                continue
+            _strategy_settings_value(config, strategy.key, field.settings_path, [])
+            _invalidate_calibration_item(config, field.recognition_key)
+
+
+def _invalidate_combat_dependents(config: dict[str, Any]) -> None:
+    _invalidate_calibration_item(config, "targeting_range")
+    _invalidate_strategy_combat_areas(config)
+
+
 def _prepare_window_calibration(config: dict[str, Any], window: WindowInfo) -> None:
     calibration = config.setdefault("calibration", {})
     previous = calibration.get("window_size")
@@ -83,6 +121,7 @@ def _prepare_window_calibration(config: dict[str, Any], window: WindowInfo) -> N
             recognition = config.setdefault("recognition", {})
             recognition["platform_center_captured"] = False
             recognition["throwing_star_safe_output_area_captured"] = False
+            _invalidate_strategy_combat_areas(config)
     calibration["window_size"] = current
 
 
@@ -117,8 +156,10 @@ def capture_status_region(
     if key == "minimap":
         _invalidate_calibration_item(config, "player_marker")
         _invalidate_calibration_item(config, "platform_center")
+        _invalidate_calibration_item(config, "throwing_star_safe_output_area")
         recognition = config.setdefault("recognition", {})
         recognition["platform_center_captured"] = False
+        recognition["throwing_star_safe_output_area_captured"] = False
     _mark_calibration_item(config, key)
     calibration = config.setdefault("calibration", {})
     calibration["window_size"] = [window.width, window.height]
@@ -338,10 +379,7 @@ def capture_combat_region(config_path: Path, parent: Any = None) -> dict[str, fl
         raise RuntimeError("已取消战斗识别区域采集")
     region = normalized_roi(result.rectangle, shape)
     config.setdefault("regions", {})["combat"] = region
-    for dependent in ("targeting_range", "throwing_star_safe_output_area"):
-        _invalidate_calibration_item(config, dependent)
-    recognition = config.setdefault("recognition", {})
-    recognition["throwing_star_safe_output_area_captured"] = False
+    _invalidate_combat_dependents(config)
     _mark_calibration_item(config, "combat_region")
     calibration = config.setdefault("calibration", {})
     calibration["window_size"] = [window.width, window.height]
@@ -471,7 +509,9 @@ def calibrate(config_path: Path, parent: Any = None) -> None:
     config["vision"]["player_hsv_ranges"] = ranges
     calibration = config.setdefault("calibration", {})
     _invalidate_calibration_item(config, "platform_center")
+    _invalidate_calibration_item(config, "throwing_star_safe_output_area")
     config.setdefault("recognition", {})["platform_center_captured"] = False
+    config["recognition"]["throwing_star_safe_output_area_captured"] = False
     for key in STATUS_ITEM_KEYS:
         _mark_calibration_item(config, key)
     calibration.update(
@@ -532,6 +572,7 @@ def capture_recognition_region(config_path: Path, parent: Any = None) -> dict[st
         "y": round(max(0.0, min(1.0, (py - my) / max(1, mh))), 6),
     }
     config["regions"]["combat"] = combat_roi
+    _invalidate_combat_dependents(config)
     config.setdefault("recognition", {})["platform_center"] = platform_center
     config["recognition"]["platform_center_space"] = "minimap"
     config["recognition"]["platform_center_captured"] = True
@@ -559,11 +600,87 @@ def capture_strategy_area(
     recognition_key: str,
     prompt: str,
     parent: Any = None,
-) -> dict[str, float]:
-    """框选并保存相对战斗识别区归一化的策略矩形。"""
+    coordinate_space: str = "combat",
+) -> dict[str, Any]:
+    """在战斗画面或放大小地图上框选并保存归一化策略矩形。"""
     key = str(recognition_key).strip()
     if not key or not key.replace("_", "").isalnum():
         raise ValueError("策略采集键无效")
+    config = load_config(config_path)
+    window = find_game_window(config)
+    _prepare_window_calibration(config, window)
+    focus_game_window(window)
+    shape = (window.height, window.width, 3)
+    with mss.MSS() as sct:
+        frozen_frame = capture_client(sct, window)
+    space = str(coordinate_space).strip().lower()
+    if space == MINIMAP_REGION_SPACE:
+        source_rect = roi_pixels(shape, config["regions"]["minimap"])
+        display_frame, display_rect, zoom = magnified_roi_preview(frozen_frame, source_rect)
+        overlay_prompt = f"小地图已放大 {zoom:.1f} 倍，{prompt}"
+    elif space == "combat":
+        display_frame = frozen_frame
+        display_rect = roi_pixels(shape, config["regions"]["combat"])
+        overlay_prompt = prompt
+    else:
+        raise ValueError(f"不支持的策略采集坐标空间：{coordinate_space}")
+    result = interactive_overlay(
+        window,
+        overlay_prompt,
+        "rectangle",
+        guide_rect=display_rect,
+        parent=parent,
+        frozen_frame=display_frame,
+    )
+    if result.cancelled or result.rectangle is None:
+        raise RuntimeError("已取消安全输出位置框选")
+    rx, ry, rw, rh = result.rectangle
+    dx, dy, dw, dh = display_rect
+    if rx < dx or ry < dy or rx + rw > dx + dw or ry + rh > dy + dh:
+        location = "放大的小地图" if space == MINIMAP_REGION_SPACE else "战斗识别区域"
+        raise RuntimeError(f"安全输出位置必须完整位于{location}内")
+    area = {
+        "x": round((rx - dx) / max(1, dw), 6),
+        "y": round((ry - dy) / max(1, dh), 6),
+        "w": round(rw / max(1, dw), 6),
+        "h": round(rh / max(1, dh), 6),
+    }
+    if space == MINIMAP_REGION_SPACE:
+        area["space"] = MINIMAP_REGION_SPACE
+    recognition = config.setdefault("recognition", {})
+    recognition[key] = area
+    recognition[f"{key}_captured"] = True
+    _mark_calibration_item(config, key)
+    refresh_calibrated(config)
+    save_config(config_path, config)
+    print(
+        f"安全输出位置已保存：x={area['x']:.3f}, y={area['y']:.3f}, "
+        f"w={area['w']:.3f}, h={area['h']:.3f}"
+        f"（相对{'小地图' if space == MINIMAP_REGION_SPACE else '战斗识别区'}）"
+    )
+    return area
+
+
+def capture_strategy_region(
+    config_path: Path,
+    strategy_key: str,
+    settings_path: str,
+    calibration_key: str,
+    prompt: str,
+    parent: Any = None,
+    region_id: str | None = None,
+    player_box: tuple[int, int, int, int] | None = None,
+    raw_box: tuple[int, int, int, int] | None = None,
+    player_anchor: tuple[float, float] | None = None,
+) -> dict[str, Any]:
+    """新增或重框一个跟随稳定战斗锚点、但不随面向翻转的策略矩形。"""
+    key = str(strategy_key).strip()
+    path = str(settings_path).strip()
+    item_key = str(calibration_key).strip()
+    if not key or not path or not item_key:
+        raise ValueError("策略索敌区配置无效")
+    if player_anchor is None and player_box is None:
+        raise RuntimeError("尚未识别到角色，请先让姓名板出现在画面上再框选标飞索敌区")
     config = load_config(config_path)
     window = find_game_window(config)
     _prepare_window_calibration(config, window)
@@ -581,28 +698,60 @@ def capture_strategy_area(
         frozen_frame=frozen_frame,
     )
     if result.cancelled or result.rectangle is None:
-        raise RuntimeError("已取消安全输出位置框选")
+        raise RuntimeError("已取消标飞索敌区框选")
     rx, ry, rw, rh = result.rectangle
     cx, cy, cw, ch = combat_rect
     if rx < cx or ry < cy or rx + rw > cx + cw or ry + rh > cy + ch:
-        raise RuntimeError("安全输出位置必须完整位于战斗识别区域内")
-    area = {
-        "x": round((rx - cx) / max(1, cw), 6),
-        "y": round((ry - cy) / max(1, ch), 6),
-        "w": round(rw / max(1, cw), 6),
-        "h": round(rh / max(1, ch), 6),
-    }
-    recognition = config.setdefault("recognition", {})
-    recognition[key] = area
-    recognition[f"{key}_captured"] = True
-    _mark_calibration_item(config, key)
+        raise RuntimeError("标飞索敌区必须完整位于战斗识别区域内")
+    if player_anchor is not None:
+        anchor = player_anchor
+    elif player_box is not None:
+        anchor = player_attack_anchor(player_box, raw_box)
+    else:  # 已在打开采集窗口前拦截；保留分支帮助类型检查器收窄。
+        raise RuntimeError("尚未识别到角色")
+    area = player_relative_region_from_rectangle(
+        result.rectangle,
+        combat_rect,
+        anchor,
+    )
+    current = _strategy_settings_value(config, key, path)
+    regions = [dict(item) for item in current if isinstance(item, dict)] if isinstance(current, list) else []
+    selected_id = str(region_id or "").strip()
+    existing = next((item for item in regions if str(item.get("id")) == selected_id), None)
+    if existing is not None:
+        existing.update(area)
+        saved = existing
+    else:
+        used_ids = {str(item.get("id", "")) for item in regions}
+        suffix = len(regions) + 1
+        selected_id = f"region_{suffix}"
+        while selected_id in used_ids:
+            suffix += 1
+            selected_id = f"region_{suffix}"
+        priorities = []
+        for item in regions:
+            try:
+                priorities.append(int(item.get("priority", 0)))
+            except (TypeError, ValueError):
+                pass
+        saved = {
+            "id": selected_id,
+            "name": f"索敌区 {suffix}",
+            "enabled": True,
+            "priority": max(priorities, default=0) + 1,
+            **area,
+        }
+        regions.append(saved)
+    _strategy_settings_value(config, key, path, regions)
+    _mark_calibration_item(config, item_key)
     refresh_calibrated(config)
     save_config(config_path, config)
     print(
-        f"安全输出位置已保存：x={area['x']:.3f}, y={area['y']:.3f}, "
-        f"w={area['w']:.3f}, h={area['h']:.3f}（相对战斗识别区）"
+        f"标飞索敌区已保存：{saved['name']}，"
+        f"相对角色 x={saved['offset_x']:.3f}, y={saved['offset_y']:.3f}, "
+        f"w={saved['w']:.3f}, h={saved['h']:.3f}"
     )
-    return area
+    return saved
 
 
 def _capture_frozen_selection_details(

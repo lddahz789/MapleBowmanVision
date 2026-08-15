@@ -42,6 +42,15 @@ class StrategyToggleField:
 
 
 @dataclass(frozen=True)
+class StrategyChoiceField:
+    """面板可选择的策略枚举参数。"""
+
+    path: str
+    label: str
+    choices: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
 class StrategyCaptureField:
     """面板按策略生成的矩形采集入口。"""
 
@@ -50,6 +59,9 @@ class StrategyCaptureField:
     prompt: str
     debug_label: str
     enable_setting: str | None = None
+    settings_path: str | None = None
+    multiple: bool = False
+    coordinate_space: str = "combat"
 
 
 @dataclass(frozen=True)
@@ -69,6 +81,9 @@ class TargetSelectionContext:
 class TargetSelection:
     target: Detection | None
     chase_target: Detection | None
+    eligible_candidate_count: int | None = None
+    eligible_detections: tuple[Detection, ...] | None = None
+    uses_common_target_area: bool = True
 
 
 @dataclass(frozen=True)
@@ -96,6 +111,7 @@ class StrategyActionContext:
 class StrategyDecision:
     action: Literal[
         "stop",
+        "face",
         "attack",
         "chase",
         "move",
@@ -110,6 +126,7 @@ class StrategyDecision:
     player_x: float | None = None
     target_seen: bool = False
     face_each_attack: bool = True
+    face_tap_seconds: float | None = None
     close_overlap_ratio: float | None = None
 
 
@@ -121,6 +138,7 @@ class CombatStrategy(Protocol):
     required_recognition_data: tuple[str, ...]
     setting_fields: tuple[StrategySettingField, ...]
     toggle_fields: tuple[StrategyToggleField, ...]
+    choice_fields: tuple[StrategyChoiceField, ...]
     capture_fields: tuple[StrategyCaptureField, ...]
     default_settings: dict[str, Any]
     def select_targets(self, context: TargetSelectionContext) -> TargetSelection:

@@ -80,9 +80,12 @@ assets/{monsters,player,player_head,player_title}/
 - **姓名板身份去重与遮挡补位**：名字字形阈值只使用模板 Alpha 有效区；多模板候选先分别保留并计算身份分，再用 `deduplicate_nameplate_detections` 跨模板去重。不得让身份无效但原始相关分较高的模板提前压掉有效模板。姓名板已确认本人后，头部/称号可在预测位置和辅助最大位移约束内连续续跟踪。首次或完全丢失时，普通辅助命中不得认人；只有达到 `player_auxiliary_identity_threshold` 且连续多帧位置一致的辅助模板才可建立受限身份。
 - **小地图静止确认**：以最近一次可靠姓名板命中，或姓名板身份已建立后的连续头部命中，固定记录 `(唯一实时小地图标记, 视觉 PlayerAnchor, 小地图尺寸)`；不得与上一帧滚动比较，配置初始标记、称号及仅靠辅助模板建立的启动身份都不能建基准。两路视觉暂失且称号也无有效位置时，当前标记距固定基准不超过 2 像素且不超过 0.2 秒，才可返回 `小地图静止确认` 锚点；该返回不得调用 `track.record()`、刷新身份/视觉时间、速度或基准。移动、缺失、多候选、尺寸变化或超时必须同帧清基准并阻断通用 hold，移动后回原点也不能复活。
 - **职业策略**：策略只放 `mbv/strategies/`，必须实现注册元数据、目标选择和动作决策；不得在 `mbv/bot.py` 增加按职业分支。完整规范见 `STRATEGIES.md`。
-- **通用索敌区**：所有职业策略共享 `targeting.box.{forward,back,up,down}`，相对稳定战斗锚点并随朝向翻转。不得把索敌框放回某个职业的策略设置；旧策略/`behavior.bow_attack_box` 只用于一次性兼容迁移。
+- **通用索敌区与策略多区域**：所有职业策略共享 `targeting.box.{forward,back,up,down}`，相对稳定战斗锚点并随朝向翻转。标飞 `target_regions` 同样跟随稳定战斗锚点，但保持屏幕方向、不随面向翻转；多个区域只做候选并集与优先级。旧策略/`behavior.bow_attack_box` 只用于一次性兼容迁移。
+- **只转向动作**：策略需要预先面向目标时返回 `StrategyDecision(action="face")`，由公共执行器释放左右移动键后仅短按一次目标方向；策略不得用 `move` 模拟转向，也不得直接发键。
+- **姓名板丢失恢复**：超过 `vision.player_hold_seconds` 仍未命中有效姓名板时，由 `BowmanBot` 在职业策略之前按 `behavior.player_lost_move_seconds` 交替左右位移；恢复姓名板、喝药、暂停或改配置时必须释放恢复按键并重置状态。
 - **独立校准**：战斗识别区与小地图平台安全点相互独立。`capture_platform_center` 必须像玩家标记采集一样放大小地图并映射回原始冻结帧，坐标相对小地图内部归一化且写入 `platform_center_space=minimap`；重采小地图会使玩家标记和平台安全点失效，重采战斗区不得使平台安全点失效。旧战斗画面平台中心不能换算，必须要求重采。
-- **Debug 框 / F7**：`BowmanBot.set_calibration_overlay_visible` / `toggle_calibration_overlay`；HUD 用 `overlay_draw_plan`。与采集时 `overlay.hide()` 独立。
+- **标飞安全输出区**：必须在放大的小地图上框选，保存 `space=minimap` 和相对小地图坐标；运行判断只使用小地图玩家标记。重采小地图时失效，重采战斗识别区时保留，旧战斗画面安全区不得迁移。
+- **Debug 框 / F7**：默认显示全部框；F7 只控制总显隐，各项通过 `calibration_overlay_hidden_items` 独立排除且切换总开关时保留。HUD 用 `overlay_draw_plan`，与采集时 `overlay.hide()` 独立。
 - **性能监控**：视觉 worker 每个成功帧只向 `PerformanceMonitor` 提交一次聚合数据；Tk 主线程低频读取冻结快照。整帧耗时不含末尾 FPS 节流，轻量喝药未执行的检测阶段不得补零，禁止从 worker 直接更新 Tk。
 - **面板不抢焦点**：`prevent_window_activate` 只设 `WS_EX_NOACTIVATE`。
 - **配置持久化**：挂机配置的鼠标控件要自动写入个人 `config.json`；`ControlPanel.quit/_destroy` 退出前再调用统一 `_persist_settings`。新增策略参数不能只改运行内存或 Entry。

@@ -16,6 +16,7 @@ from mbv.calibrate import (
     capture_player_template,
     capture_recognition_region,
     capture_strategy_area,
+    capture_strategy_region,
     capture_status_region,
     capture_template,
     hue_ranges,

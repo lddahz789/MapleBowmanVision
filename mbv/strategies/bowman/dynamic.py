@@ -23,6 +23,7 @@ class BowmanDynamicStrategy:
     )
     required_recognition_data = ("platform_center",)
     toggle_fields = ()
+    choice_fields = ()
     capture_fields = ()
     setting_fields = (
         StrategySettingField("platform_center_tolerance", "小地图水平安全半径", maximum=0.5),
