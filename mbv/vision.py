@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import cv2
 import numpy as np
@@ -899,18 +899,34 @@ def _choose_nearest_eligible(
     player_x: float,
     player_y: float,
     include: Callable[[float, float], bool],
+    distance_mode: Literal["horizontal", "euclidean"] = "horizontal",
 ) -> Detection | None:
-    eligible: list[tuple[float, float, float, Detection]] = []
+    eligible: list[tuple[float, float, float, float, Detection]] = []
     for detection in detections:
         x, y, w, h = detection.box
         mx, my = x + w / 2.0, y + h / 2.0
         if not include(mx, my):
             continue
-        eligible.append((abs(mx - player_x), abs(my - player_y), -detection.score, detection))
+        horizontal_distance = abs(mx - player_x)
+        vertical_distance = abs(my - player_y)
+        primary_distance = (
+            math.hypot(horizontal_distance, vertical_distance)
+            if distance_mode == "euclidean"
+            else horizontal_distance
+        )
+        eligible.append(
+            (
+                primary_distance,
+                horizontal_distance,
+                vertical_distance,
+                -detection.score,
+                detection,
+            )
+        )
     if not eligible:
         return None
-    eligible.sort(key=lambda item: (item[0], item[1], item[2]))
-    return eligible[0][3]
+    eligible.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    return eligible[0][4]
 
 
 def choose_nearest_target(
@@ -922,8 +938,9 @@ def choose_nearest_target(
     facing: str | None = "right",
     raw_box: tuple[int, int, int, int] | None = None,
     player_anchor: tuple[float, float] | None = None,
+    distance_mode: Literal["horizontal", "euclidean"] = "horizontal",
 ) -> Detection | None:
-    """只在框选的攻击区内，选择离玩家水平距离最近的怪物。"""
+    """只在框选的攻击区内，按指定距离方式选择离玩家最近的怪物。"""
     if player_box is None:
         return None
     player_x, player_y = player_anchor or player_anchor_center(player_box, raw_box)
@@ -933,6 +950,7 @@ def choose_nearest_target(
         player_x,
         player_y,
         lambda mx, my: point_in_attack_rect(mx, my, rect),
+        distance_mode,
     )
 
 
@@ -980,6 +998,7 @@ def choose_nearest_same_level_target(
     attack_box: dict[str, float],
     raw_box: tuple[int, int, int, int] | None = None,
     player_anchor: tuple[float, float] | None = None,
+    distance_mode: Literal["horizontal", "euclidean"] = "horizontal",
 ) -> Detection | None:
     """高度仍用框选的上/下范围，水平不限制，供追踪移动使用。"""
     if player_box is None:
@@ -993,6 +1012,7 @@ def choose_nearest_same_level_target(
         player_x,
         player_y,
         lambda _mx, my: top <= my <= bottom,
+        distance_mode,
     )
 
 

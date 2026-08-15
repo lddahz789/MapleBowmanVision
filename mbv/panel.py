@@ -493,6 +493,7 @@ class ControlPanel:
         fields = [
             ("keys.attack", "攻击键", None, None, None),
             ("keys.jump", "跳跃键", None, None, None),
+            ("keys.down", "下跳方向键", None, None, None),
             ("keys.pickup", "拾取键", None, None, None),
             ("keys.hp_potion", "HP 药键", None, None, None),
             ("keys.mp_potion", "MP 药键", None, None, None),

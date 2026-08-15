@@ -85,6 +85,11 @@ STATE_LABELS = {
     "MARKER_LOST": "玩家标记丢失",
     "RETURN_CENTER_LEFT": "向左返回平台安全点",
     "RETURN_CENTER_RIGHT": "向右返回平台安全点",
+    "RETURN_CENTER_JUMP_LEFT": "向左跳回平台安全点",
+    "RETURN_CENTER_JUMP_RIGHT": "向右跳回平台安全点",
+    "RETURN_CENTER_JUMP_UP": "向上跳回平台安全点",
+    "RETURN_CENTER_DOWN_JUMP": "下跳返回平台安全点",
+    "WAITING_CENTER_JUMP": "等待下一次平台回位跳跃",
     "RETURN_SAFE_LEFT": "向左返回安全输出区",
     "RETURN_SAFE_RIGHT": "向右返回安全输出区",
     "RETURN_SAFE_JUMP_LEFT": "向左跳回安全输出区",
@@ -99,6 +104,7 @@ STATE_LABELS = {
 DEFAULT_PLAYER_AUXILIARY_INTERVAL_SECONDS = 0.5
 JUMP_ATTACK_LEAD_SECONDS = 0.05
 JUMP_ATTACK_OVERLAP_SECONDS = 0.05
+DOWN_JUMP_LEAD_SECONDS = 0.04
 
 
 def runtime_limit_reached(
@@ -700,11 +706,22 @@ class BowmanBot:
             desired = self.direction
         self.state = f"ATTACK_{desired.upper()}"
         if now - self.last_attack >= float(behavior["attack_interval_seconds"]):
-            # 动态策略每次攻击都校准朝向；原地策略只在换边时点按，避免连续攻击造成漂移。
-            if face_each_attack or self.direction != desired:
-                self.keyboard.tap(keys[desired], float(behavior["face_tap_seconds"]))
-                self.direction = desired
-            self.keyboard.tap(keys["attack"])
+            # 弓箭手动态每次攻击都先按住目标方向，在方向键仍按下时发出攻击；
+            # 这样被击退后也会按当前目标位置重新转向。原地策略仍只在换边时点按。
+            if face_each_attack:
+                direction_key = keys[desired]
+                try:
+                    self.keyboard.down(direction_key)
+                    time.sleep(float(behavior["face_tap_seconds"]))
+                    self.direction = desired
+                    self.keyboard.tap(keys["attack"])
+                finally:
+                    self.keyboard.up(direction_key)
+            else:
+                if self.direction != desired:
+                    self.keyboard.tap(keys[desired], float(behavior["face_tap_seconds"]))
+                    self.direction = desired
+                self.keyboard.tap(keys["attack"])
             self.last_attack = now
             self.log.write(
                 "attack",
@@ -728,6 +745,20 @@ class BowmanBot:
         self.last_jump = now
         self.state = state
         self.log.write("safe_return_jump", direction=direction or "up")
+
+    def down_jump_to_safe(self, now: float, state: str) -> None:
+        """按住下方向后点按跳跃，并无论输入是否失败都释放下方向。"""
+        keys = self.config["keys"]
+        self.stop_move()
+        try:
+            self.keyboard.down(keys["down"])
+            time.sleep(DOWN_JUMP_LEAD_SECONDS)
+            self.keyboard.tap(keys["jump"])
+        finally:
+            self.keyboard.up(keys["down"])
+        self.last_jump = now
+        self.state = state
+        self.log.write("safe_return_down_jump")
 
     def jump_attack(self, target_x: float, player_x: float, overlap_ratio: float, now: float) -> None:
         keys = self.config["keys"]
@@ -862,6 +893,8 @@ class BowmanBot:
             self.state = decision.state
         elif decision.action == "jump":
             self.jump_to_safe(decision.direction, now, decision.state)
+        elif decision.action == "down_jump":
+            self.down_jump_to_safe(now, decision.state)
         elif decision.action == "jump_attack":
             self.jump_attack(
                 float(decision.target_x),

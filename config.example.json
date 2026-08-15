@@ -105,7 +105,8 @@
     "hp_potion": "home",
     "mp_potion": "end",
     "left": "left",
-    "right": "right"
+    "right": "right",
+    "down": "down"
   },
   "input": {
     "delivery": "background"
@@ -122,7 +123,9 @@
     "active": "bowman_dynamic",
     "options": {
       "bowman_dynamic": {
-        "platform_center_tolerance": 0.12
+        "platform_center_tolerance": 0.08,
+        "platform_center_vertical_tolerance": 0.06,
+        "platform_return_jump_interval_seconds": 0.45
       },
       "stationary_attack": {},
       "throwing_star_safe": {

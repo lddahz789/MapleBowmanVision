@@ -94,7 +94,16 @@ class StrategyActionContext:
 
 @dataclass(frozen=True)
 class StrategyDecision:
-    action: Literal["stop", "attack", "chase", "move", "jump", "jump_attack", "pickup"]
+    action: Literal[
+        "stop",
+        "attack",
+        "chase",
+        "move",
+        "jump",
+        "down_jump",
+        "jump_attack",
+        "pickup",
+    ]
     state: str
     direction: str | None = None
     target_x: float | None = None

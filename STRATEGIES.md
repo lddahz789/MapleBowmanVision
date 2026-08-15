@@ -6,11 +6,13 @@
 
 - 职业：弓箭手
 - 标识：`bowman_dynamic`
-- 描述：根据小地图玩家标记优先回到平台安全点附近；范围内选择通用索敌区中最近的同层怪物攻击，框外同层怪物则接近。无目标时可按配置拾取或左右巡逻。
+- 描述：根据小地图玩家标记的水平与垂直位置优先回到平台安全点附近；掉到下层时跳回，位于上层时下跳。范围内按玩家攻击锚点到怪物中心的二维距离优先攻击最近单位；每次攻击都先按住当前目标方向，在方向键仍按下时发出攻击，被怪物击退后也不依赖上次朝向。
 - 依赖采集：小地图与玩家标记、小地图平台安全点、战斗识别区、玩家定位模板、怪物模板。
 - 决策优先级：输入/窗口安全 → HP/MP 补药 → 返回小地图平台安全点 → 区内攻击 → 同层追踪 → 拾取/巡逻。
 - 索敌框：使用公共 `targeting.box`，不属于弓箭手策略；框随角色朝向左右翻转。
-- `platform_center_tolerance`：小地图玩家标记的水平位置超出“平台安全点 ± 安全半径”时，忽略目标并优先回位；该值是小地图内部宽度的比例。
+- `platform_center_tolerance`：水平安全半径，是小地图宽度的比例；超出后忽略目标并优先左右回位。
+- `platform_center_vertical_tolerance`：垂直安全半径，是小地图高度的比例；超出后根据上下层关系跳回或下跳。
+- `platform_return_jump_interval_seconds`：连续回位跳跃之间的最短间隔，防止按键过密。
 
 ## 当前策略：原地攻击
 
@@ -62,8 +64,8 @@
 - `TargetSelectionContext` 输入的是同一帧已经完成的检测结果以及公共 `target_area`。策略不得重新执行模板匹配，也不得维护自己的索敌框副本。
 - `player_anchor` 是公共视觉层提供的稳定战斗锚点；策略选敌和行动判断必须使用它，不得重新采用姓名板、头部或称号原始框的纵向中心。
 - `StrategyActionContext` 只包含归一化位置、已选目标、公共行为配置和策略设置。策略返回动作意图，`BowmanBot` 统一执行按键并写运行状态。
-- `StrategyDecision.action` 目前支持 `stop`、`attack`、`chase`、`move`、`pickup`。需要新动作时先扩展公共动作执行器和测试，不要在策略里直接发键。
-- `StrategyDecision.face_each_attack` 仅对 `attack` 生效，默认每次攻击前重新点按目标方向；需要尽量保持原位的策略可设为 `false`，此时只在目标换边时点按方向。
+- `StrategyDecision.action` 目前支持 `stop`、`attack`、`chase`、`move`、`jump`、`down_jump`、`jump_attack`、`pickup`。需要新动作时先扩展公共动作执行器和测试，不要在策略里直接发键。
+- `StrategyDecision.face_each_attack` 仅对 `attack` 生效；为 `true` 时每次按住目标方向，等待 `behavior.face_tap_seconds` 后在按键仍按下时攻击，发出后再释放方向。需要尽量保持原位的策略可设为 `false`，此时只在目标换边时点按方向。
 - 面板“框选通用索敌范围”始终写入 `targeting.box`，与当前选中的职业策略无关。
 
 ## 配置示例
@@ -82,7 +84,9 @@
     "active": "bowman_dynamic",
     "options": {
       "bowman_dynamic": {
-        "platform_center_tolerance": 0.12
+        "platform_center_tolerance": 0.08,
+        "platform_center_vertical_tolerance": 0.06,
+        "platform_return_jump_interval_seconds": 0.45
       },
       "stationary_attack": {},
       "throwing_star_safe": {

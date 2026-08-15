@@ -671,6 +671,25 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(instance.last_jump, 10.0)
         self.assertEqual(instance.state, "RETURN_SAFE_JUMP_RIGHT")
 
+    def test_down_jump_to_safe_always_releases_configured_down_key(self):
+        instance = bot.BowmanBot.__new__(bot.BowmanBot)
+        instance.config = {
+            "keys": {"left": "left", "right": "right", "down": "down", "jump": "space"}
+        }
+        instance.keyboard = MagicMock()
+        instance.direction = None
+        instance.log = MagicMock()
+        instance.last_jump = 0.0
+
+        with patch("mbv.bot.time.sleep"):
+            instance.down_jump_to_safe(10.0, "RETURN_CENTER_DOWN_JUMP")
+
+        instance.keyboard.down.assert_called_once_with("down")
+        instance.keyboard.tap.assert_called_once_with("space")
+        instance.keyboard.up.assert_has_calls([call("left"), call("right"), call("down")])
+        self.assertEqual(instance.last_jump, 10.0)
+        self.assertEqual(instance.state, "RETURN_CENTER_DOWN_JUMP")
+
     def test_throwing_star_attacks_inside_safe_area_without_chasing(self):
         from mbv.strategies import get_strategy
         from mbv.strategies.base import StrategyActionContext
@@ -953,6 +972,60 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(left_taps), 1)
         self.assertEqual(len(attack_taps), 2)
 
+    def test_bowman_dynamic_holds_current_target_direction_while_attacking(self):
+        from mbv import bot as runtime_bot
+
+        instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
+        instance.config = {
+            "keys": {"left": "left", "right": "right", "attack": "shift"},
+            "behavior": {
+                "attack_interval_seconds": 0.24,
+                "face_tap_seconds": 0.025,
+                "attack_dead_zone": 0.015,
+            },
+        }
+        instance.keyboard = MagicMock()
+        instance.direction = "left"
+        instance.last_attack = 0.0
+        instance.log = MagicMock()
+
+        with patch("mbv.bot.time.sleep") as sleep:
+            instance.face_and_attack(0.8, 0.2, 10.0, face_each_attack=True)
+
+        calls = instance.keyboard.method_calls
+        direction_down = calls.index(call.down("right"))
+        attack = calls.index(call.tap("shift"))
+        direction_releases = [index for index, item in enumerate(calls) if item == call.up("right")]
+        self.assertLess(direction_down, attack)
+        self.assertTrue(any(index > attack for index in direction_releases))
+        self.assertEqual(sleep.call_args_list, [call(0.025)])
+        self.assertEqual(instance.direction, "right")
+        self.assertEqual(instance.last_attack, 10.0)
+
+    def test_bowman_dynamic_releases_facing_key_when_attack_fails(self):
+        from mbv import bot as runtime_bot
+
+        instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
+        instance.config = {
+            "keys": {"left": "left", "right": "right", "attack": "shift"},
+            "behavior": {
+                "attack_interval_seconds": 0.24,
+                "face_tap_seconds": 0.025,
+                "attack_dead_zone": 0.015,
+            },
+        }
+        instance.keyboard = MagicMock()
+        instance.keyboard.tap.side_effect = OSError("攻击键失败")
+        instance.direction = "left"
+        instance.last_attack = 0.0
+        instance.log = MagicMock()
+
+        with patch("mbv.bot.time.sleep"), self.assertRaisesRegex(OSError, "攻击键失败"):
+            instance.face_and_attack(0.8, 0.2, 10.0, face_each_attack=True)
+
+        instance.keyboard.up.assert_any_call("right")
+        self.assertEqual(instance.last_attack, 0.0)
+
     def test_bowman_strategy_consumes_common_target_area(self):
         from mbv.strategies import get_strategy
         from mbv.strategies.base import TargetSelectionContext
@@ -980,6 +1053,35 @@ class CoreTests(unittest.TestCase):
         )
         self.assertIsNotNone(selected.target)
         self.assertNotIn("attack_box", strategy.default_settings)
+
+    def test_bowman_dynamic_prioritizes_true_nearest_target(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import TargetSelectionContext
+
+        strategy = get_strategy("bowman_dynamic")
+        horizontally_near_but_far_above = bot.Detection(
+            (105, 15, 10, 10),
+            0.99,
+            "vertical-far.png",
+        )
+        truly_nearest = bot.Detection((135, 95, 10, 10), 0.8, "nearest.png")
+
+        selected = strategy.select_targets(
+            TargetSelectionContext(
+                detections=[horizontally_near_but_far_above, truly_nearest],
+                player_box=(95, 100, 10, 1),
+                player_raw_box=(95, 60, 10, 40),
+                player_anchor=(100.0, 100.0),
+                scene_width=400,
+                scene_height=240,
+                facing="right",
+                target_area={"forward": 0.3, "back": 0.1, "up": 0.4, "down": 0.2},
+                settings=self.config["strategy"]["options"]["bowman_dynamic"],
+            )
+        )
+
+        self.assertIsNotNone(selected.target)
+        self.assertEqual(selected.target.name, "nearest.png")
 
     def test_bowman_dynamic_returns_to_platform_center_before_attacking(self):
         from mbv.strategies import get_strategy
@@ -1017,7 +1119,7 @@ class CoreTests(unittest.TestCase):
         settings = json.loads(json.dumps(self.config["strategy"]["options"]["bowman_dynamic"]))
         settings["platform_center_tolerance"] = 0.1
         context = StrategyActionContext(
-            marker=(0.5, 0.5),
+            marker=(0.5, 0.6),
             player_box=(880, 100, 40, 1),
             player_anchor=(900.0, 100.0),
             target_box=(920, 100, 20, 20),
@@ -1044,7 +1146,7 @@ class CoreTests(unittest.TestCase):
 
         strategy = get_strategy("bowman_dynamic")
         context = StrategyActionContext(
-            marker=(0.5, 0.5),
+            marker=(0.5, 0.6),
             player_box=(500, 100, 40, 1),
             player_anchor=(520.0, 100.0),
             target_box=(600, 100, 20, 20),
@@ -1062,6 +1164,76 @@ class CoreTests(unittest.TestCase):
         decision = strategy.decide(context)
         self.assertEqual(decision.action, "attack")
         self.assertTrue(decision.target_seen)
+
+    def test_bowman_dynamic_jumps_up_after_falling_below_safe_point(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        strategy = get_strategy("bowman_dynamic")
+        settings = {
+            "platform_center_tolerance": 0.08,
+            "platform_center_vertical_tolerance": 0.06,
+            "platform_return_jump_interval_seconds": 0.45,
+        }
+        common = dict(
+            player_box=(500, 100, 40, 1),
+            player_anchor=(520.0, 100.0),
+            target_box=(600, 100, 20, 20),
+            chase_box=None,
+            combat_width=1000,
+            has_monster_candidates=True,
+            last_target_seen=9.0,
+            last_pickup=0.0,
+            direction="right",
+            behavior=self.config["behavior"],
+            settings=settings,
+            recognition={"platform_center": {"x": 0.5, "y": 0.4}},
+        )
+
+        decision = strategy.decide(
+            StrategyActionContext(marker=(0.52, 0.55), now=10.0, last_jump=0.0, **common)
+        )
+        waiting = strategy.decide(
+            StrategyActionContext(marker=(0.52, 0.55), now=10.0, last_jump=9.8, **common)
+        )
+
+        self.assertEqual((decision.action, decision.state), ("jump", "RETURN_CENTER_JUMP_UP"))
+        self.assertIsNone(decision.direction)
+        self.assertEqual((waiting.action, waiting.state), ("stop", "WAITING_CENTER_JUMP"))
+
+    def test_bowman_dynamic_down_jumps_when_above_safe_point(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        strategy = get_strategy("bowman_dynamic")
+        decision = strategy.decide(
+            StrategyActionContext(
+                marker=(0.5, 0.2),
+                player_box=(500, 100, 40, 1),
+                player_anchor=(520.0, 100.0),
+                target_box=(600, 100, 20, 20),
+                chase_box=None,
+                combat_width=1000,
+                has_monster_candidates=True,
+                now=10.0,
+                last_target_seen=9.0,
+                last_pickup=0.0,
+                last_jump=0.0,
+                direction="right",
+                behavior=self.config["behavior"],
+                settings={
+                    "platform_center_tolerance": 0.08,
+                    "platform_center_vertical_tolerance": 0.06,
+                    "platform_return_jump_interval_seconds": 0.45,
+                },
+                recognition={"platform_center": {"x": 0.5, "y": 0.4}},
+            )
+        )
+
+        self.assertEqual(
+            (decision.action, decision.state),
+            ("down_jump", "RETURN_CENTER_DOWN_JUMP"),
+        )
 
     def test_bowman_dynamic_stops_when_minimap_marker_is_temporarily_missing(self):
         from mbv.strategies import get_strategy

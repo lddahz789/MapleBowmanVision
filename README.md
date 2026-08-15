@@ -96,7 +96,7 @@
 | 启动 / 暂停 | F8 |
 | 立即退出 | F9 或 Ctrl+Shift+Q |
 
-游戏内按键在面板「参数设置」或 `config.json` 的 `keys` 里改。示例默认：攻击 `Shift`，跳跃 `Alt`，拾取 `Z`，HP `Home`，MP `End`，移动左右方向键。支持字母、数字、Ctrl、Shift、Alt、Home、End、PageUp、PageDown 等。
+游戏内按键在面板「参数设置」或 `config.json` 的 `keys` 里改。示例默认：攻击 `Shift`，跳跃 `Alt`，拾取 `Z`，HP `Home`，MP `End`，移动左右方向键，下跳方向键为 `Down`。支持字母、数字、Ctrl、Shift、Alt、Home、End、PageUp、PageDown 等。
 
 ---
 

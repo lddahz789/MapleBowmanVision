@@ -17,17 +17,28 @@ class BowmanDynamicStrategy:
     display_name = "弓箭手动态"
     profession = "弓箭手"
     description = (
-        "按小地图位置优先回到平台安全点附近；范围内选择通用索敌区中最近的同层怪物攻击，"
-        "框外同层怪物则接近。无目标时可按配置拾取或左右巡逻。"
+        "按小地图水平和垂直位置优先回到平台安全点附近；掉到下层时跳回，"
+        "位于上层时下跳。范围内选择通用索敌区中最近的同层怪物攻击，"
+        "每次攻击前按当前目标方向重新转向。框外同层怪物则接近；无目标时可拾取或巡逻。"
     )
     required_recognition_data = ("platform_center",)
     toggle_fields = ()
     capture_fields = ()
     setting_fields = (
-        StrategySettingField("platform_center_tolerance", "小地图平台安全半径", maximum=0.5),
+        StrategySettingField("platform_center_tolerance", "小地图水平安全半径", maximum=0.5),
+        StrategySettingField("platform_center_vertical_tolerance", "小地图垂直安全半径", maximum=0.5),
+        StrategySettingField(
+            "platform_return_jump_interval_seconds",
+            "回安全点跳跃间隔秒",
+            step=0.05,
+            minimum=0.1,
+            maximum=2.0,
+        ),
     )
     default_settings: dict[str, Any] = {
-        "platform_center_tolerance": 0.12,
+        "platform_center_tolerance": 0.08,
+        "platform_center_vertical_tolerance": 0.06,
+        "platform_return_jump_interval_seconds": 0.45,
     }
 
     def select_targets(self, context: TargetSelectionContext) -> TargetSelection:
@@ -41,6 +52,7 @@ class BowmanDynamicStrategy:
             facing=context.facing,
             raw_box=context.player_raw_box,
             player_anchor=context.player_anchor,
+            distance_mode="euclidean",
         )
         chase_target = None
         if target is None:
@@ -52,6 +64,7 @@ class BowmanDynamicStrategy:
                 attack_box,
                 raw_box=context.player_raw_box,
                 player_anchor=context.player_anchor,
+                distance_mode="euclidean",
             )
         return TargetSelection(target, chase_target)
 
@@ -67,14 +80,54 @@ class BowmanDynamicStrategy:
             return StrategyDecision("stop", "MARKER_LOST")
 
         marker_x = max(0.0, min(1.0, float(context.marker[0])))
+        marker_y = max(0.0, min(1.0, float(context.marker[1])))
         center = context.recognition.get("platform_center", {})
         center_x = max(0.0, min(1.0, float(center.get("x", 0.5))))
-        tolerance = max(0.0, min(0.5, float(context.settings.get("platform_center_tolerance", 0.12))))
-        if abs(marker_x - center_x) > tolerance:
+        center_y = max(0.0, min(1.0, float(center.get("y", 0.5))))
+        horizontal_tolerance = max(
+            0.0,
+            min(0.5, float(context.settings.get("platform_center_tolerance", 0.08))),
+        )
+        vertical_tolerance = max(
+            0.0,
+            min(0.5, float(context.settings.get("platform_center_vertical_tolerance", 0.06))),
+        )
+        horizontal_delta = marker_x - center_x
+        vertical_delta = marker_y - center_y
+        if abs(horizontal_delta) > horizontal_tolerance:
             direction = "left" if marker_x > center_x else "right"
             return StrategyDecision(
                 "move",
                 f"RETURN_CENTER_{direction.upper()}",
+                direction=direction,
+                player_x=marker_x,
+            )
+
+        if abs(vertical_delta) > vertical_tolerance:
+            jump_interval = max(
+                0.1,
+                min(
+                    2.0,
+                    float(context.settings.get("platform_return_jump_interval_seconds", 0.45)),
+                ),
+            )
+            if context.now - context.last_jump < jump_interval:
+                return StrategyDecision("stop", "WAITING_CENTER_JUMP", player_x=marker_x)
+            if vertical_delta < 0.0:
+                return StrategyDecision(
+                    "down_jump",
+                    "RETURN_CENTER_DOWN_JUMP",
+                    player_x=marker_x,
+                )
+            alignment_dead_zone = min(0.03, max(0.01, horizontal_tolerance * 0.35))
+            direction = None
+            if horizontal_delta > alignment_dead_zone:
+                direction = "left"
+            elif horizontal_delta < -alignment_dead_zone:
+                direction = "right"
+            return StrategyDecision(
+                "jump",
+                f"RETURN_CENTER_JUMP_{(direction or 'up').upper()}",
                 direction=direction,
                 player_x=marker_x,
             )

@@ -92,6 +92,7 @@ def load_config(path: Path) -> dict[str, Any]:
     input_delivery(config)
     config.setdefault("keys", {})
     config["keys"].setdefault("jump", "alt")
+    config["keys"].setdefault("down", "down")
     config.setdefault("behavior", {})
     legacy_bow_attack_box = attack_box_from_config(config["behavior"])
     had_strategy_section = isinstance(config.get("strategy"), dict)
