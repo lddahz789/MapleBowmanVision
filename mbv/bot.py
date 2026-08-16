@@ -107,6 +107,8 @@ STATE_LABELS = {
     "RETURN_SAFE_JUMP_UP": "向上跳回安全输出区",
     "WAITING_SAFE_JUMP": "等待下一次回位跳跃",
     "SAFE_OUTPUT_ABOVE": "位于安全区上方，等待人工处理",
+    "JUMP_ATTACK_NEAR": "近目标跳跃攻击",
+    "WAITING_NEAR_JUMP_ATTACK": "等待近目标跳跃攻击间隔",
     "JUMP_ATTACK_CLOSE": "近身跳跃攻击",
     "WAITING_JUMP_ATTACK": "等待近身跳跃攻击冷却",
 }
@@ -878,7 +880,14 @@ class BowmanBot:
         self.state = state
         self.log.write("safe_return_down_jump")
 
-    def jump_attack(self, target_x: float, player_x: float, overlap_ratio: float, now: float) -> None:
+    def jump_attack(
+        self,
+        target_x: float,
+        player_x: float,
+        overlap_ratio: float,
+        now: float,
+        state: str = "JUMP_ATTACK_CLOSE",
+    ) -> None:
         keys = self.config["keys"]
         self.stop_move()
         desired = "left" if target_x < player_x else "right"
@@ -897,9 +906,10 @@ class BowmanBot:
             self.keyboard.up(jump_key)
         self.last_jump_attack = now
         self.last_attack = now
-        self.state = "JUMP_ATTACK_CLOSE"
+        self.state = state
         self.log.write(
             "jump_attack",
+            state=state,
             direction=desired,
             overlap_ratio=round(overlap_ratio, 4),
             jump_key=jump_key,
@@ -1042,6 +1052,7 @@ class BowmanBot:
                 float(decision.player_x),
                 float(decision.close_overlap_ratio or 0.0),
                 now,
+                decision.state,
             )
         elif decision.action == "pickup":
             self.stop_move()

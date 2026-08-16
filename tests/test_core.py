@@ -549,6 +549,14 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(stationary.required_recognition_data, ())
         self.assertEqual(throwing_star.required_recognition_data, ())
         self.assertEqual(len(throwing_star.capture_fields), 2)
+        self.assertIn(
+            "use_near_target_jump_attack",
+            {field.path for field in throwing_star.toggle_fields},
+        )
+        self.assertIn(
+            "near_target_jump_attack_distance_px",
+            {field.path for field in throwing_star.setting_fields},
+        )
         self.assertEqual(missing_recognition_data(self.config, bowman), ("platform_center",))
         self.assertEqual(missing_recognition_data(self.config, stationary), ())
         self.assertEqual(
@@ -876,6 +884,7 @@ class CoreTests(unittest.TestCase):
             behavior=self.config["behavior"],
             settings={
                 "use_safe_output_area": True,
+                "patrol_inside_safe_area": True,
                 "jump_interval_seconds": 0.35,
                 "minimum_target_vertical_gap": 0.02,
                 "close_overlap_threshold": 0.2,
@@ -887,9 +896,13 @@ class CoreTests(unittest.TestCase):
         )
         attack = strategy.decide(StrategyActionContext(target_box=(650, 300, 20, 20), **common))
         wait = strategy.decide(StrategyActionContext(target_box=None, **common))
+        idle_common = dict(common)
+        idle_common["settings"] = {**common["settings"], "patrol_inside_safe_area": False}
+        idle = strategy.decide(StrategyActionContext(target_box=None, **idle_common))
         self.assertEqual(attack.action, "attack")
         self.assertFalse(attack.face_each_attack)
         self.assertEqual((wait.action, wait.state, wait.direction), ("move", "SAFE_PATROL_RIGHT", "right"))
+        self.assertEqual((idle.action, idle.state), ("stop", "TARGET_OUT_OF_RANGE"))
 
     def test_throwing_star_safe_patrol_reverses_near_edges(self):
         from mbv.strategies import get_strategy
@@ -1130,6 +1143,7 @@ class CoreTests(unittest.TestCase):
             behavior=self.config["behavior"],
             settings={
                 "use_safe_output_area": False,
+                "use_near_target_jump_attack": False,
                 "close_overlap_threshold": 0.2,
                 "jump_attack_cooldown_seconds": 0.45,
             },
@@ -1172,6 +1186,7 @@ class CoreTests(unittest.TestCase):
                 behavior=self.config["behavior"],
                 settings={
                     "use_safe_output_area": False,
+                    "use_near_target_jump_attack": False,
                     "close_overlap_threshold": 0.2,
                     "jump_attack_cooldown_seconds": 0.45,
                 },
@@ -1179,6 +1194,88 @@ class CoreTests(unittest.TestCase):
             )
         )
         self.assertEqual((decision.action, decision.state), ("stop", "WAITING_JUMP_ATTACK"))
+
+    def test_throwing_star_near_target_jump_attack_uses_adjustable_distance(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        strategy = get_strategy("throwing_star_safe")
+        common = dict(
+            marker=(0.5, 0.25),
+            player_box=(130, 100, 40, 1),
+            player_anchor=(150.0, 100.0),
+            chase_box=None,
+            combat_width=1000,
+            combat_height=500,
+            has_monster_candidates=True,
+            now=10.0,
+            last_target_seen=9.0,
+            last_pickup=0.0,
+            last_jump_attack=0.0,
+            direction="right",
+            behavior=self.config["behavior"],
+            settings={
+                "use_safe_output_area": False,
+                "use_near_target_jump_attack": True,
+                "near_target_jump_attack_distance_px": 120.0,
+                "use_close_jump_attack": False,
+            },
+            recognition={},
+        )
+        at_boundary = strategy.decide(
+            StrategyActionContext(target_box=(260, 180, 20, 20), **common)
+        )
+        outside = strategy.decide(
+            StrategyActionContext(target_box=(261, 180, 20, 20), **common)
+        )
+        disabled_common = dict(common)
+        disabled_common["settings"] = {
+            **common["settings"],
+            "use_near_target_jump_attack": False,
+        }
+        disabled = strategy.decide(
+            StrategyActionContext(target_box=(260, 180, 20, 20), **disabled_common)
+        )
+
+        self.assertEqual((at_boundary.action, at_boundary.state), ("jump_attack", "JUMP_ATTACK_NEAR"))
+        self.assertEqual(outside.action, "attack")
+        self.assertEqual(disabled.action, "attack")
+
+    def test_throwing_star_near_target_jump_attack_waits_for_attack_interval(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        strategy = get_strategy("throwing_star_safe")
+        common = dict(
+            marker=(0.5, 0.25),
+            player_box=(130, 100, 40, 1),
+            player_anchor=(150.0, 100.0),
+            target_box=(260, 180, 20, 20),
+            chase_box=None,
+            combat_width=1000,
+            combat_height=500,
+            has_monster_candidates=True,
+            last_target_seen=9.0,
+            last_pickup=0.0,
+            last_jump_attack=9.8,
+            direction="right",
+            behavior={**self.config["behavior"], "attack_interval_seconds": 0.24},
+            settings={
+                "use_safe_output_area": False,
+                "use_near_target_jump_attack": True,
+                "near_target_jump_attack_distance_px": 120.0,
+                "use_close_jump_attack": False,
+            },
+            recognition={},
+        )
+        waiting = strategy.decide(StrategyActionContext(now=10.0, **common))
+        ready = strategy.decide(StrategyActionContext(now=10.05, **common))
+
+        self.assertEqual(
+            (waiting.action, waiting.state),
+            ("stop", "WAITING_NEAR_JUMP_ATTACK"),
+        )
+        self.assertEqual((ready.action, ready.state), ("jump_attack", "JUMP_ATTACK_NEAR"))
 
     def test_jump_attack_holds_alt_then_shift_and_releases_in_reverse_order(self):
         instance = bot.BowmanBot.__new__(bot.BowmanBot)
@@ -2050,9 +2147,11 @@ class CoreTests(unittest.TestCase):
                 "target_priority_mode": "region_priority_then_distance",
                 "target_regions": [],
                 "target_face_tap_seconds": 0.025,
+                "use_near_target_jump_attack": True,
+                "near_target_jump_attack_distance_px": 120.0,
                 "use_close_jump_attack": True,
                 "use_safe_output_area": False,
-                "patrol_inside_safe_area": True,
+                "patrol_inside_safe_area": False,
                 "jump_interval_seconds": 0.35,
                 "safe_patrol_edge_margin": 0.02,
                 "minimum_target_vertical_gap": 0.02,

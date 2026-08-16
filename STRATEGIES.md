@@ -28,11 +28,11 @@
 
 - 职业：飞侠·标飞
 - 标识：`throwing_star_safe`
-- 描述：安全输出区在放大的小地图上框选，并与玩家标记使用同一坐标；启用后，玩家标记低于安全区时优先朝安全区水平中心移动并向上跳。标飞可维护多个跟随角色但不随面向翻转的独立索敌区，按区域并集过滤怪物；近身水平重叠达到阈值时可执行跳跃攻击。
+- 描述：安全输出区在放大的小地图上框选，并与玩家标记使用同一坐标；启用后，玩家标记低于安全区时优先朝安全区水平中心移动并向上跳。标飞可维护多个跟随角色但不随面向翻转的独立索敌区，按区域并集过滤怪物；目标进入可调近距离时可令每次攻击先跳跃。
 - 依赖采集：战斗识别区、玩家定位模板、怪物模板和小地图玩家标记；`use_target_regions=true` 时至少要求一个已启用的标飞索敌区，`use_safe_output_area=true` 时要求重新框选小地图安全输出区。
-- 决策优先级：输入/窗口安全 → HP/MP 补药 → 可选安全区回位 → 近身跳跃攻击 → 普通向下攻击 → 安全区内巡逻。
+- 决策优先级：输入/窗口安全 → HP/MP 补药 → 可选安全区回位 → 近目标每次跳跃攻击 → 近身重叠跳跃攻击 → 普通向下攻击 → 可选安全区巡逻。
 - 上方边界：当前不处理玩家位于安全区上方的下跳回位；发现位于上方时原地停住并等待人工处理。
-- 移动限制：不追怪、不自动拾取；无有效目标时只在安全输出区内左右巡逻，到边界前自动折返。
+- 移动限制：不追怪、不自动拾取；巡逻默认关闭，启用后无有效目标时只在安全输出区内左右巡逻，到边界前自动折返。
 - `use_target_regions`：启用策略内的多索敌区；区域相对稳定角色锚点移动，但不随角色面向翻转，重采战斗识别区后自动失效。
 - `use_common_target_box`：是否在多索敌区过滤后继续套用公共角色相对索敌框，默认关闭。
 - `only_targets_below_player`：是否只保留角色脚底下方的目标。
@@ -42,6 +42,8 @@
 - `throwing_star_safe_output_area`：保存 `space=minimap` 和相对小地图的 `x/y/w/h`；重采战斗识别区时保留，重采小地图时失效。旧战斗画面坐标不迁移。
 - `jump_interval_seconds`：连续回位跳跃之间的最短间隔。
 - `minimum_target_vertical_gap`：怪物中心必须低于角色脚底的最小归一化高度差，同层目标会被过滤。
+- `use_near_target_jump_attack`：目标进入近距离时，是否把每次攻击改为跳跃攻击，默认开启。
+- `near_target_jump_attack_distance_px`：目标中心到稳定角色锚点的最大水平像素距离，默认 `120`；等于边界时触发。
 - `use_close_jump_attack`：是否启用近身重叠跳跃攻击，默认开启。
 - `close_overlap_threshold`：水平重叠宽度除以角色与怪物较小宽度，默认阈值 `0.2`，等于阈值时触发。
 - `jump_attack_cooldown_seconds`：两次跳跃攻击之间的最短间隔。
@@ -104,8 +106,10 @@
         "target_priority_mode": "region_priority_then_distance",
         "target_regions": [],
         "target_face_tap_seconds": 0.025,
+        "use_near_target_jump_attack": true,
+        "near_target_jump_attack_distance_px": 120.0,
         "use_safe_output_area": false,
-        "patrol_inside_safe_area": true,
+        "patrol_inside_safe_area": false,
         "jump_interval_seconds": 0.35,
         "safe_patrol_edge_margin": 0.02,
         "minimum_target_vertical_gap": 0.02

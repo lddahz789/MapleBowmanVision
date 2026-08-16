@@ -92,7 +92,7 @@ class ThrowingStarSafeStrategy:
     profession = "飞侠·标飞"
     description = (
         "安全输出区在小地图上框选；启用后，玩家低于安全区时优先朝中心移动并连续向上跳。"
-        "可配置多个跟随角色位置但不随面向翻转的独立索敌区；安全区内无目标时左右巡逻。"
+        "可配置多个跟随角色位置但不随面向翻转的独立索敌区，并可在近距离攻击前跳跃。"
     )
     required_recognition_data: tuple[str, ...] = ()
     toggle_fields = (
@@ -100,6 +100,7 @@ class ThrowingStarSafeStrategy:
         StrategyToggleField("use_common_target_box", "同时限制在通用索敌框内"),
         StrategyToggleField("only_targets_below_player", "只攻击角色下方目标"),
         StrategyToggleField("auto_face_target", "索敌成功后先自动面向目标"),
+        StrategyToggleField("use_near_target_jump_attack", "启用近目标每次跳跃攻击"),
         StrategyToggleField("use_close_jump_attack", "启用近身重叠跳跃攻击"),
         StrategyToggleField("use_safe_output_area", "启用标飞安全输出区回位"),
         StrategyToggleField("patrol_inside_safe_area", "安全输出区内无目标时巡逻"),
@@ -160,6 +161,13 @@ class ThrowingStarSafeStrategy:
             maximum=0.5,
         ),
         StrategySettingField(
+            "near_target_jump_attack_distance_px",
+            "近目标跳攻距离像素",
+            step=5.0,
+            minimum=0.0,
+            maximum=1000.0,
+        ),
+        StrategySettingField(
             "close_overlap_threshold",
             "近身水平重叠阈值",
             step=0.05,
@@ -182,9 +190,11 @@ class ThrowingStarSafeStrategy:
         "target_priority_mode": "region_priority_then_distance",
         "target_regions": [],
         "target_face_tap_seconds": 0.025,
+        "use_near_target_jump_attack": True,
+        "near_target_jump_attack_distance_px": 120.0,
         "use_close_jump_attack": True,
         "use_safe_output_area": False,
-        "patrol_inside_safe_area": True,
+        "patrol_inside_safe_area": False,
         "jump_interval_seconds": 0.35,
         "safe_patrol_edge_margin": 0.02,
         "minimum_target_vertical_gap": 0.02,
@@ -392,6 +402,40 @@ class ThrowingStarSafeStrategy:
                     ),
                 )
             overlap_ratio = horizontal_overlap_ratio(context.player_box, context.target_box)
+            target_center_x = context.target_box[0] + context.target_box[2] / 2
+            target_distance_px = abs(target_center_x - anchor_x)
+            near_jump_distance_px = max(
+                0.0,
+                min(
+                    1000.0,
+                    float(context.settings.get("near_target_jump_attack_distance_px", 120.0)),
+                ),
+            )
+            if (
+                bool(context.settings.get("use_near_target_jump_attack", True))
+                and target_distance_px <= near_jump_distance_px
+            ):
+                attack_interval = max(
+                    0.05,
+                    float(context.behavior.get("attack_interval_seconds", 0.24)),
+                )
+                if context.now - context.last_jump_attack >= attack_interval:
+                    return StrategyDecision(
+                        "jump_attack",
+                        "JUMP_ATTACK_NEAR",
+                        target_x=target_x,
+                        player_x=player_x,
+                        target_seen=True,
+                        face_each_attack=False,
+                        close_overlap_ratio=overlap_ratio,
+                    )
+                return StrategyDecision(
+                    "stop",
+                    "WAITING_NEAR_JUMP_ATTACK",
+                    player_x=player_x,
+                    target_seen=True,
+                    close_overlap_ratio=overlap_ratio,
+                )
             overlap_threshold = max(
                 0.0,
                 min(1.0, float(context.settings.get("close_overlap_threshold", 0.2))),
@@ -429,7 +473,7 @@ class ThrowingStarSafeStrategy:
             )
         if (
             safe_patrol_bounds is not None
-            and bool(context.settings.get("patrol_inside_safe_area", True))
+            and bool(context.settings.get("patrol_inside_safe_area", False))
         ):
             left, right = safe_patrol_bounds
             margin = max(
