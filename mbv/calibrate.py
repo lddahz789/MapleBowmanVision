@@ -12,9 +12,8 @@ import numpy as np
 from mbv.config import load_config, refresh_calibrated, save_config
 from mbv.input import VK
 from mbv.overlay import interactive_overlay
-from mbv.paths import PLAYER_ASSET_DIR, PLAYER_HEAD_ASSET_DIR, PLAYER_TITLE_ASSET_DIR
 from mbv.strategies import list_strategies
-from mbv.template_store import monster_template_directory
+from mbv.template_store import monster_template_directory, template_roots_from_config
 from mbv.vision import (
     MINIMAP_REGION_SPACE,
     attack_box_from_rectangle,
@@ -864,6 +863,7 @@ def _save_captured_template(
 
 def capture_template(config_path: Path, parent: Any = None, category: str = "") -> Path:
     config = load_config(config_path)
+    roots = template_roots_from_config(config)
     window = find_game_window(config)
     image = capture_frozen_selection(
         window,
@@ -872,12 +872,19 @@ def capture_template(config_path: Path, parent: Any = None, category: str = "") 
         parent=parent,
     )
     bgra = monster_template_image(image)
-    directory = monster_template_directory(category, "monster", create=True)
+    directory = monster_template_directory(
+        category,
+        "monster",
+        monster_root=roots.monster,
+        filter_root=roots.filter,
+        create=True,
+    )
     return _save_captured_template(bgra, directory, "monster", "怪物")
 
 
 def capture_monster_filter(config_path: Path, parent: Any = None, category: str = "") -> Path:
     config = load_config(config_path)
+    roots = template_roots_from_config(config)
     window = find_game_window(config)
     image = capture_frozen_selection(
         window,
@@ -888,7 +895,13 @@ def capture_monster_filter(config_path: Path, parent: Any = None, category: str 
     # 过滤项需要保留完整矩形结构；透明度全满可阻止加载器套用怪物前景蒙版。
     bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
     bgra[:, :, 3] = 255
-    directory = monster_template_directory(category, "filter", create=True)
+    directory = monster_template_directory(
+        category,
+        "filter",
+        monster_root=roots.monster,
+        filter_root=roots.filter,
+        create=True,
+    )
     return _save_captured_template(bgra, directory, "filter", "怪物过滤项")
 
 
@@ -948,6 +961,7 @@ def nameplate_template_alpha(image: np.ndarray) -> np.ndarray:
 
 def capture_player_template(config_path: Path, parent: Any = None) -> Path:
     config = load_config(config_path)
+    roots = template_roots_from_config(config)
     window = find_game_window(config)
     image, anchor_offset = _capture_player_template_with_anchor(
         window,
@@ -962,7 +976,7 @@ def capture_player_template(config_path: Path, parent: Any = None) -> Path:
     bgra[:, :, 3] = alpha
     return _save_captured_template(
         bgra,
-        PLAYER_ASSET_DIR,
+        roots.player,
         "nameplate",
         "玩家姓名板",
         anchor_offset=anchor_offset,
@@ -970,24 +984,25 @@ def capture_player_template(config_path: Path, parent: Any = None) -> Path:
 
 
 def capture_player_aux_template(config_path: Path, kind: str, parent: Any = None) -> Path:
+    if kind not in {"head", "title"}:
+        raise ValueError(f"未知辅助模板类型：{kind}")
+    config = load_config(config_path)
+    roots = template_roots_from_config(config)
     specs = {
         "head": (
             "紧贴框选自己的头部（头发和脸），不要包含身体、姓名板或其他玩家",
-            PLAYER_HEAD_ASSET_DIR,
+            roots.head,
             "head",
             "玩家头部",
         ),
         "title": (
             "紧贴框选姓名板下方的称号勋章整行，不要包含姓名板、宠物或怪物",
-            PLAYER_TITLE_ASSET_DIR,
+            roots.title,
             "title",
             "玩家称号勋章",
         ),
     }
-    if kind not in specs:
-        raise ValueError(f"未知辅助模板类型：{kind}")
     prompt, directory, prefix, label = specs[kind]
-    config = load_config(config_path)
     window = find_game_window(config)
     image, anchor_offset = _capture_player_template_with_anchor(
         window,

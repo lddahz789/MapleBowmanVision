@@ -367,7 +367,7 @@ class ThrowingStarSafeStrategy:
                     )
                 return StrategyDecision("stop", "WAITING_SAFE_JUMP", player_x=player_x)
 
-            if player_y < top:
+            if safe_player_y < top:
                 return StrategyDecision("stop", "SAFE_OUTPUT_ABOVE", player_x=player_x)
 
             if direction is not None:

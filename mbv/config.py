@@ -3,14 +3,17 @@ from __future__ import annotations
 from datetime import datetime
 import json
 import math
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
+from mbv.buffs import BUFF_SLOT_KEYS
 from mbv.input import input_delivery
-from mbv.paths import LOG_DIR, PLAYER_ASSET_DIR, PLAYER_HEAD_ASSET_DIR, PLAYER_TITLE_ASSET_DIR
+from mbv.paths import CLASSIC_PROFILE, LOG_DIR, profile_key_from_config
 from mbv.strategies import normalize_strategy_config
-from mbv.template_store import list_monster_categories
+from mbv.template_store import list_monster_categories, template_roots_from_config
 from mbv.vision import MINIMAP_REGION_SPACE, attack_box_from_config
 
 class SessionLog:
@@ -31,15 +34,17 @@ def png_count(directory: Path) -> int:
     return sum(1 for path in directory.glob("*.png"))
 
 
-def template_counts() -> dict[str, int]:
-    categories = list_monster_categories()
+def template_counts(config: dict[str, Any] | None = None) -> dict[str, int]:
+    selected = config or {"profile": CLASSIC_PROFILE}
+    roots = template_roots_from_config(selected)
+    categories = list_monster_categories(roots.monster, roots.filter)
     return {
         "monster": sum(item.monster_count for item in categories),
         "filter": sum(item.filter_count for item in categories),
         "category": len(categories),
-        "player": png_count(PLAYER_ASSET_DIR),
-        "head": png_count(PLAYER_HEAD_ASSET_DIR),
-        "title": png_count(PLAYER_TITLE_ASSET_DIR),
+        "player": png_count(roots.player),
+        "head": png_count(roots.head),
+        "title": png_count(roots.title),
     }
 
 
@@ -67,11 +72,45 @@ def _resized_legacy_target_box(box: dict[str, float]) -> dict[str, float]:
     }
 
 
+def _normalize_buffs(config: dict[str, Any]) -> None:
+    raw_buffs = config.get("buffs")
+    buffs = raw_buffs if isinstance(raw_buffs, dict) else {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for slot in BUFF_SLOT_KEYS:
+        raw_item = buffs.get(slot)
+        item = raw_item if isinstance(raw_item, dict) else {}
+        key = str(item.get("key", "")).strip().casefold()
+        raw_interval = item.get("interval_seconds", 0.0)
+        try:
+            if isinstance(raw_interval, bool):
+                raise TypeError
+            interval = float(raw_interval)
+        except (TypeError, ValueError):
+            interval = 0.0
+        if not math.isfinite(interval):
+            interval = 0.0
+        normalized_interval = max(0.0, min(86400.0, interval))
+        raw_enabled = item.get("enabled")
+        enabled = (
+            raw_enabled
+            if isinstance(raw_enabled, bool)
+            else bool(key and normalized_interval > 0.0)
+        )
+        normalized[slot] = {
+            "enabled": enabled,
+            "key": key,
+            "interval_seconds": normalized_interval,
+        }
+    config["buffs"] = normalized
+
+
 def load_config(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         config = json.load(handle)
     if config.get("version") != 1:
         raise RuntimeError("不支持的配置文件版本")
+    config.setdefault("profile", CLASSIC_PROFILE)
+    config["profile"] = profile_key_from_config(config)
     config.setdefault("window", {})
     config["window"].setdefault("topmost_while_armed", True)
     performance_monitor = config.get("performance_monitor")
@@ -93,6 +132,7 @@ def load_config(path: Path) -> dict[str, Any]:
     config.setdefault("keys", {})
     config["keys"].setdefault("jump", "alt")
     config["keys"].setdefault("down", "down")
+    _normalize_buffs(config)
     config.setdefault("behavior", {})
     behavior = config["behavior"]
     if not isinstance(behavior.get("player_lost_recovery_enabled"), bool):
@@ -227,7 +267,27 @@ def load_config(path: Path) -> dict[str, Any]:
     config["vision"].setdefault("player_name_identity_threshold", 0.50)
     config["vision"].setdefault("player_name_identity_margin", 0.08)
     config["vision"].setdefault("player_reacquire_confirm_frames", 2)
+    raw_nameplate_recovery_threshold = config["vision"].get(
+        "player_nameplate_recovery_threshold",
+        0.66,
+    )
+    try:
+        if isinstance(raw_nameplate_recovery_threshold, bool):
+            raise TypeError
+        nameplate_recovery_threshold = float(raw_nameplate_recovery_threshold)
+    except (TypeError, ValueError):
+        nameplate_recovery_threshold = 0.66
+    if not math.isfinite(nameplate_recovery_threshold):
+        nameplate_recovery_threshold = 0.66
+    config["vision"]["player_nameplate_recovery_threshold"] = max(
+        0.0,
+        min(
+            float(config["vision"].get("player_template_threshold", 0.76)),
+            nameplate_recovery_threshold,
+        ),
+    )
     config["vision"].setdefault("player_auxiliary_max_jump", 0.06)
+    config["vision"].setdefault("player_auxiliary_continuation_seconds", 15.0)
     config["vision"].setdefault("player_auxiliary_identity_threshold", 0.90)
     config["vision"].setdefault("player_auxiliary_reacquire_confirm_frames", 3)
     if not isinstance(config["vision"].get("player_minimap_assist_enabled"), bool):
@@ -270,10 +330,34 @@ def refresh_calibrated(config: dict[str, Any]) -> bool:
     return complete
 
 
+def _atomic_write(path: Path, payload: bytes) -> None:
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def save_config(path: Path, config: dict[str, Any]) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(config, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    # 序列化失败也不得触碰原文件；备份只保存完整、可解析的上一版。
+    payload = (json.dumps(config, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    if path.exists():
+        previous = path.read_bytes()
+        try:
+            json.loads(previous)
+        except (ValueError, UnicodeError):
+            pass
+        else:
+            _atomic_write(path.with_name(path.name + ".bak"), previous)
+    _atomic_write(path, payload)
 
 
 def create_config_from_example(path: Path, example_path: Path) -> bool:

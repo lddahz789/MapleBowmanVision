@@ -12,6 +12,7 @@ from mbv.paths import (
     PLAYER_HEAD_ASSET_DIR,
     PLAYER_TITLE_ASSET_DIR,
     TEMPLATE_TRASH_DIR,
+    asset_paths_from_config,
 )
 
 
@@ -58,6 +59,21 @@ class TemplateRoots:
 
 
 DEFAULT_TEMPLATE_ROOTS = TemplateRoots()
+
+
+def template_roots_from_config(config: dict[str, object]) -> TemplateRoots:
+    paths = asset_paths_from_config(config)
+    return TemplateRoots(
+        monster=paths.monster,
+        filter=paths.filter,
+        player=paths.player,
+        head=paths.head,
+        title=paths.title,
+    )
+
+
+def template_trash_from_config(config: dict[str, object]) -> Path:
+    return asset_paths_from_config(config).trash
 
 
 @dataclass(frozen=True)

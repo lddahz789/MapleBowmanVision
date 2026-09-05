@@ -6,10 +6,15 @@
 
 - 职业：弓箭手
 - 标识：`bowman_dynamic`
-- 描述：根据小地图玩家标记的水平与垂直位置优先回到平台安全点附近；掉到下层时跳回，位于上层时下跳。范围内按玩家攻击锚点到怪物中心的二维距离优先攻击最近单位；每次攻击都先按住当前目标方向，在方向键仍按下时发出攻击，被怪物击退后也不依赖上次朝向。
+- 描述：根据小地图玩家标记的水平与垂直位置优先回到平台安全点附近；掉到下层时跳回，位于上层时下跳。范围内按玩家攻击锚点到怪物中心的二维距离优先攻击最近单位；怪物贴身时用近身技能，当前目标附近聚集到指定数量时用 AOE，否则用单体技能。
 - 依赖采集：小地图与玩家标记、小地图平台安全点、战斗识别区、玩家定位模板、怪物模板。
-- 决策优先级：输入/窗口安全 → HP/MP 补药 → 返回小地图平台安全点 → 区内攻击 → 同层追踪 → 拾取/巡逻。
+- 决策优先级：输入/窗口安全 → HP/MP 补药 → 返回小地图平台安全点 → 近身技能 → 聚怪 AOE → 单体技能 → 同层追踪 → 拾取/巡逻。
 - 索敌框：使用公共 `targeting.box`，不属于弓箭手策略；框随角色朝向左右翻转。
+- `aoe_skill_key` / `single_skill_key` / `melee_skill_key`：面板直接采集三种技能键；AOE、近身留空表示不用，单体留空则回退到公共 `keys.attack`。
+- `aoe_min_monsters`：当前目标及其附近怪物达到此数量才使用 AOE，默认 `2`。
+- `aoe_cluster_distance_multiplier`：两怪矩形边缘距离除以两者平均可见体型，默认不超过 `0.75` 视为聚集。
+- `melee_enter_distance_multiplier`：玩家水平锚点到怪物边缘的间隙除以怪物宽度，默认不超过 `0.35` 进入近身模式。
+- `melee_exit_distance_multiplier`：已进入近身模式后，距离倍率超过此值才恢复普通技能，默认 `0.9`。
 - `platform_center_tolerance`：水平安全半径，是小地图宽度的比例；超出后忽略目标并优先左右回位。
 - `platform_center_vertical_tolerance`：垂直安全半径，是小地图高度的比例；超出后根据上下层关系跳回或下跳。
 - `platform_return_jump_interval_seconds`：连续回位跳跃之间的最短间隔，防止按键过密。
@@ -18,11 +23,18 @@
 
 - 职业：通用
 - 标识：`stationary_attack`
-- 描述：保持玩家当前位置不动，使用左右两个面向索敌区的并集选择最近同层怪物，不受当前朝向限制；仅在目标换边时短按方向键并原地攻击，范围外目标不追踪，也不巡逻或返回平台中心。
-- 依赖采集：战斗识别区、玩家定位模板、怪物模板；不依赖平台中心。
-- 决策优先级：输入/窗口安全 → HP/MP 补药 → 区内攻击 → 原地等待。
+- 描述：使用左右两个面向索敌区的并集选择最近同层怪物，不受当前朝向限制；仅在目标换边时短按方向键并原地攻击。每隔 45 秒向右短走一步，随后按小地图位置优先回到平台安全点，回位后继续输出。
+- 依赖采集：小地图与玩家标记、小地图平台安全点、战斗识别区、玩家定位模板、怪物模板。
+- 决策优先级：输入/窗口安全 → HP/MP 补药与 Buff → 平时及周期短步后的平台安全点回位 → 定时向右短步 → 区内攻击 → 原地等待。只要实时位置超出容差，即使没有周期短步也优先回位。
 - 索敌框：使用公共 `targeting.box`，框随角色朝向左右翻转。
-- 专属参数：无。
+- `periodic_step_interval_seconds`：两次向右短步之间的间隔，默认 45 秒。
+- `periodic_step_seconds`：向右短步首轮的按键时长，默认 0.12 秒。先跨帧停攻 0.6 秒，输入层独立计时抬键（调度精度约 50 毫秒），抬键后等待 0.25 秒再验证。无位移时最多三轮，后续时长分别为首轮的 2 倍和 3 倍、单轮上限 0.5 秒。
+- `platform_center_tolerance`：平时及周期短步后返回安全点时的小地图水平容差。
+- `platform_center_vertical_tolerance`：平时及周期短步后返回安全点时的小地图垂直容差。
+- 短步必须在唯一实时小地图标记中观察到正确方向至少 0.5 像素位移，才更新周期计时并进入待回位；未移动不能直接判为“回位完成”。反向位移或三轮无位移会暂停，不能把消息发送成功等同于游戏移动成功。
+- 公共 `move` 执行器在最近攻击后保留 0.6 秒停攻时间；同方向连续 2 秒无进展重新抬按一次，4 秒仍无进展则暂停。进展依据唯一实时小地图位置，记录 `movement_start/progress/retry/failed`。
+- `window_message` 模式的移动使用约 0.10 秒按下、0.05 秒抬起的脉冲。攻击/转向短按不改变，classic/旧后台模式仍使用原扫描码；不伪造焦点、不向其它窗口发送全局按键。此方式仍需客户端实测，游戏不接受窗口移动消息时会安全失败。
+- `platform_return_jump_interval_seconds`：回安全点需要跨层时，连续跳跃之间的最短间隔。
 
 ## 当前策略：标飞安全输出
 
@@ -57,7 +69,7 @@
    - `profession`：职业分类。
    - `description`：一到三句话说明执行逻辑；用户切换下拉选项时会直接看到。
    - `required_recognition_data`：依赖的公共采集数据键。
-   - `default_settings` 和 `setting_fields`：策略专属默认值及面板字段；数字字段同时声明鼠标微调步长和上下限。
+   - `default_settings` 和 `setting_fields`：策略专属默认值及面板字段；数字字段同时声明鼠标微调步长和上下限，技能键字段声明 `capture_key=true`。
    - `select_targets(context)`：使用公共 `context.target_area` 做目标筛选，只返回攻击目标和追踪目标。
    - `decide(context)`：只做策略决策，返回 `StrategyDecision`，不得直接调用键盘或 Win32。
 3. 在职业子包导出实现，再在 `mbv/strategies/__init__.py` 调用 `register_strategy(...)` 注册。面板会自动增加下拉项、说明和参数输入框。
@@ -72,8 +84,8 @@
 
 - `TargetSelectionContext` 输入的是同一帧已经完成的检测结果以及公共 `target_area`。策略不得重新执行模板匹配；标飞多索敌区从自身 `settings` 读取并相对稳定角色锚点换算，屏幕方向固定且不随面向翻转。
 - `player_anchor` 是公共视觉层提供的稳定战斗锚点；策略选敌和行动判断必须使用它，不得重新采用姓名板、头部或称号原始框的纵向中心。
-- `StrategyActionContext` 只包含归一化位置、已选目标、公共行为配置和策略设置。策略返回动作意图，`BowmanBot` 统一执行按键并写运行状态。
-- `StrategyDecision.action` 目前支持 `stop`、`face`、`attack`、`chase`、`move`、`jump`、`down_jump`、`jump_attack`、`pickup`。`face` 只短按方向键改变面向，不得保持方向键或进入移动；需要新动作时先扩展公共动作执行器和测试，不要在策略里直接发键。
+- `StrategyActionContext` 包含归一化位置、已选目标、当前索敌区候选、上次攻击技能、公共行为配置和策略设置。策略返回动作意图与可选技能键，`BowmanBot` 统一执行按键并写运行状态。
+- `StrategyDecision.action` 目前支持 `stop`、`face`、`attack`、`chase`、`move`、`step`、`jump`、`down_jump`、`jump_attack`、`pickup`。`face` 只短按方向键改变面向，不得保持方向键或进入移动；`step` 以限定时长短按移动键，并由公共执行器记录周期动作和待回位状态。需要新动作时先扩展公共动作执行器和测试，不要在策略里直接发键。
 - `StrategyDecision.face_each_attack` 仅对 `attack` 生效；为 `true` 时每次按住目标方向，等待 `behavior.face_tap_seconds` 后在按键仍按下时攻击，发出后再释放方向。需要尽量保持原位的策略可设为 `false`，此时只在目标换边时点按方向。
 - 面板“框选通用索敌范围”始终写入 `targeting.box`，与当前选中的职业策略无关。
 
@@ -93,11 +105,24 @@
     "active": "bowman_dynamic",
     "options": {
       "bowman_dynamic": {
+        "aoe_skill_key": "",
+        "single_skill_key": "",
+        "melee_skill_key": "",
+        "aoe_min_monsters": 2,
+        "aoe_cluster_distance_multiplier": 0.75,
+        "melee_enter_distance_multiplier": 0.35,
+        "melee_exit_distance_multiplier": 0.9,
         "platform_center_tolerance": 0.08,
         "platform_center_vertical_tolerance": 0.06,
         "platform_return_jump_interval_seconds": 0.45
       },
-      "stationary_attack": {},
+      "stationary_attack": {
+        "periodic_step_interval_seconds": 45.0,
+        "periodic_step_seconds": 0.12,
+        "platform_center_tolerance": 0.015,
+        "platform_center_vertical_tolerance": 0.06,
+        "platform_return_jump_interval_seconds": 0.45
+      },
       "throwing_star_safe": {
         "use_target_regions": true,
         "use_common_target_box": false,

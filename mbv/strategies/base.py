@@ -31,6 +31,8 @@ class StrategySettingField:
     step: float | None = 0.01
     minimum: float | None = 0.0
     maximum: float | None = 1.0
+    capture_key: bool = False
+    direct_numeric_input: bool = False
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,7 @@ class TargetSelectionContext:
     facing: str | None
     target_area: dict[str, float]
     settings: dict[str, Any]
+    previous_attack_skill: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +108,10 @@ class StrategyActionContext:
     combat_height: int = 1
     last_jump: float = 0.0
     last_jump_attack: float = 0.0
+    last_periodic_step: float = 0.0
+    periodic_step_pending_return: bool = False
+    eligible_detections: tuple[Detection, ...] = ()
+    previous_attack_skill: str | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +126,7 @@ class StrategyDecision:
         "down_jump",
         "jump_attack",
         "pickup",
+        "step",
     ]
     state: str
     direction: str | None = None
@@ -128,6 +136,10 @@ class StrategyDecision:
     face_each_attack: bool = True
     face_tap_seconds: float | None = None
     close_overlap_ratio: float | None = None
+    move_seconds: float | None = None
+    periodic_step_return_complete: bool = False
+    attack_key: str | None = None
+    attack_skill: str | None = None
 
 
 class CombatStrategy(Protocol):

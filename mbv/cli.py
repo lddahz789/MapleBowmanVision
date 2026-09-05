@@ -18,7 +18,13 @@ from mbv.calibrate import (
 )
 from mbv.config import create_config_from_example, load_config
 from mbv.overlay import RuntimeOverlay
-from mbv.paths import DEFAULT_CONFIG, EXAMPLE_CONFIG, LOG_DIR
+from mbv.paths import (
+    CLASSIC_PROFILE,
+    LOG_DIR,
+    PROFILE_KEYS,
+    profile_paths,
+    profile_paths_from_config_path,
+)
 from mbv.window import visible_windows
 from mbv.win32 import user32
 
@@ -52,7 +58,13 @@ class ChineseArgumentParser(argparse.ArgumentParser):
 def parse_args() -> argparse.Namespace:
     parser = ChineseArgumentParser(description="冒险岛弓箭手纯视觉固定地图原型", add_help=False)
     parser.add_argument("-h", "--help", action="help", help="显示这段帮助信息并退出")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="配置文件路径")
+    config_source = parser.add_mutually_exclusive_group()
+    config_source.add_argument("--config", type=Path, help="配置文件路径")
+    config_source.add_argument(
+        "--profile",
+        choices=PROFILE_KEYS,
+        help="运行档案；classic 为原怀旧服，newmaple 为 NewMaple",
+    )
     parser.add_argument("--calibrate", action="store_true", help="校准状态栏与小地图")
     parser.add_argument("--capture-recognition-region", action="store_true", help="采集战斗识别区与小地图平台安全点")
     parser.add_argument("--capture-template", action="store_true", help="采集怪物模板")
@@ -69,13 +81,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    config_path = args.config.resolve()
+    selected_paths = profile_paths(args.profile or CLASSIC_PROFILE)
+    config_path = (args.config or selected_paths.config).resolve()
     if args.list_windows:
         list_windows()
         return 0
     if not config_path.exists():
-        if config_path == DEFAULT_CONFIG.resolve():
-            create_config_from_example(config_path, EXAMPLE_CONFIG)
+        known_paths = profile_paths_from_config_path(config_path)
+        if known_paths is not None:
+            create_config_from_example(config_path, known_paths.example_config)
             print(f"已创建个人配置文件：{config_path}")
         else:
             print(f"找不到配置文件：{config_path}")

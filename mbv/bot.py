@@ -9,21 +9,23 @@ from typing import Any
 
 import mss
 
+from mbv.buffs import (
+    AutoBuffController,
+    BUFF_KEY_HOLD_SECONDS,
+    BUFF_PRE_CAST_SECONDS,
+    BuffAction,
+)
 from mbv.config import SessionLog, load_config
 from mbv.input import Keyboard, input_delivery, key_is_down, rising_edge, vk_for
+from mbv.movement import MoveProgress, StepMotion, directed_progress
+from mbv.background_capture import BackgroundCapture, BackgroundCaptureError
 from mbv.overlay import RuntimeOverlay
-from mbv.paths import (
-    ASSET_DIR,
-    MONSTER_FILTER_ASSET_DIR,
-    PLAYER_ASSET_DIR,
-    PLAYER_HEAD_ASSET_DIR,
-    PLAYER_TITLE_ASSET_DIR,
-)
 from mbv.performance import PerformanceMonitor
 from mbv.player_tracking import PlayerTrackState
 from mbv.potion import AutoPotionController, PotionAction
 from mbv.strategies import active_strategy, missing_recognition_data, strategy_settings
 from mbv.strategies.base import StrategyActionContext, TargetSelectionContext, horizontal_overlap_ratio
+from mbv.template_store import template_roots_from_config, template_trash_from_config
 from mbv.vision import (
     Detection,
     MINIMAP_REGION_SPACE,
@@ -72,6 +74,9 @@ from mbv.window import (
 )
 
 STATE_LABELS = {
+    "MOVEMENT_PREPARE": "停攻等待移动",
+    "PERIODIC_STEP_VERIFY": "检查向右小步实际位移",
+    "MOVEMENT_RETRY": "移动无进展，重新按键尝试",
     "PAUSED": "已暂停",
     "SCANNING": "正在搜索目标",
     "PATROL_LEFT": "向左巡逻",
@@ -88,6 +93,9 @@ STATE_LABELS = {
     "TARGET_OUT_OF_RANGE": "战斗区暂无有效目标",
     "HP_POTION": "正在使用回血药",
     "MP_POTION": "正在使用回蓝药",
+    "BUFF_1": "正在补 Buff 1",
+    "BUFF_2": "正在补 Buff 2",
+    "BUFF_3": "正在补 Buff 3",
     "PICKUP": "正在拾取",
     "MARKER_LOST": "玩家标记丢失",
     "RETURN_CENTER_LEFT": "向左返回平台安全点",
@@ -97,6 +105,8 @@ STATE_LABELS = {
     "RETURN_CENTER_JUMP_UP": "向上跳回平台安全点",
     "RETURN_CENTER_DOWN_JUMP": "下跳返回平台安全点",
     "WAITING_CENTER_JUMP": "等待下一次平台回位跳跃",
+    "PERIODIC_STEP_RIGHT": "定时向右短步",
+    "PERIODIC_STEP_RETURNED": "已回到平台安全点",
     "RETURN_SAFE_LEFT": "向左返回安全输出区",
     "RETURN_SAFE_RIGHT": "向右返回安全输出区",
     "SAFE_OUTPUT_UNCALIBRATED": "请重新框选小地图安全输出区",
@@ -114,6 +124,8 @@ STATE_LABELS = {
 }
 
 PLAYER_LOST_RECOVERY_PAUSE_SECONDS = 0.08
+DYNAMIC_DIRECTION_CHANGE_MIN_TAP_SECONDS = 0.06
+DYNAMIC_DIRECTION_CHANGE_SETTLE_SECONDS = 0.08
 
 DEFAULT_PLAYER_AUXILIARY_INTERVAL_SECONDS = 0.5
 JUMP_ATTACK_LEAD_SECONDS = 0.05
@@ -179,20 +191,22 @@ class BowmanBot:
         self.strategy = active_strategy(config)
         self.input_authorized = input_authorized
         self.delivery = input_delivery(config)
-        self.background_input = self.delivery == "background"
+        self.background_input = self.delivery in {"background", "window_message"}
         self.keyboard = Keyboard(self.delivery)
+        self.template_roots = template_roots_from_config(config)
+        self.template_trash_dir = template_trash_from_config(config)
         self.active_monster_category = str(config["vision"].get("active_monster_category", "")).strip()
         self.templates = monster_templates_for_category(
-            load_templates(ASSET_DIR, recursive=True),
+            load_templates(self.template_roots.monster, recursive=True),
             self.active_monster_category,
         )
         self.monster_filter_templates = monster_templates_for_category(
-            load_templates(MONSTER_FILTER_ASSET_DIR, recursive=True),
+            load_templates(self.template_roots.filter, recursive=True),
             self.active_monster_category,
         )
-        self.player_templates = load_templates(PLAYER_ASSET_DIR)
-        self.player_head_templates = load_templates(PLAYER_HEAD_ASSET_DIR)
-        self.player_title_templates = load_templates(PLAYER_TITLE_ASSET_DIR)
+        self.player_templates = load_templates(self.template_roots.player)
+        self.player_head_templates = load_templates(self.template_roots.head)
+        self.player_title_templates = load_templates(self.template_roots.title)
         self.log = SessionLog()
         self.performance = PerformanceMonitor(max(2.0, float(config["capture"]["fps"])))
         self.armed = False
@@ -204,6 +218,12 @@ class BowmanBot:
         self.last_attack = 0.0
         self.last_jump = 0.0
         self.last_jump_attack = 0.0
+        self.attack_facing_ready_at = 0.0
+        self.last_strategy_attack_skill: str | None = None
+        self.last_periodic_step = 0.0
+        self.periodic_step_pending_return = False
+        self.step_motion: StepMotion | None = None
+        self.move_progress: MoveProgress | None = None
         self.last_pickup = 0.0
         self.started_at = 0.0
         self.hotkey_state: dict[str, bool] = {}
@@ -212,7 +232,7 @@ class BowmanBot:
         self.f7_requested = threading.Event()
         self.f8_requested = threading.Event()
         self.f9_requested = threading.Event()
-        self.potion_mode_requested: bool | None = None
+        self.potion_enabled_requested: bool | None = None
         self.calibration_overlay_visible = True
         self.calibration_overlay_hidden_items: frozenset[str] = frozenset()
         self.notice = ""
@@ -226,11 +246,15 @@ class BowmanBot:
         self.last_attack_anchor: tuple[float, float] | None = None
         self.nameplate_visible_this_frame = False
         self.last_nameplate_seen_at = time.monotonic()
+        self.player_recognition_lost_at = 0.0
+        self.player_recognition_last_log_at = 0.0
         self.player_lost_recovery_direction: str | None = None
         self.player_lost_recovery_started_at = 0.0
         self.player_lost_recovery_next_at = 0.0
         self.player_lost_recovery_next_direction = "left"
         self.auto_potion = AutoPotionController()
+        self.auto_buff = AutoBuffController()
+        self.buff_preparation: tuple[BuffAction, float] | None = None
         self.integrity_ok = True
         self.vision_suspended = threading.Event()
         self.window: WindowInfo | None = None
@@ -314,8 +338,17 @@ class BowmanBot:
 
     def disarm(self, reason: str) -> None:
         was_armed = self.armed
+        self.buff_preparation = None
+        self.step_motion = None
+        self.move_progress = None
+        track = getattr(self, "player_track", None)
+        if track is not None:
+            track.cancel_reacquisition()
         self.armed = False
         self.state = "PAUSED"
+        self.attack_facing_ready_at = 0.0
+        self.last_strategy_attack_skill = None
+        self.periodic_step_pending_return = False
         try:
             self.keyboard.release_all()
             self._reset_player_lost_recovery(release_key=False)
@@ -388,7 +421,7 @@ class BowmanBot:
         self.keyboard.bind_window(window.hwnd)
         topmost_while_armed = bool(
             self.config.get("window", {}).get("topmost_while_armed", True)
-        )
+        ) and self.delivery != "window_message"
         if int(user32.GetForegroundWindow()) != window.hwnd and (
             not self.background_input or topmost_while_armed
         ):
@@ -412,6 +445,10 @@ class BowmanBot:
         self.armed = True
         self.state = "SCANNING"
         self.started_at = time.monotonic()
+        self.attack_facing_ready_at = 0.0
+        self.last_strategy_attack_skill = None
+        self.last_periodic_step = self.started_at
+        self.periodic_step_pending_return = False
         self.log.write(
             "arm",
             window=window.title,
@@ -420,7 +457,9 @@ class BowmanBot:
             input_hwnd=self.keyboard.hwnd,
             window_topmost=topmost_while_armed,
         )
-        if self.background_input:
+        if self.delivery == "window_message":
+            self.notify("已启动独立后台实验模式：仅窗口消息与窗口截图；请确认角色确实响应。", 8.0)
+        elif self.background_input:
             window_mode = "游戏窗口置顶" if topmost_while_armed else "游戏窗口不置顶"
             self.notify(f"已经启动（后台按键、{window_mode}）。始终发送扫描码；控制面板不抢焦点。", 5.0)
         else:
@@ -431,9 +470,13 @@ class BowmanBot:
     def request_toggle(self) -> None:
         self.f8_requested.set()
 
-    def request_standalone_potion(self, enabled: bool) -> None:
+    def request_auto_potion(self, enabled: bool) -> None:
         with self.action_lock:
-            self.potion_mode_requested = bool(enabled)
+            self.potion_enabled_requested = bool(enabled)
+
+    def request_standalone_potion(self, enabled: bool) -> None:
+        """兼容旧面板调用；开关现在控制全部自动喝药。"""
+        self.request_auto_potion(enabled)
 
     def _calibration_item_complete(self, key: str) -> bool:
         calibration = self.config.get("calibration", {})
@@ -443,18 +486,18 @@ class BowmanBot:
             return bool(value.get("complete")) if isinstance(value, dict) else bool(value)
         return bool(calibration.get("status_regions_complete")) if isinstance(calibration, dict) else False
 
-    def _set_standalone_potion(self, window: WindowInfo, enabled: bool) -> None:
+    def _set_auto_potion(self, window: WindowInfo, enabled: bool) -> None:
         with self.action_lock:
             if not enabled:
-                was_enabled = self.auto_potion.standalone_enabled
-                self.auto_potion.set_standalone_enabled(False)
+                was_enabled = self.auto_potion.enabled
+                self.auto_potion.set_enabled(False)
                 if was_enabled:
-                    self.notify("独立自动喝药已关闭", 3.0)
+                    self.notify("全局自动喝药已关闭", 3.0)
                 return
-            if self.auto_potion.standalone_enabled:
+            if self.auto_potion.enabled:
                 return
             if self.vision_suspended.is_set():
-                self.notify("采集工具打开期间不能开启独立自动喝药。", 4.0)
+                self.notify("采集工具打开期间不能开启全局自动喝药。", 4.0)
                 return
             if not self.input_authorized:
                 self.notify("按键未授权，请从唯一入口 Start.bat 启动。", 5.0)
@@ -473,16 +516,20 @@ class BowmanBot:
             if missing:
                 self.notify(f"自动喝药需要先采集：{'、'.join(missing)}。", 5.0)
                 return
-            self.auto_potion.set_standalone_enabled(True)
-            if int(user32.GetForegroundWindow()) != window.hwnd:
+            self.auto_potion.set_enabled(True)
+            if not self.armed and int(user32.GetForegroundWindow()) != window.hwnd:
                 self.auto_potion.waiting_foreground = True
-                self.notify("独立自动喝药已开启；切回游戏窗口后生效。", 5.0)
+                self.notify("全局自动喝药已开启；暂停时切回游戏窗口后生效。", 5.0)
             else:
-                self.notify("独立自动喝药已开启；暂停挂机时仍会生效。", 5.0)
+                self.notify("全局自动喝药已开启。", 4.0)
             self.player_track = PlayerTrackState()
             self.last_attack_anchor = None
             self.last_detections = []
             self.last_detection_at = 0.0
+
+    def _set_standalone_potion(self, window: WindowInfo, enabled: bool) -> None:
+        """兼容旧调用；开关现在控制全部自动喝药。"""
+        self._set_auto_potion(window, enabled)
 
     def _try_auto_potion(
         self,
@@ -492,7 +539,7 @@ class BowmanBot:
         now: float,
     ) -> bool:
         standalone = not self.armed
-        if standalone and not self.auto_potion.standalone_enabled:
+        if not self.auto_potion.enabled:
             return False
         if not self.input_authorized or not self.integrity_ok:
             if standalone:
@@ -518,8 +565,10 @@ class BowmanBot:
         if action is None:
             return False
         if self.armed:
+            self._interrupt_step()
             self.stop_move()
             self._reset_player_lost_recovery(release_key=False)
+        self.buff_preparation = None
         self.keyboard.tap(action.key)
         self.auto_potion.record(action, now)
         if self.armed:
@@ -528,6 +577,71 @@ class BowmanBot:
             f"{action.kind}_potion",
             fill=round(action.fill, 3),
             standalone=standalone,
+        )
+        return True
+
+    def _try_auto_buff(self, now: float) -> bool:
+        if not self.armed or not self.input_authorized:
+            self.buff_preparation = None
+            return False
+        auto_buff = getattr(self, "auto_buff", None)
+        buffs = self.config.get("buffs", {})
+        if auto_buff is None or not isinstance(buffs, dict):
+            return False
+        if auto_buff.casting_guard_active(now):
+            self._interrupt_step()
+            self.stop_move()
+            return True
+        action: BuffAction | None = auto_buff.decide(buffs, now)
+        if action is None:
+            self.buff_preparation = None
+            return False
+        self._interrupt_step()
+        self.stop_move()
+        self._reset_player_lost_recovery(release_key=False)
+        # 准备期由后续帧推进，视觉、暂停请求及配置开关继续得到处理。
+        preparation = getattr(self, "buff_preparation", None)
+        if preparation is None or preparation[0] != action:
+            self.buff_preparation = (action, now + BUFF_PRE_CAST_SECONDS)
+            self.state = action.slot.upper()
+            return True
+        if now < preparation[1]:
+            return True
+        if any(
+            event is not None and event.is_set()
+            for event in (
+                getattr(self, "f8_requested", None),
+                getattr(self, "f9_requested", None),
+                getattr(self, "vision_suspended", None),
+            )
+        ):
+            self.buff_preparation = None
+            return True
+        window = getattr(self, "window", None)
+        if (
+            window is None
+            or not user32.IsWindow(window.hwnd)
+            or user32.IsIconic(window.hwnd)
+            or (
+                not self.background_input
+                and int(user32.GetForegroundWindow()) != window.hwnd
+            )
+        ):
+            self.disarm("补 Buff 前游戏窗口已不可用或失去前台")
+            return True
+        self.buff_preparation = None
+        self.keyboard.tap(action.key, BUFF_KEY_HOLD_SECONDS)
+        cast_at = time.monotonic()
+        auto_buff.record(action, cast_at)
+        self.state = action.slot.upper()
+        self.log.write(
+            "buff",
+            slot=action.slot,
+            key=action.key,
+            interval_seconds=action.interval_seconds,
+            pre_cast_seconds=BUFF_PRE_CAST_SECONDS,
+            key_hold_seconds=BUFF_KEY_HOLD_SECONDS,
+            result="key_sent_unverified",
         )
         return True
 
@@ -580,11 +694,8 @@ class BowmanBot:
             if performance is not None:
                 performance.set_suspended(True)
             self.f8_requested.clear()
-            if hasattr(self, "potion_mode_requested"):
-                self.potion_mode_requested = None
-            auto_potion = getattr(self, "auto_potion", None)
-            if auto_potion is not None:
-                auto_potion.set_standalone_enabled(False)
+            if hasattr(self, "potion_enabled_requested"):
+                self.potion_enabled_requested = None
             if self.armed:
                 self.disarm("打开采集工具")
             self.keyboard.release_all()
@@ -597,16 +708,16 @@ class BowmanBot:
 
     def reload_templates(self) -> None:
         monster_templates = monster_templates_for_category(
-            load_templates(ASSET_DIR, recursive=True),
+            load_templates(self.template_roots.monster, recursive=True),
             self.active_monster_category,
         )
         monster_filter_templates = monster_templates_for_category(
-            load_templates(MONSTER_FILTER_ASSET_DIR, recursive=True),
+            load_templates(self.template_roots.filter, recursive=True),
             self.active_monster_category,
         )
-        player_templates = load_templates(PLAYER_ASSET_DIR)
-        player_head_templates = load_templates(PLAYER_HEAD_ASSET_DIR)
-        player_title_templates = load_templates(PLAYER_TITLE_ASSET_DIR)
+        player_templates = load_templates(self.template_roots.player)
+        player_head_templates = load_templates(self.template_roots.head)
+        player_title_templates = load_templates(self.template_roots.title)
         self.templates = monster_templates
         self.monster_filter_templates = monster_filter_templates
         self.player_templates = player_templates
@@ -621,6 +732,8 @@ class BowmanBot:
         self.player_track = PlayerTrackState()
         self.nameplate_visible_this_frame = False
         self.last_nameplate_seen_at = time.monotonic()
+        self.player_recognition_lost_at = 0.0
+        self.player_recognition_last_log_at = 0.0
         self.log.write(
             "templates_reloaded",
             category=self.active_monster_category,
@@ -633,12 +746,12 @@ class BowmanBot:
 
     def apply_config(self, config: dict[str, Any]) -> None:
         with self.action_lock:
+            self.buff_preparation = None
+            self.step_motion = None
+            self.move_progress = None
             self.f8_requested.clear()
-            if hasattr(self, "potion_mode_requested"):
-                self.potion_mode_requested = None
-            auto_potion = getattr(self, "auto_potion", None)
-            if auto_potion is not None:
-                auto_potion.set_standalone_enabled(False)
+            if hasattr(self, "potion_enabled_requested"):
+                self.potion_enabled_requested = None
             with self.config_lock:
                 old_marker_seed = configured_player_marker(getattr(self, "config", {}))
                 new_marker_seed = configured_player_marker(config)
@@ -652,12 +765,18 @@ class BowmanBot:
                 if new_delivery != self.delivery:
                     self.keyboard.release_all()
                     self.delivery = new_delivery
-                    self.background_input = new_delivery == "background"
+                    self.background_input = new_delivery in {"background", "window_message"}
                     self.keyboard = Keyboard(self.delivery)
                     if hwnd:
                         self.keyboard.bind_window(hwnd)
                 self.config = config
+                self.template_roots = template_roots_from_config(config)
+                self.template_trash_dir = template_trash_from_config(config)
                 self.strategy = active_strategy(config)
+                self.attack_facing_ready_at = 0.0
+                self.last_strategy_attack_skill = None
+                self.last_periodic_step = time.monotonic()
+                self.periodic_step_pending_return = False
                 self.active_monster_category = str(
                     config["vision"].get("active_monster_category", "")
                 ).strip()
@@ -665,6 +784,8 @@ class BowmanBot:
                 self.last_attack_anchor = None
                 self.nameplate_visible_this_frame = False
                 self.last_nameplate_seen_at = time.monotonic()
+                self.player_recognition_lost_at = 0.0
+                self.player_recognition_last_log_at = 0.0
                 if new_marker_seed != old_marker_seed:
                     self.marker = new_marker_seed
                     self.marker_last_seen = time.monotonic()
@@ -731,14 +852,124 @@ class BowmanBot:
         keys = self.config["keys"]
         opposite = "left" if direction == "right" else "right"
         self.keyboard.up(keys[opposite])
-        self.keyboard.down(keys[direction])
+        if getattr(self, "delivery", "foreground") == "window_message":
+            self.keyboard.movement_down(keys[direction])
+        else:
+            self.keyboard.down(keys[direction])
         self.direction = direction
+        self.attack_facing_ready_at = 0.0
         self.state = f"PATROL_{direction.upper()}"
 
     def stop_move(self) -> None:
         keys = self.config["keys"]
         self.keyboard.up(keys["left"])
         self.keyboard.up(keys["right"])
+        self.move_progress = None
+
+    def _interrupt_step(self) -> None:
+        motion = getattr(self, "step_motion", None)
+        if motion is not None:
+            motion.phase = "prepare"
+            motion.deadline = time.monotonic() + 0.6
+            motion.baseline = None
+
+    def periodic_step(self, direction: str, seconds: float, now: float, state: str) -> None:
+        """跨帧停攻、移动、验证；不能把发出按键当成已经移动。"""
+        desired = str(direction).strip().lower()
+        if desired not in {"left", "right"}:
+            raise ValueError(f"短步方向无效：{direction}")
+        duration = max(0.03, min(0.5, float(seconds)))
+        self.stop_move()
+        self.step_motion = StepMotion(desired, duration, now, now + 0.6)
+        self.state = "MOVEMENT_PREPARE"
+
+    def _advance_periodic_step(self, marker: tuple[float, float], now: float) -> bool:
+        motion = getattr(self, "step_motion", None)
+        if motion is None:
+            return False
+        if now - motion.started > 12.0:
+            self.disarm("小步动作长时间无法完成，请检查识别、补药与移动输入")
+            return True
+        if now < motion.deadline:
+            return True
+        if motion.phase == "prepare":
+            if motion.attempts >= 3:
+                self.disarm("小步移动多次中断，已停止重试")
+                return True
+            motion.baseline = marker[0]
+            motion.attempts += 1
+            self.stop_move()
+            duration = min(0.5, motion.seconds * motion.attempts)
+            self.keyboard.movement_down(self.config["keys"][motion.direction], seconds=duration)
+            self.direction = motion.direction
+            self.attack_facing_ready_at = 0.0
+            motion.phase = "hold"
+            motion.deadline = now + duration
+            self.state = "PERIODIC_STEP_RIGHT"
+            self.log.write("periodic_step", direction=motion.direction,
+                           seconds=round(motion.deadline - now, 3), attempt=motion.attempts,
+                           marker=marker, result="key_sent_unverified")
+        elif motion.phase == "hold":
+            self.stop_move()
+            motion.phase = "verify"
+            motion.deadline = now + 0.25
+            self.state = "PERIODIC_STEP_VERIFY"
+        else:
+            delta = directed_progress(float(motion.baseline), marker[0], motion.direction,
+                                      getattr(self, "live_minimap_width", 100))
+            if delta >= 0.5:
+                self.log.write("periodic_step_verified", direction=motion.direction,
+                               displacement_pixels=round(delta, 3), attempt=motion.attempts)
+                self.step_motion = None
+                self.last_periodic_step = now
+                self.periodic_step_pending_return = True
+            elif motion.attempts >= 3 or delta <= -0.5:
+                self.log.write("movement_failed", action="step", marker=marker,
+                               displacement_pixels=round(delta, 3), attempt=motion.attempts)
+                self.disarm("小步未检测到正确方向位移：后台方向键可能不兼容，或角色被阻挡")
+            else:
+                motion.phase = "prepare"
+                motion.deadline = now + 0.3
+                self.state = "MOVEMENT_RETRY"
+        return True
+
+    def _move_with_feedback(self, direction: str, marker: tuple[float, float],
+                            now: float, state: str) -> None:
+        progress = getattr(self, "move_progress", None)
+        if progress is None or progress.direction != direction:
+            self.stop_move()
+            ready_at = max(now, float(getattr(self, "last_attack", now)) + 0.6)
+            self.move_progress = MoveProgress(direction, marker[0], ready_at, ready_at)
+            self.state = "MOVEMENT_PREPARE"
+            self.log.write("movement_start", direction=direction, marker=marker,
+                           delivery=getattr(self, "delivery", "foreground"))
+            return
+        if now < progress.ready_at:
+            self.state = "MOVEMENT_PREPARE"
+            return
+        delta = directed_progress(progress.baseline, marker[0], direction,
+                                  getattr(self, "live_minimap_width", 100))
+        if delta >= 0.5:
+            progress.baseline = marker[0]
+            progress.progress_at = now
+            progress.retried = False
+            self.log.write("movement_progress", direction=direction, marker=marker,
+                           displacement_pixels=round(delta, 3))
+        stalled = now - progress.progress_at
+        if stalled >= 4.0:
+            self.log.write("movement_failed", action="return", direction=direction,
+                           marker=marker, no_progress_seconds=round(stalled, 3))
+            self.disarm("回位连续 4 秒无正确方向位移：请检查后台移动兼容性、障碍或角色状态")
+            return
+        if stalled >= 2.0 and not progress.retried:
+            self.keyboard.up(self.config["keys"][direction])
+            progress.retried = True
+            progress.ready_at = now + 0.1
+            self.state = "MOVEMENT_RETRY"
+            self.log.write("movement_retry", direction=direction, marker=marker)
+            return
+        self.move(direction)
+        self.state = state
 
     def _reset_player_lost_recovery(self, *, release_key: bool) -> None:
         current = getattr(self, "player_lost_recovery_direction", None)
@@ -776,6 +1007,7 @@ class BowmanBot:
         self.stop_move()
         self.keyboard.down(keys[direction])
         self.direction = direction
+        self.attack_facing_ready_at = 0.0
         self.player_lost_recovery_direction = direction
         self.player_lost_recovery_started_at = now
         self.state = f"PLAYER_RECOVER_{direction.upper()}"
@@ -791,9 +1023,12 @@ class BowmanBot:
         player_x: float,
         now: float,
         face_each_attack: bool = True,
+        attack_key: str | None = None,
+        attack_skill: str | None = None,
     ) -> None:
         behavior = self.config["behavior"]
         keys = self.config["keys"]
+        selected_attack_key = str(attack_key or "").strip().lower() or keys["attack"]
         self.stop_move()
         desired = "left" if target_x < player_x else "right"
         dead = float(behavior["attack_dead_zone"])
@@ -801,22 +1036,50 @@ class BowmanBot:
             desired = self.direction
         self.state = f"ATTACK_{desired.upper()}"
         if now - self.last_attack >= float(behavior["attack_interval_seconds"]):
-            # 弓箭手动态每次攻击都先按住目标方向，在方向键仍按下时发出攻击；
-            # 这样被击退后也会按当前目标位置重新转向。原地策略仍只在换边时点按。
+            # NewMaple 在上一技能动作尚未结束时，可能忽略与下一次技能同时到达的换向。
+            # 动态策略换边时先独立转向并等待下一帧再次确认目标仍在同侧，避免内部方向
+            # 已更新、角色画面却仍朝旧方向。目标左右抖动时也只会转向，不会朝错误方向出手。
+            if face_each_attack and self.direction != desired:
+                previous = self.direction
+                tap_seconds = max(
+                    DYNAMIC_DIRECTION_CHANGE_MIN_TAP_SECONDS,
+                    float(behavior["face_tap_seconds"]),
+                )
+                self.keyboard.tap(keys[desired], tap_seconds)
+                self.direction = desired
+                self.attack_facing_ready_at = (
+                    time.monotonic() + DYNAMIC_DIRECTION_CHANGE_SETTLE_SECONDS
+                )
+                self.state = f"FACE_TARGET_{desired.upper()}"
+                self.log.write(
+                    "attack_face_prepare",
+                    direction=desired,
+                    previous_direction=previous,
+                    tap_seconds=round(tap_seconds, 3),
+                    settle_seconds=DYNAMIC_DIRECTION_CHANGE_SETTLE_SECONDS,
+                )
+                return
+            if face_each_attack and time.monotonic() < float(
+                getattr(self, "attack_facing_ready_at", 0.0)
+            ):
+                self.state = f"FACE_TARGET_{desired.upper()}"
+                return
+            # 已确认面向后，每次攻击仍短暂按住目标方向，在方向键按下期间发送技能。
+            # 原地策略保持原行为，只在换边时点按方向。
             if face_each_attack:
                 direction_key = keys[desired]
                 try:
                     self.keyboard.down(direction_key)
                     time.sleep(float(behavior["face_tap_seconds"]))
                     self.direction = desired
-                    self.keyboard.tap(keys["attack"])
+                    self.keyboard.tap(selected_attack_key)
                 finally:
                     self.keyboard.up(direction_key)
             else:
                 if self.direction != desired:
                     self.keyboard.tap(keys[desired], float(behavior["face_tap_seconds"]))
                     self.direction = desired
-                self.keyboard.tap(keys["attack"])
+                self.keyboard.tap(selected_attack_key)
             self.last_attack = now
             self.log.write(
                 "attack",
@@ -824,6 +1087,8 @@ class BowmanBot:
                 player_x=round(player_x, 3),
                 target_x=round(target_x, 3),
                 distance=round(abs(target_x - player_x), 3),
+                skill=str(attack_skill or "single"),
+                key=selected_attack_key,
             )
 
     def face_target(
@@ -929,6 +1194,7 @@ class BowmanBot:
         has_monster_candidates: bool,
         now: float,
         combat_height: int = 1,
+        eligible_detections: tuple[Detection, ...] = (),
     ) -> None:
         with self.action_lock:
             if not self.armed:
@@ -946,6 +1212,7 @@ class BowmanBot:
                 has_monster_candidates,
                 now,
                 combat_height,
+                eligible_detections,
             )
 
     def _act(
@@ -961,9 +1228,11 @@ class BowmanBot:
         has_monster_candidates: bool,
         now: float,
         combat_height: int = 1,
+        eligible_detections: tuple[Detection, ...] = (),
     ) -> None:
         if not self.armed or not self.input_authorized:
             return
+        self.keyboard.check_health()
         if not user32.IsWindow(window.hwnd) or user32.IsIconic(window.hwnd):
             self.disarm("游戏窗口已关闭或最小化")
             return
@@ -984,6 +1253,8 @@ class BowmanBot:
             return
         if self._try_auto_potion(window, hp, mp, now):
             return
+        if self._try_auto_buff(now):
+            return
         nameplate_lost_seconds = max(
             0.0,
             float(self.config["vision"].get("player_hold_seconds", 0.8)),
@@ -993,14 +1264,23 @@ class BowmanBot:
             >= nameplate_lost_seconds
         )
         if bool(behavior.get("player_lost_recovery_enabled", True)) and nameplate_lost:
+            self._interrupt_step()
             self.recover_player_nameplate(now)
             return
         if player_box is None:
             self._reset_player_lost_recovery(release_key=True)
+            self._interrupt_step()
             self.stop_move()
             self.state = "PLAYER_SCREEN_LOST"
             return
         self._reset_player_lost_recovery(release_key=True)
+        if marker is None or not getattr(self, "live_marker_unambiguous", True):
+            self._interrupt_step()
+            self.stop_move()
+            self.state = "MARKER_LOST"
+            return
+        if self._advance_periodic_step(marker, now):
+            return
         decision = self.strategy.decide(
             StrategyActionContext(
                 marker=marker,
@@ -1020,10 +1300,22 @@ class BowmanBot:
                 combat_height=combat_height,
                 last_jump=getattr(self, "last_jump", 0.0),
                 last_jump_attack=getattr(self, "last_jump_attack", 0.0),
+                last_periodic_step=getattr(self, "last_periodic_step", self.started_at),
+                periodic_step_pending_return=bool(
+                    getattr(self, "periodic_step_pending_return", False)
+                ),
+                eligible_detections=eligible_detections,
+                previous_attack_skill=getattr(self, "last_strategy_attack_skill", None),
             )
         )
+        if decision.attack_skill is not None:
+            self.last_strategy_attack_skill = decision.attack_skill
+        if decision.periodic_step_return_complete:
+            self.periodic_step_pending_return = False
         if decision.target_seen:
             self.last_target_seen = now
+        if decision.action != "move":
+            self.move_progress = None
         if decision.action == "face":
             self.face_target(
                 str(decision.direction),
@@ -1036,12 +1328,20 @@ class BowmanBot:
                 float(decision.player_x),
                 now,
                 face_each_attack=decision.face_each_attack,
+                attack_key=decision.attack_key,
+                attack_skill=decision.attack_skill,
             )
         elif decision.action == "chase":
             self.chase_target(float(decision.target_x), float(decision.player_x))
         elif decision.action == "move":
-            self.move(str(decision.direction))
-            self.state = decision.state
+            self._move_with_feedback(str(decision.direction), marker, now, decision.state)
+        elif decision.action == "step":
+            self.periodic_step(
+                str(decision.direction),
+                float(decision.move_seconds or 0.03),
+                now,
+                decision.state,
+            )
         elif decision.action == "jump":
             self.jump_to_safe(decision.direction, now, decision.state)
         elif decision.action == "down_jump":
@@ -1068,11 +1368,17 @@ class BowmanBot:
         scene: SceneFeatures,
         vision: dict[str, Any],
         search_roi: tuple[int, int, int, int] | None,
+        *,
+        threshold: float | None = None,
     ) -> tuple[list[Detection], float, str | None]:
         detections, score, template_name = find_detections(
             scene,
             self.player_templates,
-            float(vision.get("player_template_threshold", 0.76)),
+            (
+                float(vision.get("player_template_threshold", 0.76))
+                if threshold is None
+                else float(threshold)
+            ),
             float(vision.get("player_detection_scale", 0.5)),
             max_per_template=8,
             nms_iou=0.35,
@@ -1093,7 +1399,7 @@ class BowmanBot:
         head_detections, head_score, _head_template_name = find_detections(
             scene,
             self.player_head_templates,
-            float(vision.get("player_head_threshold", 0.76)),
+            float(vision.get("player_head_threshold", 0.74)),
             float(vision.get("player_detection_scale", 0.5)),
             max_per_template=8,
             nms_iou=0.35,
@@ -1114,6 +1420,62 @@ class BowmanBot:
         )
         return head_detections, head_score, title_detections, title_score
 
+    def _record_player_recognition_result(
+        self,
+        anchor: PlayerAnchor | None,
+        now: float,
+        *,
+        nameplate_score: float,
+        nameplate_count: int,
+        best_identity_score: float,
+        head_score: float,
+        title_score: float,
+        global_scan: bool,
+        minimap_guard_active: bool,
+        marker_unambiguous: bool,
+    ) -> PlayerAnchor | None:
+        """仅在状态转换或持续丢失时记录定位分数，避免逐帧刷日志。"""
+        lost_at = float(getattr(self, "player_recognition_lost_at", 0.0))
+        last_log_at = float(getattr(self, "player_recognition_last_log_at", 0.0))
+        log = getattr(self, "log", None)
+        if anchor is None:
+            first_loss = lost_at <= 0.0
+            if first_loss:
+                lost_at = now
+                self.player_recognition_lost_at = now
+            if first_loss or now - last_log_at >= 5.0:
+                event = "player_recognition_lost" if first_loss else "player_recognition_still_lost"
+                if log is not None:
+                    log.write(
+                        event,
+                        lost_seconds=round(max(0.0, now - lost_at), 3),
+                        nameplate_score=round(float(nameplate_score), 4),
+                        nameplate_count=int(nameplate_count),
+                        best_identity_score=round(float(best_identity_score), 4),
+                        head_score=round(float(head_score), 4),
+                        title_score=round(float(title_score), 4),
+                        global_scan=bool(global_scan),
+                        minimap_guard_active=bool(minimap_guard_active),
+                        minimap_blocked=bool(self.player_track.minimap_stationary_blocked),
+                        marker_unambiguous=bool(marker_unambiguous),
+                        misses=int(self.player_track.misses),
+                    )
+                self.player_recognition_last_log_at = now
+            return None
+        if lost_at > 0.0 and log is not None:
+            log.write(
+                "player_recognition_reacquired",
+                lost_seconds=round(max(0.0, now - lost_at), 3),
+                source=anchor.source,
+                nameplate_score=round(float(nameplate_score), 4),
+                best_identity_score=round(float(best_identity_score), 4),
+                head_score=round(float(head_score), 4),
+                title_score=round(float(title_score), 4),
+            )
+        self.player_recognition_lost_at = 0.0
+        self.player_recognition_last_log_at = 0.0
+        return anchor
+
     def _track_player(
         self,
         scene: SceneFeatures,
@@ -1128,6 +1490,7 @@ class BowmanBot:
         self.nameplate_visible_this_frame = False
         # 配置热更新会原子替换 tracker；本帧始终使用同一个实例，旧结果不会回写新状态。
         track = self.player_track
+        track.begin_frame()
         had_minimap_reference = track.minimap_stationary_reference is not None
         track.clear_minimap_evidence()
         scene_height, scene_width = scene.scene.shape[:2]
@@ -1139,6 +1502,29 @@ class BowmanBot:
             and track.has_nameplate_identity()
         )
         stationary_anchor = None
+        nameplate_score = -1.0
+        head_score = -1.0
+        title_score = -1.0
+        nameplate_detections: list[Detection] = []
+
+        def finish(result: PlayerAnchor | None) -> PlayerAnchor | None:
+            identity_scores = [
+                float(detection.identity_score)
+                for detection in nameplate_detections
+                if detection.identity_score is not None
+            ]
+            return self._record_player_recognition_result(
+                result,
+                now,
+                nameplate_score=nameplate_score,
+                nameplate_count=len(nameplate_detections),
+                best_identity_score=max(identity_scores, default=-1.0),
+                head_score=head_score,
+                title_score=title_score,
+                global_scan=global_scan,
+                minimap_guard_active=minimap_guard_active,
+                marker_unambiguous=marker_unambiguous,
+            )
         if not minimap_assist_enabled and (
             had_minimap_reference or track.minimap_stationary_blocked
         ):
@@ -1179,7 +1565,7 @@ class BowmanBot:
                 float(vision.get("player_local_roi_down", 0.18)),
             )
 
-        raw_nameplate_detections, _nameplate_score, _template_name = self._detect_player_nameplate(
+        raw_nameplate_detections, nameplate_score, _template_name = self._detect_player_nameplate(
             scene,
             vision,
             search_roi,
@@ -1200,6 +1586,62 @@ class BowmanBot:
             float(vision.get("player_anchor_max_jump", 0.18)),
             float(vision.get("player_anchor_agreement", 0.07)),
         )
+        if (
+            global_scan
+            and previous_anchor is None
+            and not nameplate_detections
+            and track.has_nameplate_identity()
+            and track.anchor is not None
+            and predicted_point is not None
+            and now - track.last_seen_at
+            <= max(
+                0.0,
+                float(vision.get("player_auxiliary_continuation_seconds", 15.0)),
+            )
+        ):
+            # 正常全图搜索仍使用严格阈值。只在已经由姓名板确认过本人、普通 hold
+            # 也已超时后，围绕最后预测位置放宽原始模板候选门槛；候选仍必须通过
+            # 全分辨率名字字形核验、最大位移约束，以及下游的连续多帧重获确认。
+            recovery_roi = player_tracking_roi(
+                predicted_point,
+                scene_width,
+                scene_height,
+                float(vision.get("player_local_roi_width", 0.36)),
+                float(vision.get("player_local_roi_up", 0.24)),
+                float(vision.get("player_local_roi_down", 0.18)),
+            )
+            recovery_detections, recovery_score, _recovery_template = (
+                self._detect_player_nameplate(
+                    scene,
+                    vision,
+                    recovery_roi,
+                    threshold=float(
+                        vision.get("player_nameplate_recovery_threshold", 0.66)
+                    ),
+                )
+            )
+            nameplate_score = max(nameplate_score, recovery_score)
+            recovery_anchor_args = (
+                scene_width,
+                scene_height,
+                float(vision.get("player_head_feet_offset", 0.07)),
+                float(vision.get("player_title_feet_offset", 0.076)),
+                float(vision.get("player_auxiliary_max_jump", 0.06)),
+                float(vision.get("player_anchor_agreement", 0.07)),
+            )
+            nameplate_detections = [
+                detection
+                for detection in recovery_detections
+                if detection.identity_score is not None
+                and detection.identity_score >= identity_threshold
+                and choose_fused_player_anchor(
+                    [("姓名板", [detection])],
+                    track.anchor,
+                    *recovery_anchor_args,
+                    reference_point=predicted_point,
+                )
+                is not None
+            ]
         nameplate_anchor = choose_fused_player_anchor(
             [("姓名板", nameplate_detections)],
             previous_anchor,
@@ -1221,7 +1663,7 @@ class BowmanBot:
         head_detections: list[Detection] = []
         title_detections: list[Detection] = []
         if run_auxiliary:
-            head_detections, _head_score, title_detections, _title_score = self._detect_player_auxiliary(
+            head_detections, head_score, title_detections, title_score = self._detect_player_auxiliary(
                 scene,
                 vision,
                 search_roi,
@@ -1282,6 +1724,42 @@ class BowmanBot:
                 *auxiliary_args,
                 reference_point=predicted_point,
             )
+        elif (
+            global_scan
+            and not nameplate_detections
+            and track.has_nameplate_identity()
+            and track.anchor is not None
+            and now - track.last_seen_at
+            <= max(
+                0.0,
+                float(vision.get("player_auxiliary_continuation_seconds", 15.0)),
+            )
+        ):
+            # 已由本人姓名板建立身份后，攻击、Buff 或短步动画可能让姓名板/头部同时
+            # 低分超过普通 hold。此时不能退回“首次认人”的 0.90 门槛：只允许普通
+            # 辅助模板在最后可靠位置附近连续多帧确认，从而恢复同一人的空间续跟踪。
+            auxiliary_args = (
+                scene_width,
+                scene_height,
+                float(vision.get("player_head_feet_offset", 0.07)),
+                float(vision.get("player_title_feet_offset", 0.076)),
+                float(vision.get("player_auxiliary_max_jump", 0.06)),
+                float(vision.get("player_anchor_agreement", 0.07)),
+            )
+            candidate = choose_fused_player_anchor(
+                [("头部", head_detections), ("称号勋章", title_detections)],
+                track.anchor,
+                *auxiliary_args,
+                reference_point=predicted_point,
+            )
+            if candidate is not None:
+                anchor = track.consider_reacquisition(
+                    candidate,
+                    int(vision.get("player_auxiliary_reacquire_confirm_frames", 3)),
+                    float(vision.get("player_anchor_agreement", 0.07))
+                    * max(scene_width, scene_height),
+                    kind="known_identity_aux",
+                )
         elif global_scan and not nameplate_detections:
             # 启动时姓名板可能已被遮挡。普通辅助命中仍不能认人；只有高置信头部/称号
             # 连续多帧落到同一位置，才允许建立受限的视觉身份。
@@ -1315,7 +1793,7 @@ class BowmanBot:
 
         if anchor is None and search_roi is not None and track.misses + 1 >= miss_limit:
             # 连续局部丢失后只允许通过本人名字做全图重定位，辅助模板不得建立新身份。
-            raw_nameplate_detections, _nameplate_score, _template_name = self._detect_player_nameplate(
+            raw_nameplate_detections, nameplate_score, _template_name = self._detect_player_nameplate(
                 scene,
                 vision,
                 None,
@@ -1389,19 +1867,19 @@ class BowmanBot:
                     head_continuous=previous_anchor is not None,
                     marker_unambiguous=marker_unambiguous,
                 )
-            return anchor
+            return finish(anchor)
         track.mark_miss()
         if minimap_guard_active:
             if stationary_anchor is not None:
-                return stationary_anchor
+                return finish(stationary_anchor)
             # 位移、歧义、丢失、尺寸变化或过期时立即隐藏旧锚点，不能再由通用 hold 绕过。
-            return None
+            return finish(None)
         if minimap_assist_enabled and track.minimap_stationary_blocked:
             # 失效门禁会一直保持到真实视觉重新命中；不能在下一帧因基准已清空而复活旧 hold。
-            return None
+            return finish(None)
         if track.misses >= miss_limit:
-            return None
-        return track.anchor_within_hold(now, player_hold)
+            return finish(None)
+        return finish(track.anchor_within_hold(now, player_hold))
 
     def run(self, overlay: RuntimeOverlay) -> None:
         window = find_game_window(self.config)
@@ -1425,7 +1903,11 @@ class BowmanBot:
             f"姓名板 {len(self.player_templates)} / 头部 {len(self.player_head_templates)} / "
             f"称号勋章 {len(self.player_title_templates)}"
         )
-        print("按键投递：" + ("后台扫描码（失焦仍 SendInput，并补发窗口消息）。" if self.background_input else "前台 SendInput（游戏必须在前台）。"))
+        print("按键投递：" + {
+            "window_message": "纯窗口消息（移动采用按下/抬起脉冲，不发送全局按键）。",
+            "background": "后台扫描码（失焦仍 SendInput，并补发窗口消息）。",
+            "foreground": "前台 SendInput（游戏必须在前台）。",
+        }[self.delivery])
         if self.input_authorized and not self.integrity_ok:
             print("权限不足：助手权限低于游戏，输入会被 Windows 阻止。")
         print("F7 显隐 Debug 框，F8 启动或暂停，F9 / Ctrl+Shift+Q 立即退出。按键输入：" + ("已允许。" if self.input_authorized else "未授权。"))
@@ -1444,6 +1926,7 @@ class BowmanBot:
         hotkey_thread = threading.Thread(target=self.monitor_hotkeys, name="MapleHotkeys", daemon=True)
         hotkey_thread.start()
         capture_failures = 0
+        background_capture = BackgroundCapture()
         try:
             with mss.MSS() as sct:
                 while True:
@@ -1458,10 +1941,10 @@ class BowmanBot:
                             self.f8_requested.clear()
                             self.toggle(window)
                     with self.action_lock:
-                        potion_mode_requested = self.potion_mode_requested
-                        self.potion_mode_requested = None
-                        if potion_mode_requested is not None:
-                            self._set_standalone_potion(window, potion_mode_requested)
+                        potion_enabled_requested = self.potion_enabled_requested
+                        self.potion_enabled_requested = None
+                        if potion_enabled_requested is not None:
+                            self._set_auto_potion(window, potion_enabled_requested)
                     if self.f7_requested.is_set():
                         self.f7_requested.clear()
                         self.toggle_calibration_overlay()
@@ -1471,15 +1954,20 @@ class BowmanBot:
                     vision = self.config["vision"]
                     capture_started_ns = time.perf_counter_ns()
                     try:
-                        frame = capture_client(sct, window)
+                        if self.delivery == "window_message":
+                            frame = background_capture.capture(window)
+                        else:
+                            background_capture.close()
+                            frame = capture_client(sct, window)
                         capture_failures = 0
-                    except mss.exception.ScreenShotError as exc:
+                    except (mss.exception.ScreenShotError, BackgroundCaptureError) as exc:
                         capture_failures += 1
                         self.performance.record_capture_failure(exc)
-                        if self.auto_potion.standalone_enabled:
+                        if self.auto_potion.enabled:
                             self.auto_potion.set_unavailable("画面不可用")
                         if capture_failures == 1 or capture_failures % 30 == 0:
                             self.log.write("capture_retry", failures=capture_failures, error=str(exc))
+                            self.notify(f"截图不可用：{exc}", 8.0)
                         if self.armed:
                             self.disarm("游戏画面暂时无法截取")
                         time.sleep(0.1)
@@ -1502,13 +1990,15 @@ class BowmanBot:
                         self.marker,
                     )
                     marker = marker_observation.point
+                    self.live_marker_unambiguous = marker_observation.unambiguous
+                    self.live_minimap_width = minimap_img.shape[1]
                     now = time.monotonic()
                     if marker is not None:
                         self.marker = marker
                         self.marker_last_seen = now
-                    # 独立喝药模式只需要血蓝条；保留同一截图循环，但跳过昂贵的战斗模板匹配。
+                    # 暂停时的全局喝药只需要血蓝条；保留截图循环，但跳过昂贵的战斗模板匹配。
                     lightweight_potion_only = bool(
-                        not self.armed and self.auto_potion.standalone_enabled
+                        not self.armed and self.auto_potion.enabled
                     )
                     # 四路模板检测共用同一份场景特征，避免每帧重复缩放、颜色转换和 Canny。
                     scene = SceneFeatures(combat_img)
@@ -1634,6 +2124,11 @@ class BowmanBot:
                             facing=facing,
                             target_area=self.config["targeting"]["box"],
                             settings=strategy_settings(self.config),
+                            previous_attack_skill=getattr(
+                                self,
+                                "last_strategy_attack_skill",
+                                None,
+                            ),
                         )
                     )
                     target = target_selection.target
@@ -1679,6 +2174,7 @@ class BowmanBot:
                         has_strategy_candidates,
                         now,
                         combat_height=combat_img.shape[0],
+                        eligible_detections=tuple(target_selection.eligible_detections or ()),
                     )
                     stages_ns["action"] = time.perf_counter_ns() - action_started_ns
                     hud_started_ns = time.perf_counter_ns()
@@ -1805,10 +2301,10 @@ class BowmanBot:
                     state_label = STATE_LABELS.get(self.state, self.state)
                     if player_source == "小地图静止确认":
                         state_label = "小地图显示角色未移动（沿用上次视觉位置）"
-                    if not self.armed and self.auto_potion.standalone_enabled:
+                    if not self.armed and self.auto_potion.enabled:
                         potion_state = self.auto_potion.display_state(now)
                         banner = (
-                            f"独立喝药｜{potion_state}｜仅游戏前台发药键"
+                            f"自动喝药｜{potion_state}｜暂停时仅游戏前台发药键"
                             "｜F8 启动挂机｜F9 / Ctrl+Shift+Q 退出"
                         )
                     elif not self.player_templates:
@@ -1827,6 +2323,8 @@ class BowmanBot:
                         banner = "按键未授权｜请从 Start.bat 启动｜F7 Debug 框｜F9 / Ctrl+Shift+Q 退出"
                     overlay.update(
                         {
+                            "background_hidden": self.delivery == "window_message"
+                            and int(user32.GetForegroundWindow()) != window.hwnd,
                             "left": current_window.left,
                             "top": current_window.top,
                             "width": current_window.width,
@@ -1879,10 +2377,11 @@ class BowmanBot:
             self.performance.mark_error(exc)
             raise
         finally:
+            background_capture.close()
             self.performance.stop()
             self.stop_hotkey_monitor()
             hotkey_thread.join(timeout=1.0)
-            self.auto_potion.set_standalone_enabled(False)
+            self.auto_potion.set_enabled(False)
             self.disarm("程序退出")
             overlay.close()
             self.log.write("session_end")

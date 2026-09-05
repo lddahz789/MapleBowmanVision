@@ -59,6 +59,8 @@ class PlayerTrackState:
     pending_anchor: PlayerAnchor | None = None
     pending_count: int = 0
     pending_kind: str = ""
+    frame_index: int = 0
+    pending_frame_index: int = -1
     nameplate_identity_established: bool = False
     minimap_stationary_reference: MinimapStationaryReference | None = None
     minimap_stationary_evidence: MinimapStationaryEvidence | None = None
@@ -93,6 +95,7 @@ class PlayerTrackState:
         identity_confirmed: bool = True,
     ) -> None:
         previous = self.anchor
+        self.cancel_reacquisition()
         previous_at = self.last_seen_at
         next_velocity = (0.0, 0.0)
         if previous is not None and previous_at > 0.0 and now > previous_at:
@@ -254,6 +257,15 @@ class PlayerTrackState:
         )
         return anchor
 
+    def begin_frame(self) -> None:
+        self.frame_index += 1
+
+    def cancel_reacquisition(self) -> None:
+        self.pending_anchor = None
+        self.pending_count = 0
+        self.pending_kind = ""
+        self.pending_frame_index = -1
+
     def consider_reacquisition(
         self,
         anchor: PlayerAnchor,
@@ -278,10 +290,14 @@ class PlayerTrackState:
             previous_x, previous_y = _anchor_point(self.pending_anchor)
             distance = ((current_x - previous_x) ** 2 + (current_y - previous_y) ** 2) ** 0.5
             same_candidate = distance <= max(4.0, float(max_distance))
-        if same_candidate:
+        if same_candidate and self.pending_frame_index == self.frame_index:
+            # 同一张图中的局部/全图扫描只能算一次证据。
+            pass
+        elif same_candidate and self.pending_frame_index == self.frame_index - 1:
             self.pending_count += 1
         else:
             self.pending_count = 1
+        self.pending_frame_index = self.frame_index
         self.pending_anchor = anchor
         self.pending_kind = selected_kind
         self.mode = "REACQUIRE"
@@ -295,6 +311,8 @@ class PlayerTrackState:
 
     def mark_miss(self) -> None:
         self.misses += 1
+        if self.pending_frame_index != self.frame_index:
+            self.cancel_reacquisition()
         if self.pending_count > 0:
             self.mode = "REACQUIRE"
         else:
@@ -313,4 +331,6 @@ class PlayerTrackState:
         self.pending_anchor = None
         self.pending_count = 0
         self.pending_kind = ""
+        self.frame_index = 0
+        self.pending_frame_index = -1
         self.invalidate_minimap_assist()

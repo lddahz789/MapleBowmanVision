@@ -232,7 +232,7 @@ class PerformanceMonitor:
             if self._last_started_ns is not None and start < self._last_started_ns:
                 raise ValueError("帧开始时间不能倒退")
             if self._samples and sample.mode != self._mode:
-                # 完整识别与独立喝药的工作量不可直接比较；切换时重新建立节奏窗口。
+                # 完整识别与暂停补药的工作量不可直接比较；切换时重新建立节奏窗口。
                 self._samples.clear()
                 self._last_started_ns = None
             self._target_fps = fps

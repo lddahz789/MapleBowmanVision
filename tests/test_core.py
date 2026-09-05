@@ -473,6 +473,53 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(loaded["vision"]["monster_structure_weight"], 0.15)
         self.assertEqual(loaded["vision"]["active_monster_category"], "")
 
+    def test_legacy_config_without_profile_remains_classic(self):
+        legacy = json.loads(json.dumps(self.config))
+        legacy.pop("profile", None)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = bot.load_config(path)
+
+        self.assertEqual(loaded["profile"], "classic")
+
+    def test_newmaple_profile_has_independent_config_and_assets(self):
+        from mbv.paths import CLASSIC_PATHS, NEW_MAPLE_PATHS
+        from mbv.template_store import template_roots_from_config, template_trash_from_config
+
+        loaded = bot.load_config(NEW_MAPLE_PATHS.example_config)
+        roots = template_roots_from_config(loaded)
+
+        self.assertEqual(loaded["profile"], "newmaple")
+        self.assertEqual(loaded["window"]["exact_titles"], ["NewMaple"])
+        self.assertEqual(loaded["window"]["executable_contains"], ["NewMaple.exe"])
+        self.assertEqual(loaded["vision"]["player_head_threshold"], 0.74)
+        self.assertEqual(roots.monster, NEW_MAPLE_PATHS.assets.monster)
+        self.assertEqual(template_trash_from_config(loaded), NEW_MAPLE_PATHS.assets.trash)
+        self.assertNotEqual(roots.monster, CLASSIC_PATHS.assets.monster)
+
+    def test_newmaple_window_detection_prefers_executable_profile(self):
+        from mbv import window as runtime_window
+        from mbv.paths import NEW_MAPLE_PATHS
+
+        config = bot.load_config(NEW_MAPLE_PATHS.example_config)
+        expected = bot.WindowInfo(200, "NewMaple", 30, 40, 1280, 720)
+
+        def process_path(hwnd: int) -> tuple[int, str]:
+            if hwnd == 200:
+                return 4321, r"D:\NewMaple\NewMaple.exe"
+            return 1234, r"C:\Windows\notepad.exe"
+
+        with (
+            patch.object(runtime_window, "visible_windows", return_value=[(100, "NewMaple 攻略"), (200, "NewMaple")]),
+            patch.object(runtime_window, "window_process_path", side_effect=process_path),
+            patch.object(runtime_window, "client_window", return_value=expected) as client,
+        ):
+            found = runtime_window.find_game_window(config)
+
+        self.assertEqual(found, expected)
+        client.assert_called_once_with(200, "NewMaple")
+
     def test_old_combat_platform_center_is_invalidated_for_minimap_recapture(self):
         legacy = json.loads(json.dumps(self.config))
         legacy["recognition"].pop("platform_center_space", None)
@@ -513,6 +560,12 @@ class CoreTests(unittest.TestCase):
         first_box = first["targeting"]["box"]
         second_box = second["targeting"]["box"]
         self.assertEqual(first["strategy"]["active"], "bowman_dynamic")
+        self.assertEqual(
+            first["strategy"]["options"]["stationary_attack"][
+                "periodic_step_interval_seconds"
+            ],
+            45.0,
+        )
         self.assertEqual(first_box, {"forward": 0.2808, "back": 0.072, "up": 0.144, "down": 0.144})
         self.assertEqual(second_box, first_box)
         self.assertNotIn("bow_attack_box", second["behavior"])
@@ -546,7 +599,7 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(all(item.description for item in strategies))
         bowman, stationary, throwing_star = strategies
         self.assertIn("platform_center", bowman.required_recognition_data)
-        self.assertEqual(stationary.required_recognition_data, ())
+        self.assertIn("platform_center", stationary.required_recognition_data)
         self.assertEqual(throwing_star.required_recognition_data, ())
         self.assertEqual(len(throwing_star.capture_fields), 2)
         self.assertIn(
@@ -558,7 +611,7 @@ class CoreTests(unittest.TestCase):
             {field.path for field in throwing_star.setting_fields},
         )
         self.assertEqual(missing_recognition_data(self.config, bowman), ("platform_center",))
-        self.assertEqual(missing_recognition_data(self.config, stationary), ())
+        self.assertEqual(missing_recognition_data(self.config, stationary), ("platform_center",))
         self.assertEqual(
             missing_recognition_data(self.config, throwing_star),
             ("throwing_star_target_regions",),
@@ -566,6 +619,7 @@ class CoreTests(unittest.TestCase):
         ready = json.loads(json.dumps(self.config))
         ready["recognition"]["platform_center_captured"] = True
         self.assertEqual(missing_recognition_data(ready, bowman), ())
+        self.assertEqual(missing_recognition_data(ready, stationary), ())
         ready["strategy"]["options"]["throwing_star_safe"]["target_regions"] = [
             {
                 "id": "region_1",
@@ -1076,6 +1130,7 @@ class CoreTests(unittest.TestCase):
 
         instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
         instance.armed = True
+        instance.keyboard = MagicMock()
         instance.input_authorized = True
         instance.background_input = True
         instance.started_at = 1.0
@@ -1398,7 +1453,7 @@ class CoreTests(unittest.TestCase):
         self.assertIs(selected.target, left_only_when_facing_left)
         self.assertIsNone(selected.chase_target)
 
-    def test_stationary_attack_only_attacks_or_stops(self):
+    def test_stationary_attack_only_attacks_or_stops_inside_safe_area(self):
         from mbv.strategies import get_strategy
         from mbv.strategies.base import StrategyActionContext
 
@@ -1415,7 +1470,7 @@ class CoreTests(unittest.TestCase):
             direction="right",
             behavior=self.config["behavior"],
             settings={},
-            recognition={"platform_center": {"x": 0.1, "y": 0.5}},
+            recognition={"platform_center": {"x": 0.8, "y": 0.5}},
         )
         attack = strategy.decide(
             StrategyActionContext(target_box=(400, 100, 20, 20), has_monster_candidates=True, **common)
@@ -1427,6 +1482,87 @@ class CoreTests(unittest.TestCase):
         self.assertLess(attack.target_x, attack.player_x)
         self.assertFalse(attack.face_each_attack)
         self.assertEqual((wait.action, wait.state), ("stop", "TARGET_OUT_OF_RANGE"))
+
+    def test_stationary_attack_steps_right_after_45_seconds_before_attacking(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        decision = get_strategy("stationary_attack").decide(
+            StrategyActionContext(
+                marker=(0.5, 0.5),
+                player_box=(500, 100, 40, 1),
+                player_anchor=(520.0, 100.0),
+                target_box=(600, 100, 20, 20),
+                chase_box=None,
+                combat_width=1000,
+                has_monster_candidates=True,
+                now=55.0,
+                last_target_seen=54.0,
+                last_pickup=0.0,
+                direction="right",
+                behavior=self.config["behavior"],
+                settings={
+                    "periodic_step_interval_seconds": 45.0,
+                    "periodic_step_seconds": 0.12,
+                },
+                recognition={"platform_center": {"x": 0.5, "y": 0.5}},
+                last_periodic_step=10.0,
+            )
+        )
+
+        self.assertEqual((decision.action, decision.state, decision.direction), (
+            "step",
+            "PERIODIC_STEP_RIGHT",
+            "right",
+        ))
+        self.assertEqual(decision.move_seconds, 0.12)
+
+    def test_stationary_attack_returns_to_platform_center_before_resuming_output(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        strategy = get_strategy("stationary_attack")
+        common = dict(
+            player_box=(500, 100, 40, 1),
+            player_anchor=(520.0, 100.0),
+            target_box=(600, 100, 20, 20),
+            chase_box=None,
+            combat_width=1000,
+            has_monster_candidates=True,
+            now=56.0,
+            last_target_seen=55.0,
+            last_pickup=0.0,
+            direction="right",
+            behavior=self.config["behavior"],
+            settings={"platform_center_tolerance": 0.015},
+            recognition={"platform_center": {"x": 0.5, "y": 0.5}},
+            last_periodic_step=55.0,
+            periodic_step_pending_return=True,
+        )
+
+        returning = strategy.decide(StrategyActionContext(marker=(0.54, 0.5), **common))
+        returned = strategy.decide(StrategyActionContext(marker=(0.51, 0.5), **common))
+
+        self.assertEqual((returning.action, returning.direction), ("move", "left"))
+        self.assertEqual((returned.action, returned.state), ("stop", "PERIODIC_STEP_RETURNED"))
+        self.assertTrue(returned.periodic_step_return_complete)
+
+    def test_periodic_step_prepares_without_claiming_movement(self):
+        from mbv import bot as runtime_bot
+
+        instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
+        instance.config = {"keys": {"left": "left", "right": "right"}}
+        instance.keyboard = MagicMock()
+        instance.direction = None
+        instance.log = MagicMock()
+
+        instance.periodic_step("right", 0.12, 55.0, "PERIODIC_STEP_RIGHT")
+
+        instance.keyboard.tap.assert_not_called()
+        instance.keyboard.movement_down.assert_not_called()
+        self.assertEqual(instance.step_motion.deadline, 55.6)
+        self.assertFalse(getattr(instance, "periodic_step_pending_return", False))
+        self.assertEqual(instance.state, "MOVEMENT_PREPARE")
 
     def test_stationary_attack_does_not_repeat_direction_tap_on_same_side(self):
         from mbv import bot as runtime_bot
@@ -1446,7 +1582,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(left_taps), 1)
         self.assertEqual(len(attack_taps), 2)
 
-    def test_bowman_dynamic_holds_current_target_direction_while_attacking(self):
+    def test_bowman_dynamic_prepares_direction_change_before_attacking(self):
         from mbv import bot as runtime_bot
 
         instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
@@ -1461,9 +1597,41 @@ class CoreTests(unittest.TestCase):
         instance.keyboard = MagicMock()
         instance.direction = "left"
         instance.last_attack = 0.0
+        instance.attack_facing_ready_at = 0.0
         instance.log = MagicMock()
 
-        with patch("mbv.bot.time.sleep") as sleep:
+        with patch("mbv.bot.time.monotonic", return_value=20.0):
+            instance.face_and_attack(0.8, 0.2, 10.0, face_each_attack=True)
+
+        instance.keyboard.tap.assert_called_once_with("right", 0.06)
+        self.assertNotIn(call.tap("shift"), instance.keyboard.method_calls)
+        self.assertEqual(instance.direction, "right")
+        self.assertEqual(instance.state, "FACE_TARGET_RIGHT")
+        self.assertEqual(instance.attack_facing_ready_at, 20.08)
+        self.assertEqual(instance.last_attack, 0.0)
+        self.assertEqual(instance.log.write.call_args.kwargs["previous_direction"], "left")
+
+    def test_bowman_dynamic_attacks_after_prepared_direction_is_stable(self):
+        from mbv import bot as runtime_bot
+
+        instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
+        instance.config = {
+            "keys": {"left": "left", "right": "right", "attack": "shift"},
+            "behavior": {
+                "attack_interval_seconds": 0.24,
+                "face_tap_seconds": 0.025,
+                "attack_dead_zone": 0.015,
+            },
+        }
+        instance.keyboard = MagicMock()
+        instance.direction = "right"
+        instance.last_attack = 0.0
+        instance.attack_facing_ready_at = 9.0
+        instance.log = MagicMock()
+
+        with patch("mbv.bot.time.monotonic", return_value=10.0), patch(
+            "mbv.bot.time.sleep"
+        ) as sleep:
             instance.face_and_attack(0.8, 0.2, 10.0, face_each_attack=True)
 
         calls = instance.keyboard.method_calls
@@ -1473,8 +1641,66 @@ class CoreTests(unittest.TestCase):
         self.assertLess(direction_down, attack)
         self.assertTrue(any(index > attack for index in direction_releases))
         self.assertEqual(sleep.call_args_list, [call(0.025)])
-        self.assertEqual(instance.direction, "right")
         self.assertEqual(instance.last_attack, 10.0)
+
+    def test_bowman_dynamic_does_not_attack_while_target_side_keeps_flipping(self):
+        from mbv import bot as runtime_bot
+
+        instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
+        instance.config = {
+            "keys": {"left": "left", "right": "right", "attack": "shift"},
+            "behavior": {
+                "attack_interval_seconds": 0.24,
+                "face_tap_seconds": 0.025,
+                "attack_dead_zone": 0.015,
+            },
+        }
+        instance.keyboard = MagicMock()
+        instance.direction = "left"
+        instance.last_attack = 0.0
+        instance.attack_facing_ready_at = 0.0
+        instance.log = MagicMock()
+
+        with patch("mbv.bot.time.monotonic", side_effect=(20.0, 20.02)):
+            instance.face_and_attack(0.8, 0.2, 10.0, face_each_attack=True)
+            instance.face_and_attack(0.2, 0.8, 10.1, face_each_attack=True)
+
+        self.assertEqual(
+            instance.keyboard.tap.call_args_list,
+            [call("right", 0.06), call("left", 0.06)],
+        )
+        self.assertNotIn(call.tap("shift"), instance.keyboard.method_calls)
+
+    def test_bowman_dynamic_sends_selected_skill_key(self):
+        from mbv import bot as runtime_bot
+
+        instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
+        instance.config = {
+            "keys": {"left": "left", "right": "right", "attack": "shift"},
+            "behavior": {
+                "attack_interval_seconds": 0.24,
+                "face_tap_seconds": 0.025,
+                "attack_dead_zone": 0.015,
+            },
+        }
+        instance.keyboard = MagicMock()
+        instance.direction = "right"
+        instance.last_attack = 0.0
+        instance.attack_facing_ready_at = 0.0
+        instance.log = MagicMock()
+
+        with patch("mbv.bot.time.sleep"):
+            instance.face_and_attack(
+                0.8,
+                0.2,
+                10.0,
+                attack_key="a",
+                attack_skill="aoe",
+            )
+
+        instance.keyboard.tap.assert_called_once_with("a")
+        self.assertEqual(instance.log.write.call_args.kwargs["skill"], "aoe")
+        self.assertEqual(instance.log.write.call_args.kwargs["key"], "a")
 
     def test_bowman_dynamic_releases_facing_key_when_attack_fails(self):
         from mbv import bot as runtime_bot
@@ -1490,8 +1716,9 @@ class CoreTests(unittest.TestCase):
         }
         instance.keyboard = MagicMock()
         instance.keyboard.tap.side_effect = OSError("攻击键失败")
-        instance.direction = "left"
+        instance.direction = "right"
         instance.last_attack = 0.0
+        instance.attack_facing_ready_at = 0.0
         instance.log = MagicMock()
 
         with patch("mbv.bot.time.sleep"), self.assertRaisesRegex(OSError, "攻击键失败"):
@@ -1556,6 +1783,173 @@ class CoreTests(unittest.TestCase):
 
         self.assertIsNotNone(selected.target)
         self.assertEqual(selected.target.name, "nearest.png")
+
+    def test_bowman_dynamic_skill_fields_and_old_config_defaults(self):
+        from mbv.strategies import get_strategy
+
+        strategy = get_strategy("bowman_dynamic")
+        fields = {field.path: field for field in strategy.setting_fields}
+        for key in ("aoe_skill_key", "single_skill_key", "melee_skill_key"):
+            self.assertTrue(fields[key].capture_key)
+        for key in (
+            "aoe_min_monsters",
+            "aoe_cluster_distance_multiplier",
+            "melee_enter_distance_multiplier",
+            "melee_exit_distance_multiplier",
+        ):
+            self.assertTrue(fields[key].direct_numeric_input)
+
+        legacy = json.loads(json.dumps(self.config))
+        legacy["strategy"]["options"]["bowman_dynamic"] = {
+            "platform_center_tolerance": 0.08,
+            "platform_center_vertical_tolerance": 0.06,
+            "platform_return_jump_interval_seconds": 0.45,
+        }
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = bot.load_config(path)
+
+        settings = loaded["strategy"]["options"]["bowman_dynamic"]
+        self.assertEqual(settings["aoe_skill_key"], "")
+        self.assertEqual(settings["single_skill_key"], "")
+        self.assertEqual(settings["melee_skill_key"], "")
+        self.assertEqual(settings["aoe_min_monsters"], 2)
+        self.assertEqual(settings["aoe_cluster_distance_multiplier"], 0.75)
+        self.assertEqual(settings["melee_enter_distance_multiplier"], 0.35)
+        self.assertEqual(settings["melee_exit_distance_multiplier"], 0.9)
+
+    def test_bowman_dynamic_skill_key_capture_writes_strategy_config(self):
+        from mbv.panel import ControlPanel
+
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(self.config), encoding="utf-8")
+            panel = ControlPanel.__new__(ControlPanel)
+            panel.config_path = path
+            panel.root = MagicMock()
+            panel._run_tool = lambda _title, action: action()
+
+            with patch("mbv.panel.capture_key_name", return_value="Q"):
+                panel._capture_key("strategy.options.bowman_dynamic.aoe_skill_key")
+
+            loaded = bot.load_config(path)
+
+        self.assertEqual(
+            loaded["strategy"]["options"]["bowman_dynamic"]["aoe_skill_key"],
+            "q",
+        )
+
+    def test_bowman_dynamic_distance_ratios_scale_with_monster_size(self):
+        from mbv.strategies.bowman.dynamic import normalized_monster_gap
+
+        small = normalized_monster_gap((0, 0, 20, 20), (30, 0, 20, 20))
+        large = normalized_monster_gap((0, 0, 40, 40), (60, 0, 40, 40))
+
+        self.assertAlmostEqual(small, 0.5)
+        self.assertAlmostEqual(large, 0.5)
+
+    def test_bowman_dynamic_aims_at_cluster_instead_of_isolated_nearest_target(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import TargetSelectionContext
+
+        strategy = get_strategy("bowman_dynamic")
+        settings = json.loads(json.dumps(self.config["strategy"]["options"]["bowman_dynamic"]))
+        settings.update(
+            {
+                "aoe_skill_key": "a",
+                "melee_skill_key": "m",
+                "aoe_min_monsters": 2,
+                "aoe_cluster_distance_multiplier": 0.75,
+                "melee_enter_distance_multiplier": 0.35,
+                "melee_exit_distance_multiplier": 0.9,
+            }
+        )
+        isolated = bot.Detection((130, 90, 20, 20), 0.95, "isolated.png")
+        cluster_left = bot.Detection((180, 90, 20, 20), 0.9, "cluster-left.png")
+        cluster_right = bot.Detection((205, 90, 20, 20), 0.9, "cluster-right.png")
+
+        selected = strategy.select_targets(
+            TargetSelectionContext(
+                detections=[isolated, cluster_left, cluster_right],
+                player_box=(95, 100, 10, 1),
+                player_raw_box=(95, 60, 10, 40),
+                player_anchor=(100.0, 100.0),
+                scene_width=400,
+                scene_height=240,
+                facing="right",
+                target_area={"forward": 0.5, "back": 0.1, "up": 0.2, "down": 0.2},
+                settings=settings,
+            )
+        )
+
+        self.assertIsNotNone(selected.target)
+        self.assertEqual(selected.target.name, "cluster-left.png")
+        self.assertEqual(len(selected.eligible_detections), 3)
+
+    def test_bowman_dynamic_selects_melee_aoe_and_single_skills_with_hysteresis(self):
+        from mbv.strategies import get_strategy
+        from mbv.strategies.base import StrategyActionContext
+
+        strategy = get_strategy("bowman_dynamic")
+        settings = json.loads(json.dumps(self.config["strategy"]["options"]["bowman_dynamic"]))
+        settings.update(
+            {
+                "aoe_skill_key": "a",
+                "single_skill_key": "s",
+                "melee_skill_key": "m",
+                "aoe_min_monsters": 2,
+                "aoe_cluster_distance_multiplier": 0.75,
+                "melee_enter_distance_multiplier": 0.35,
+                "melee_exit_distance_multiplier": 0.9,
+            }
+        )
+
+        def decide(
+            target_box: tuple[int, int, int, int],
+            detections: tuple[bot.Detection, ...],
+            previous: str | None = None,
+        ):
+            return strategy.decide(
+                StrategyActionContext(
+                    marker=(0.5, 0.5),
+                    player_box=(95, 100, 10, 1),
+                    player_anchor=(100.0, 100.0),
+                    target_box=target_box,
+                    chase_box=None,
+                    combat_width=400,
+                    has_monster_candidates=True,
+                    now=10.0,
+                    last_target_seen=9.0,
+                    last_pickup=0.0,
+                    direction="right",
+                    behavior=self.config["behavior"],
+                    settings=settings,
+                    recognition={"platform_center": {"x": 0.5, "y": 0.5}},
+                    eligible_detections=detections,
+                    previous_attack_skill=previous,
+                )
+            )
+
+        close = bot.Detection((105, 90, 20, 20), 0.9, "close.png")
+        cluster_target = bot.Detection((150, 90, 20, 20), 0.9, "cluster-1.png")
+        cluster_neighbor = bot.Detection((175, 90, 20, 20), 0.9, "cluster-2.png")
+        middle = bot.Detection((114, 90, 20, 20), 0.9, "middle.png")
+        far = bot.Detection((130, 90, 20, 20), 0.9, "far.png")
+
+        melee = decide(close.box, (close,))
+        aoe = decide(cluster_target.box, (cluster_target, cluster_neighbor))
+        single = decide(cluster_target.box, (cluster_target,))
+        not_entered = decide(middle.box, (middle,))
+        held_melee = decide(middle.box, (middle,), previous="melee")
+        exited_melee = decide(far.box, (far,), previous="melee")
+
+        self.assertEqual((melee.attack_skill, melee.attack_key), ("melee", "m"))
+        self.assertEqual((aoe.attack_skill, aoe.attack_key), ("aoe", "a"))
+        self.assertEqual((single.attack_skill, single.attack_key), ("single", "s"))
+        self.assertEqual(not_entered.attack_skill, "single")
+        self.assertEqual(held_melee.attack_skill, "melee")
+        self.assertEqual(exited_melee.attack_skill, "single")
 
     def test_bowman_dynamic_returns_to_platform_center_before_attacking(self):
         from mbv.strategies import get_strategy
@@ -2473,6 +2867,8 @@ class CoreTests(unittest.TestCase):
                 "behavior.attack_interval_seconds": "0.31",
                 "targeting.box.forward": "0.41",
                 "strategy.options.bowman_dynamic.platform_center_tolerance": "0.21",
+                "strategy.options.bowman_dynamic.aoe_skill_key": "A",
+                "strategy.options.bowman_dynamic.aoe_cluster_distance_multiplier": "1.25",
             }
             for key, value in changes.items():
                 entry = (
@@ -2501,6 +2897,16 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(
             reloaded["strategy"]["options"]["bowman_dynamic"]["platform_center_tolerance"],
             0.21,
+        )
+        self.assertEqual(
+            reloaded["strategy"]["options"]["bowman_dynamic"]["aoe_skill_key"],
+            "a",
+        )
+        self.assertEqual(
+            reloaded["strategy"]["options"]["bowman_dynamic"][
+                "aoe_cluster_distance_multiplier"
+            ],
+            1.25,
         )
         self.assertEqual(reloaded["behavior"]["hp_threshold"], 0.42)
         self.assertEqual(reloaded["behavior"]["mp_threshold"], 0.33)
@@ -2715,9 +3121,14 @@ class CoreTests(unittest.TestCase):
     def test_start_bat_is_the_only_daily_startup(self):
         startup_files = sorted(path.name for path in ROOT.glob("Start*.bat"))
         self.assertEqual(startup_files, ["Start.bat"])
-        script = (ROOT / "Start.bat").read_text(encoding="utf-8")
+        start_path = ROOT / "Start.bat"
+        script_bytes = start_path.read_bytes()
+        script = script_bytes.decode("utf-8")
         self.assertIn("-Verb RunAs", script)
         self.assertIn("--enable-input", script)
+        self.assertIn('set "PROFILE=newmaple"', script)
+        self.assertIn('--profile "%PROFILE%"', script)
+        self.assertNotIn(b"\n", script_bytes.replace(b"\r\n", b""))
 
     def test_apply_config_switches_delivery_without_sendinput(self):
         from mbv.player_tracking import PlayerTrackState

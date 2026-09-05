@@ -253,6 +253,10 @@ class RuntimeOverlay:
             self._root.after(25, self._poll)
 
     def _draw(self, root: tk.Tk, canvas: tk.Canvas, hwnd: int, state: dict[str, Any]) -> None:
+        if state.get("background_hidden", False):
+            root.withdraw()
+            self._exit_root.withdraw()
+            return
         left = int(state["left"])
         top = int(state["top"])
         width = int(state["width"])

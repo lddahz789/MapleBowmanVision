@@ -69,11 +69,13 @@ def name_for_vk(code: int) -> str:
 
 def input_delivery(config: dict[str, Any]) -> str:
     raw = str(config.get("input", {}).get("delivery", "foreground")).strip().lower()
+    if raw in {"window_message", "message_only"}:
+        return "window_message"
     if raw in {"background", "postmessage", "window"}:
         return "background"
     if raw in {"foreground", "sendinput", "focus"}:
         return "foreground"
-    raise ValueError(f"不支持的按键投递方式：{raw!r}，请使用 foreground 或 background")
+    raise ValueError(f"不支持的按键投递方式：{raw!r}，请使用 foreground、background 或 window_message")
 
 
 def key_lparam(vk: int, key_up: bool, *, was_down: bool = False, repeat: int = 1) -> int:
@@ -155,44 +157,87 @@ def window_is_foreground(hwnd: int) -> bool:
 
 class Keyboard:
     def __init__(self, delivery: str = "foreground") -> None:
-        if delivery not in {"foreground", "background"}:
+        if delivery not in {"foreground", "background", "window_message"}:
             raise ValueError(f"不支持的按键投递方式：{delivery!r}")
         self.delivery = delivery
         self.root_hwnd = 0
         self.hwnd = 0
         self.held: set[int] = set()
         self._hardware_down: set[int] = set()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._repeat_stop = threading.Event()
         self._repeat_thread: threading.Thread | None = None
+        self._movement_pulses: dict[int, tuple[bool, float]] = {}
+        self._movement_deadlines: dict[int, float] = {}
+        self._repeat_error: OSError | None = None
 
     def bind_window(self, hwnd: int) -> None:
         self.root_hwnd = int(hwnd)
         self.hwnd = resolve_input_hwnd(hwnd)
 
     def _ensure_repeat_thread(self) -> None:
-        if self.delivery != "background":
+        if self.delivery not in {"background", "window_message"} and not self._movement_deadlines:
             return
         thread = self._repeat_thread
-        if thread is not None and thread.is_alive():
+        if thread is not None and thread.is_alive() and not self._repeat_stop.is_set():
             return
         self._repeat_stop = threading.Event()
         self._repeat_thread = threading.Thread(
             target=self._repeat_held_keys,
+            args=(self._repeat_stop,),
             name="MapleKeyRepeat",
             daemon=True,
         )
         self._repeat_thread.start()
 
-    def _repeat_held_keys(self) -> None:
-        while not self._repeat_stop.wait(0.05):
+    def _repeat_held_keys(self, stop: threading.Event) -> None:
+        while not stop.wait(0.05):
             with self._lock:
-                held = list(self.held)
-            for vk in held:
-                try:
-                    self._dispatch(vk, key_up=False, was_down=True)
-                except OSError:
-                    break
+                if stop.is_set():
+                    return
+                for vk in list(self.held):
+                    try:
+                        self._repeat_key(vk, time.monotonic())
+                    except OSError as exc:
+                        self._repeat_error = exc
+                        break
+
+    def _repeat_key(self, vk: int, now: float) -> None:
+        """调用方持锁；移动脉冲保留真实的抬键间隙及新的 keydown 边沿。"""
+        if vk in self._movement_deadlines and now >= self._movement_deadlines[vk]:
+            self.up(VK_BY_CODE[vk])
+            return
+        if self.delivery == "foreground":
+            return
+        pulse = self._movement_pulses.get(vk)
+        if pulse is None:
+            self._dispatch(vk, key_up=False, was_down=True)
+            return
+        is_down, due = pulse
+        if now < due:
+            return
+        self._dispatch(vk, key_up=is_down, was_down=is_down)
+        self._movement_pulses[vk] = (not is_down, now + (0.05 if is_down else 0.10))
+
+    def check_health(self) -> None:
+        with self._lock:
+            if self._repeat_error is not None:
+                raise OSError(f"后台持续按键投递失败：{self._repeat_error}")
+
+    def movement_down(self, key: str, seconds: float | None = None) -> None:
+        """只对纯窗口模式的位移启用脉冲；攻击/转向和旧扫描码路径不变。"""
+        code = vk_for(key)
+        with self._lock:
+            self.check_health()
+            if self.delivery != "window_message":
+                self.down(key)
+            elif code not in self.held:
+                self._dispatch(code, False)
+                self.held.add(code)
+                self._movement_pulses[code] = (True, time.monotonic() + 0.10)
+            if seconds is not None:
+                self._movement_deadlines[code] = time.monotonic() + max(0.03, min(0.5, seconds))
+            self._ensure_repeat_thread()
 
     def _release_hardware(self) -> None:
         for vk in list(self._hardware_down):
@@ -247,6 +292,17 @@ class Keyboard:
             raise OSError("键盘输入发送失败")
 
     def _dispatch(self, vk: int, key_up: bool, *, was_down: bool = False) -> None:
+        if self.delivery == "window_message":
+            # 实验模式只向一个已绑定窗口排队，不重复 SendMessage、不发 WM_CHAR，
+            # 也不伪造焦点事件或回退到全局扫描码。
+            if not self.hwnd or not user32.IsWindow(self.hwnd):
+                raise OSError("独立后台按键失败：游戏窗口句柄无效")
+            message = WM_KEYUP if key_up else WM_KEYDOWN
+            if not user32.PostMessageW(
+                self.hwnd, message, vk, key_lparam(vk, key_up, was_down=was_down)
+            ):
+                raise OSError("独立后台按键投递失败，请检查游戏权限")
+            return
         # Classic MapleStory reads GetAsyncKeyState / DirectInput, not WM_KEY*.
         # Switching to PostMessage-only after unfocus therefore does nothing, and
         # releasing hardware keys first makes GetAsyncKeyState go back up.
@@ -270,19 +326,22 @@ class Keyboard:
     def down(self, key: str) -> None:
         code = vk_for(key)
         with self._lock:
+            self.check_health()
             if code in self.held:
                 return
+            self._dispatch(code, False)
             self.held.add(code)
-        self._dispatch(code, False)
-        self._ensure_repeat_thread()
+            self._ensure_repeat_thread()
 
     def up(self, key: str) -> None:
         code = vk_for(key)
         with self._lock:
             if code not in self.held:
                 return
+            self._dispatch(code, True, was_down=True)
             self.held.discard(code)
-        self._dispatch(code, True, was_down=True)
+            self._movement_pulses.pop(code, None)
+            self._movement_deadlines.pop(code, None)
 
     def tap(self, key: str, seconds: float = 0.035) -> None:
         code = vk_for(key)
@@ -301,20 +360,22 @@ class Keyboard:
 
     def release_all(self) -> None:
         with self._lock:
+            self._repeat_stop.set()
             held = list(self.held)
+            for code in held:
+                try:
+                    self._dispatch(code, True, was_down=True)
+                except OSError:
+                    pass
             self.held.clear()
-        self._release_hardware()
-        for code in held:
-            try:
-                if self.delivery == "background" and not window_is_foreground(self.root_hwnd or self.hwnd):
-                    self._post(code, True, was_down=True)
-            except OSError:
-                pass
-        self._repeat_stop.set()
-        thread = self._repeat_thread
+            self._movement_pulses.clear()
+            self._movement_deadlines.clear()
+            self._repeat_error = None
+            self._release_hardware()
+            thread = self._repeat_thread
+            self._repeat_thread = None
         if thread is not None and thread is not threading.current_thread() and thread.is_alive():
             thread.join(timeout=0.3)
-        self._repeat_thread = None
 
 
 def key_is_down(name: str) -> bool:

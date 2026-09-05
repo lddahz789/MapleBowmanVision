@@ -14,6 +14,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from mbv import bot as runtime_bot  # noqa: E402
+from mbv.buffs import (  # noqa: E402
+    AutoBuffController,
+    BUFF_KEY_HOLD_SECONDS,
+    BUFF_PRE_CAST_SECONDS,
+)
 from mbv.input import Keyboard, vk_for  # noqa: E402
 from mbv.config import load_config  # noqa: E402
 from mbv.player_tracking import PlayerTrackState  # noqa: E402
@@ -455,6 +460,62 @@ class PlayerTrackingTests(unittest.TestCase):
         self.assertEqual(anchor.raw_box, teleported.box)
         self.assertEqual(instance.player_track.misses, 0)
 
+    def test_known_nameplate_uses_local_low_threshold_recovery_after_hold_expires(self):
+        instance = self._tracker_bot()
+        prior = PlayerAnchor((90, 80, 20, 1), 0.9, "姓名板", (90, 80, 20, 10))
+        instance.player_track.record(prior, 10.0, velocity_alpha=1.0, max_displacement=100.0)
+        instance.player_track.last_global_at = 10.0
+        weak_own_nameplate = Detection(
+            (92, 80, 20, 10),
+            0.68,
+            "player.png",
+            identity_score=0.96,
+        )
+        instance._detect_player_nameplate.side_effect = [
+            ([], 0.68, "player.png"),
+            ([weak_own_nameplate], 0.68, "player.png"),
+            ([], 0.68, "player.png"),
+            ([weak_own_nameplate], 0.68, "player.png"),
+        ]
+        instance._detect_player_auxiliary.return_value = ([], -1.0, [], -1.0)
+        scene = SceneFeatures(np.zeros((200, 400, 3), dtype=np.uint8))
+
+        first = instance._track_player(scene, self.config["vision"], 11.0)
+        anchor = instance._track_player(scene, self.config["vision"], 11.1)
+
+        self.assertIsNone(first)
+        self.assertIsNotNone(anchor)
+        self.assertEqual(anchor.raw_box, weak_own_nameplate.box)
+        self.assertEqual(anchor.source, "姓名板")
+        self.assertIsNone(instance._detect_player_nameplate.call_args_list[0].args[2])
+        recovery_call = instance._detect_player_nameplate.call_args_list[1]
+        self.assertIsNotNone(recovery_call.args[2])
+        self.assertEqual(recovery_call.kwargs["threshold"], 0.66)
+
+    def test_low_threshold_recovery_rejects_candidate_far_from_known_player(self):
+        instance = self._tracker_bot()
+        prior = PlayerAnchor((20, 80, 20, 1), 0.9, "姓名板", (20, 80, 20, 10))
+        instance.player_track.record(prior, 10.0, velocity_alpha=1.0, max_displacement=100.0)
+        instance.player_track.last_global_at = 10.0
+        far_candidate = Detection(
+            (340, 150, 20, 10),
+            0.68,
+            "player.png",
+            identity_score=0.96,
+        )
+        instance._detect_player_nameplate.side_effect = [
+            ([], 0.68, "player.png"),
+            ([far_candidate], 0.68, "player.png"),
+        ]
+        instance._detect_player_auxiliary.return_value = ([], -1.0, [], -1.0)
+        scene = SceneFeatures(np.zeros((200, 400, 3), dtype=np.uint8))
+
+        anchor = instance._track_player(scene, self.config["vision"], 11.0)
+
+        self.assertIsNone(anchor)
+        self.assertFalse(instance.nameplate_visible_this_frame)
+        self.assertEqual(instance.player_track.misses, 1)
+
     def test_far_reacquisition_keeps_three_source_vote_against_wrong_nameplate(self):
         instance = self._tracker_bot()
         prior = PlayerAnchor((20, 80, 20, 1), 0.9, "姓名板", (20, 80, 20, 10))
@@ -538,7 +599,9 @@ class PlayerTrackingTests(unittest.TestCase):
             "player_name_identity_threshold",
             "player_name_identity_margin",
             "player_reacquire_confirm_frames",
+            "player_nameplate_recovery_threshold",
             "player_auxiliary_max_jump",
+            "player_auxiliary_continuation_seconds",
             "player_auxiliary_identity_threshold",
             "player_auxiliary_reacquire_confirm_frames",
             "player_minimap_assist_enabled",
@@ -555,6 +618,8 @@ class PlayerTrackingTests(unittest.TestCase):
         self.assertEqual(loaded["vision"]["player_local_roi_width"], 0.36)
         self.assertEqual(loaded["vision"]["player_reacquire_confirm_frames"], 2)
         self.assertEqual(loaded["vision"]["player_name_identity_threshold"], 0.50)
+        self.assertEqual(loaded["vision"]["player_nameplate_recovery_threshold"], 0.66)
+        self.assertEqual(loaded["vision"]["player_auxiliary_continuation_seconds"], 15.0)
         self.assertEqual(loaded["vision"]["player_auxiliary_identity_threshold"], 0.90)
         self.assertEqual(loaded["vision"]["player_auxiliary_reacquire_confirm_frames"], 3)
         self.assertTrue(loaded["vision"]["player_minimap_assist_enabled"])
@@ -587,7 +652,7 @@ class AutoPotionTests(unittest.TestCase):
         instance.input_authorized = True
         instance.integrity_ok = True
         instance.auto_potion = AutoPotionController()
-        instance.auto_potion.set_standalone_enabled(True)
+        instance.auto_potion.set_enabled(True)
         instance.config = {"behavior": self.behavior, "keys": self.keys}
         instance.keyboard = MagicMock()
         instance.log = MagicMock()
@@ -623,10 +688,24 @@ class AutoPotionTests(unittest.TestCase):
         self.assertTrue(instance.auto_potion.waiting_foreground)
         instance.keyboard.tap.assert_not_called()
 
-    def test_armed_bot_keeps_original_potion_priority_when_standalone_is_off(self):
+    def test_global_potion_switch_blocks_armed_bot_when_off(self):
         instance = self._bot()
         instance.armed = True
-        instance.auto_potion.set_standalone_enabled(False)
+        instance.auto_potion.set_enabled(False)
+        window = WindowInfo(123, "MapleStory", 0, 0, 800, 600)
+        with (
+            patch.object(runtime_bot.user32, "IsWindow", return_value=True),
+            patch.object(runtime_bot.user32, "IsIconic", return_value=False),
+        ):
+            used = instance._try_auto_potion(window, 0.2, 0.8, 10.0)
+
+        self.assertFalse(used)
+        instance.stop_move.assert_not_called()
+        instance.keyboard.tap.assert_not_called()
+
+    def test_global_potion_switch_allows_armed_bot_when_on(self):
+        instance = self._bot()
+        instance.armed = True
         window = WindowInfo(123, "MapleStory", 0, 0, 800, 600)
         with (
             patch.object(runtime_bot.user32, "IsWindow", return_value=True),
@@ -687,36 +766,260 @@ class AutoPotionTests(unittest.TestCase):
             [call(code, False), call(code, True, was_down=True)],
         )
 
-    def test_latest_potion_mode_request_wins_and_suspended_mode_cannot_enable(self):
+    def test_latest_global_potion_request_wins_and_suspended_mode_cannot_enable(self):
         instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
         instance.action_lock = threading.RLock()
-        instance.potion_mode_requested = None
-        instance.request_standalone_potion(True)
-        instance.request_standalone_potion(False)
-        self.assertFalse(instance.potion_mode_requested)
+        instance.potion_enabled_requested = None
+        instance.request_auto_potion(True)
+        instance.request_auto_potion(False)
+        self.assertFalse(instance.potion_enabled_requested)
 
         instance.auto_potion = AutoPotionController()
         instance.vision_suspended = threading.Event()
         instance.vision_suspended.set()
         instance.notify = MagicMock()
-        instance._set_standalone_potion(WindowInfo(123, "MapleStory", 0, 0, 800, 600), True)
-        self.assertFalse(instance.auto_potion.standalone_enabled)
+        instance._set_auto_potion(WindowInfo(123, "MapleStory", 0, 0, 800, 600), True)
+        self.assertFalse(instance.auto_potion.enabled)
+
+
+class BuffConfigTests(unittest.TestCase):
+    def test_old_config_receives_three_disabled_buff_slots(self):
+        config = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+        config.pop("buffs", None)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            loaded = load_config(path)
+
+        self.assertEqual(
+            loaded["buffs"],
+            {
+                "buff_1": {"enabled": False, "key": "", "interval_seconds": 0.0},
+                "buff_2": {"enabled": False, "key": "", "interval_seconds": 0.0},
+                "buff_3": {"enabled": False, "key": "", "interval_seconds": 0.0},
+            },
+        )
+
+    def test_buff_intervals_are_normalized_and_bounded(self):
+        config = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+        config["buffs"] = {
+            "buff_1": {"key": " A ", "interval_seconds": "30"},
+            "buff_2": {"key": "B", "interval_seconds": -5},
+            "buff_3": {"key": "C", "interval_seconds": float("inf")},
+        }
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            loaded = load_config(path)
+
+        self.assertEqual(
+            loaded["buffs"]["buff_1"],
+            {"enabled": True, "key": "a", "interval_seconds": 30.0},
+        )
+        self.assertFalse(loaded["buffs"]["buff_2"]["enabled"])
+        self.assertEqual(loaded["buffs"]["buff_2"]["interval_seconds"], 0.0)
+        self.assertFalse(loaded["buffs"]["buff_3"]["enabled"])
+        self.assertEqual(loaded["buffs"]["buff_3"]["interval_seconds"], 0.0)
+
+
+class AutoBuffTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.buffs = {
+            "buff_1": {"key": "a", "interval_seconds": 10.0},
+            "buff_2": {"key": "b", "interval_seconds": 20.0},
+            "buff_3": {"key": "", "interval_seconds": 30.0},
+        }
+
+    def test_three_slots_cast_immediately_then_keep_independent_intervals(self):
+        controller = AutoBuffController()
+
+        first = controller.decide(self.buffs, 100.0)
+        self.assertEqual((first.slot, first.key), ("buff_1", "a"))
+        controller.record(first, 100.0)
+        self.assertIsNone(controller.decide(self.buffs, 100.99))
+
+        second = controller.decide(self.buffs, 101.2)
+        self.assertEqual((second.slot, second.key), ("buff_2", "b"))
+        controller.record(second, 101.2)
+        self.assertIsNone(controller.decide(self.buffs, 109.99))
+        self.assertEqual(controller.decide(self.buffs, 110.0).slot, "buff_1")
+
+    def test_zero_interval_or_blank_key_disables_slot(self):
+        controller = AutoBuffController()
+        disabled = {
+            "buff_1": {"key": "a", "interval_seconds": 0.0},
+            "buff_2": {"key": "", "interval_seconds": 10.0},
+            "buff_3": {"key": "c", "interval_seconds": -1.0},
+        }
+        self.assertIsNone(controller.decide(disabled, 100.0))
+
+    def test_explicit_switch_disables_only_selected_slot_and_preserves_timer(self):
+        controller = AutoBuffController()
+        first = controller.decide(self.buffs, 100.0)
+        controller.record(first, 100.0)
+        selected = {
+            "buff_1": {"enabled": False, "key": "a", "interval_seconds": 10.0},
+            "buff_2": {"enabled": True, "key": "b", "interval_seconds": 20.0},
+            "buff_3": {"enabled": False, "key": "c", "interval_seconds": 30.0},
+        }
+
+        second = controller.decide(selected, 101.2)
+        self.assertEqual(second.slot, "buff_2")
+        controller.record(second, 101.2)
+        self.assertIsNone(controller.decide(selected, 110.0))
+
+        selected["buff_1"]["enabled"] = True
+        self.assertEqual(controller.decide(selected, 110.0).slot, "buff_1")
+
+    def test_bot_only_casts_buff_while_armed(self):
+        instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
+        instance.armed = True
+        instance.input_authorized = True
+        instance.auto_buff = AutoBuffController()
+        instance.config = {"buffs": self.buffs}
+        instance.keyboard = MagicMock()
+        instance.log = MagicMock()
+        instance.stop_move = MagicMock()
+        instance._reset_player_lost_recovery = MagicMock()
+
+        instance.window = MagicMock(hwnd=123)
+        instance.background_input = True
+        with (
+            patch("mbv.bot.time.sleep") as sleep,
+            patch("mbv.bot.time.monotonic", return_value=10.45),
+            patch("mbv.bot.user32.IsWindow", return_value=True),
+            patch("mbv.bot.user32.IsIconic", return_value=False),
+        ):
+            self.assertTrue(instance._try_auto_buff(10.0))
+            instance.keyboard.tap.assert_not_called()
+            self.assertTrue(instance._try_auto_buff(10.45))
+        sleep.assert_not_called()
+        instance.keyboard.tap.assert_called_once_with("a", BUFF_KEY_HOLD_SECONDS)
+        self.assertEqual(instance.stop_move.call_count, 2)
+        self.assertEqual(instance.state, "BUFF_1")
+        instance.log.write.assert_called_once_with(
+            "buff",
+            slot="buff_1",
+            key="a",
+            interval_seconds=10.0,
+            pre_cast_seconds=BUFF_PRE_CAST_SECONDS,
+            key_hold_seconds=BUFF_KEY_HOLD_SECONDS,
+            result="key_sent_unverified",
+        )
+
+        instance.keyboard.reset_mock()
+        instance.stop_move.reset_mock()
+        self.assertTrue(instance._try_auto_buff(10.5))
+        instance.keyboard.tap.assert_not_called()
+        instance.stop_move.assert_called_once_with()
+
+        instance.armed = False
+        instance.keyboard.reset_mock()
+        self.assertFalse(instance._try_auto_buff(30.0))
+        instance.keyboard.tap.assert_not_called()
+
+    def test_pause_preserves_last_buff_cast_time(self):
+        instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
+        instance.armed = True
+        instance.state = "BUFF_1"
+        instance.keyboard = MagicMock()
+        instance.window = None
+        instance.window_topmost = False
+        instance.log = MagicMock()
+        instance.notify = MagicMock()
+        instance.auto_buff = AutoBuffController()
+        only_one = {
+            "buff_1": {"key": "a", "interval_seconds": 120.0},
+            "buff_2": {"key": "", "interval_seconds": 0.0},
+            "buff_3": {"key": "", "interval_seconds": 0.0},
+        }
+        action = instance.auto_buff.decide(only_one, 100.0)
+        instance.auto_buff.record(action, 100.0)
+
+        with patch.object(runtime_bot.user32, "MessageBeep"):
+            instance.disarm("测试暂停")
+
+        self.assertIsNone(instance.auto_buff.decide(only_one, 150.0))
+        self.assertIsNotNone(instance.auto_buff.decide(only_one, 220.0))
 
 
 class PanelPotionTests(unittest.TestCase):
-    def test_panel_potion_button_only_queues_session_toggle(self):
+    def test_individual_buff_switch_persists_and_updates_runtime_without_disarming(self):
+        from mbv.panel import ControlPanel
+
+        panel = ControlPanel.__new__(ControlPanel)
+        panel.busy = False
+        panel.root = MagicMock()
+        panel.config_path = Path("config.json")
+        panel.bot = MagicMock()
+        variable = MagicMock()
+        variable.get.return_value = False
+        panel.buff_enabled = {"buff_2": variable}
+        panel._buff_toggle_buttons = {}
+        config = {
+            "buffs": {
+                "buff_2": {"enabled": True, "key": "delete", "interval_seconds": 120.0}
+            }
+        }
+
+        with patch("mbv.panel.load_config", return_value=config), patch(
+            "mbv.panel.save_config"
+        ) as save:
+            panel._toggle_buff_slot("buff_2")
+
+        self.assertFalse(config["buffs"]["buff_2"]["enabled"])
+        save.assert_called_once_with(panel.config_path, config)
+        panel.bot.preview_config_setting.assert_called_once_with(
+            "buffs.buff_2.enabled",
+            False,
+        )
+        panel.bot.notify.assert_called_once_with("Buff 2 已关闭", 3.0)
+
+    def test_buff_interval_direct_input_updates_and_persists(self):
+        from mbv.panel import ControlPanel
+
+        panel = ControlPanel.__new__(ControlPanel)
+        panel.root = MagicMock()
+        entry = MagicMock()
+        entry.get.return_value = "30"
+        persist = MagicMock()
+
+        with patch("mbv.panel.simpledialog.askfloat", return_value=123.5) as askfloat:
+            panel._prompt_numeric_entry(entry, "Buff 1 间隔秒", 0.0, 86400.0, persist)
+
+        self.assertEqual(askfloat.call_args.kwargs["initialvalue"], 30.0)
+        self.assertEqual(askfloat.call_args.kwargs["minvalue"], 0.0)
+        self.assertEqual(askfloat.call_args.kwargs["maxvalue"], 86400.0)
+        persist.assert_called_once_with("123.5")
+        entry.delete.assert_called_once_with(0, "end")
+        entry.insert.assert_called_once_with(0, "123.5")
+
+    def test_panel_potion_button_queues_global_toggle(self):
         from mbv.panel import ControlPanel
 
         panel = ControlPanel.__new__(ControlPanel)
         panel.busy = False
         panel.bot = MagicMock()
-        panel.standalone_potion = MagicMock()
+        panel.auto_potion_enabled = MagicMock()
 
-        panel.standalone_potion.get.return_value = True
+        panel.auto_potion_enabled.get.return_value = True
 
-        panel._toggle_standalone_potion()
+        panel._toggle_auto_potion()
 
-        panel.bot.request_standalone_potion.assert_called_once_with(True)
+        panel.bot.request_auto_potion.assert_called_once_with(True)
+
+    def test_all_comboboxes_can_block_mousewheel_changes(self):
+        from mbv.panel import disable_combobox_mousewheel
+
+        combo = MagicMock()
+        disable_combobox_mousewheel(combo)
+
+        self.assertEqual(
+            [item.args[0] for item in combo.bind.call_args_list],
+            ["<MouseWheel>", "<Button-4>", "<Button-5>"],
+        )
+        self.assertTrue(all(item.kwargs.get("add") == "+" for item in combo.bind.call_args_list))
+        self.assertTrue(all(item.args[1](None) == "break" for item in combo.bind.call_args_list))
 
 
 if __name__ == "__main__":

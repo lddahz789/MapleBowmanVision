@@ -1,18 +1,16 @@
 {
   "version": 1,
-  "profile": "classic",
+  "profile": "newmaple",
   "calibrated": false,
   "window": {
     "exact_titles": [
-      "冒险岛怀旧服",
-      "MapleStory"
+      "NewMaple"
     ],
     "executable_contains": [
-      "Maplestory_Classic.exe"
+      "NewMaple.exe"
     ],
     "title_contains": [
-      "MapleStory",
-      "冒险岛"
+      "NewMaple"
     ],
     "topmost_while_armed": true
   },
@@ -73,7 +71,7 @@
     "monster_structure_weight": 0.15,
     "monster_hold_seconds": 0.35,
     "player_template_threshold": 0.7,
-    "player_head_threshold": 0.76,
+    "player_head_threshold": 0.74,
     "player_title_threshold": 0.7,
     "player_detection_scale": 0.5,
     "player_auxiliary_interval_seconds": 0.5,
@@ -104,7 +102,7 @@
   },
   "keys": {
     "attack": "shift",
-    "jump": "alt",
+    "jump": "space",
     "pickup": "z",
     "hp_potion": "home",
     "mp_potion": "end",
@@ -118,7 +116,7 @@
     "buff_3": {"enabled": false, "key": "", "interval_seconds": 0.0}
   },
   "input": {
-    "delivery": "background"
+    "delivery": "foreground"
   },
   "targeting": {
     "box": {

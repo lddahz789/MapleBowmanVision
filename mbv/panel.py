@@ -58,6 +58,11 @@ FONT = ("Microsoft YaHei UI", 10)
 FONT_TITLE = ("Microsoft YaHei UI", 14, "bold")
 FONT_SECTION = ("Microsoft YaHei UI", 11, "bold")
 FONT_SMALL = ("Microsoft YaHei UI", 9)
+DELIVERY_LABELS = {
+    "foreground": "前台按键",
+    "background": "兼容后台（全局按键）",
+    "window_message": "独立后台（实验）",
+}
 TEMPLATE_GROUPS = (
     ("monster", "怪物模板"),
     ("filter", "过滤项"),
@@ -99,11 +104,19 @@ def is_elevated() -> bool:
         return False
 
 
+def disable_combobox_mousewheel(combo: ttk.Combobox) -> None:
+    """防止滚动面板时意外改变只读下拉框。"""
+    for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        combo.bind(sequence, lambda _event: "break", add="+")
+
+
 class ControlPanel:
     def __init__(self, config_path: Path, enable_input: bool) -> None:
         self.config_path = config_path
+        config = load_config(config_path)
+        self.profile_label = "NewMaple" if config["profile"] == "newmaple" else "怀旧服"
         self.root = tk.Tk()
-        self.root.title("MapleBowmanVision")
+        self.root.title(f"MapleBowmanVision — {self.profile_label}")
         self.root.configure(bg=BG)
         self.root.minsize(560, 720)
         screen_w = self.root.winfo_screenwidth()
@@ -118,7 +131,6 @@ class ControlPanel:
         _exclude_from_capture(panel_hwnd)
         prevent_window_activate(panel_hwnd)
 
-        config = load_config(config_path)
         self.bot = BowmanBot(config, input_authorized=enable_input)
         self.overlay = RuntimeOverlay(self.root)
         self.overlay.set_exit_handler(self.quit)
@@ -140,10 +152,16 @@ class ControlPanel:
         self.monster_category_summary = tk.StringVar(value="")
         self._monster_category_lookup: dict[str, str] = {UNCATEGORIZED_LABEL: ""}
         self.debug_boxes = tk.BooleanVar(value=self.bot.calibration_overlay_visible)
-        self.standalone_potion = tk.BooleanVar(value=False)
+        self.auto_potion_enabled = tk.BooleanVar(value=False)
+        self.standalone_potion = self.auto_potion_enabled
+        self.buff_enabled: dict[str, tk.BooleanVar] = {
+            slot: tk.BooleanVar(value=bool(config["buffs"][slot]["enabled"]))
+            for slot in ("buff_1", "buff_2", "buff_3")
+        }
+        self._buff_toggle_buttons: dict[str, tk.Checkbutton] = {}
         self.hp_threshold_percent = tk.IntVar(value=int(round(float(config["behavior"]["hp_threshold"]) * 100)))
         self.mp_threshold_percent = tk.IntVar(value=int(round(float(config["behavior"]["mp_threshold"]) * 100)))
-        self.delivery = tk.BooleanVar(value=input_delivery(config) == "background")
+        self.delivery = tk.StringVar(value=DELIVERY_LABELS[input_delivery(config)])
         self.topmost_while_armed = tk.BooleanVar(
             value=bool(config.get("window", {}).get("topmost_while_armed", True))
         )
@@ -192,7 +210,6 @@ class ControlPanel:
         except BaseException as exc:
             self.worker_errors.append(exc)
             self.overlay.close()
-            self.root.after(0, lambda: self._worker_failed(exc))
 
     def _worker_failed(self, exc: BaseException) -> None:
         messagebox.showerror("冒险岛弓箭手", f"视觉线程异常：{exc}")
@@ -207,7 +224,7 @@ class ControlPanel:
         topbar.grid_propagate(False)
         tk.Label(
             topbar,
-            text="◉  MapleBowmanVision",
+            text=f"◉  MapleBowmanVision · {self.profile_label}",
             bg=BG,
             fg=FG,
             font=("Microsoft YaHei UI", 16, "bold"),
@@ -355,6 +372,7 @@ class ControlPanel:
             font=FONT,
         )
         self.monster_category_combo.pack(side="right", fill="x", expand=True, padx=(8, 0))
+        disable_combobox_mousewheel(self.monster_category_combo)
         self.monster_category_combo.bind("<<ComboboxSelected>>", self._monster_category_changed)
         category_buttons = tk.Frame(capture, bg=PANEL)
         category_buttons.pack(fill="x", padx=8, pady=2)
@@ -451,6 +469,7 @@ class ControlPanel:
             font=FONT,
         )
         self.profession_combo.pack(side="left", fill="x", expand=True)
+        disable_combobox_mousewheel(self.profession_combo)
         self.profession_combo.bind("<<ComboboxSelected>>", self._profession_changed)
         strategy_select_row = tk.Frame(settings, bg=PANEL)
         strategy_select_row.pack(fill="x", padx=8, pady=(3, 2))
@@ -470,6 +489,7 @@ class ControlPanel:
             font=FONT,
         )
         self.strategy_combo.pack(side="left", fill="x", expand=True)
+        disable_combobox_mousewheel(self.strategy_combo)
         self.strategy_combo.bind("<<ComboboxSelected>>", self._strategy_changed)
         tk.Label(
             settings,
@@ -575,9 +595,9 @@ class ControlPanel:
         self._threshold_control(settings, self.mp_threshold_percent, "MP 自动喝药阈值")
         self.potion_button = tk.Checkbutton(
             settings,
-            text="独立自动喝药：关闭",
-            variable=self.standalone_potion,
-            command=self._toggle_standalone_potion,
+            text="全局自动喝药：关闭",
+            variable=self.auto_potion_enabled,
+            command=self._toggle_auto_potion,
             indicatoron=False,
             bg=BUTTON_BG,
             fg=FG,
@@ -592,7 +612,7 @@ class ControlPanel:
         self.potion_button.pack(fill="x", padx=8, pady=(6, 2), ipady=5)
         tk.Label(
             settings,
-            text="会话开关；挂机暂停时仍监测血蓝，仅在游戏位于前台时发送药键。挂机运行时的自动喝药不受此开关影响。",
+            text="会话开关；关闭后任何状态都不会发送 HP/MP 药键。开启后挂机运行时自动补药，暂停时仅在游戏位于前台时补药。",
             bg=PANEL,
             fg=MUTED,
             font=FONT_SMALL,
@@ -600,6 +620,62 @@ class ControlPanel:
             justify="left",
             anchor="w",
         ).pack(fill="x", padx=8, pady=(0, 5))
+        tk.Label(
+            settings,
+            text="定时补 Buff（仅挂机运行时）",
+            bg=PANEL,
+            fg=FG,
+            font=FONT_SECTION,
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=(8, 2))
+        tk.Label(
+            settings,
+            text="每项可独立开关；关闭会保留按键和间隔。程序首次启动挂机时立即施放；F8 暂停后会保留计时，重新启动只补已到期项目。",
+            bg=PANEL,
+            fg=MUTED,
+            font=FONT_SMALL,
+            wraplength=360,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=(0, 4))
+        for index in range(1, 4):
+            slot = f"buff_{index}"
+            prefix = f"buffs.{slot}"
+            toggle = tk.Checkbutton(
+                settings,
+                text=f"Buff {index}：关闭",
+                variable=self.buff_enabled[slot],
+                command=lambda selected_slot=slot: self._toggle_buff_slot(selected_slot),
+                indicatoron=False,
+                bg=BUTTON_BG,
+                fg=FG,
+                selectcolor="#163844",
+                activebackground=BUTTON_ACTIVE,
+                activeforeground=FG,
+                relief="flat",
+                font=FONT,
+                cursor="hand2",
+                takefocus=False,
+            )
+            toggle.pack(fill="x", padx=8, pady=(5, 1), ipady=4)
+            self._buff_toggle_buttons[slot] = toggle
+            self._labeled_entry(
+                settings,
+                f"{prefix}.key",
+                f"Buff {index} 按键",
+                capture=True,
+            )
+            self._labeled_entry(
+                settings,
+                f"{prefix}.interval_seconds",
+                f"Buff {index} 间隔秒",
+                adjust_step=1.0,
+                minimum=0.0,
+                maximum=86400.0,
+                direct_numeric_input=True,
+                on_adjust=lambda text, field_path=f"{prefix}.interval_seconds":
+                    self._preview_common_setting(field_path, text),
+            )
         tk.Checkbutton(
             settings,
             text="没有目标时左右巡逻",
@@ -650,11 +726,14 @@ class ControlPanel:
             anchor="w",
         ).pack(fill="x", padx=12, pady=10)
 
-        footer = tk.Frame(self.root, bg=BG, height=68, highlightbackground="#263642", highlightthickness=1)
-        footer.grid(row=2, column=0, sticky="ew")
-        footer.grid_propagate(False)
+        footer_shell = tk.Frame(self.root, bg=BG, highlightbackground="#263642", highlightthickness=1)
+        footer_shell.grid(row=2, column=0, sticky="ew")
+        mode_row = tk.Frame(footer_shell, bg=BG)
+        mode_row.pack(fill="x")
+        footer = tk.Frame(footer_shell, bg=BG)
+        footer.pack(fill="x")
         self.debug_button = tk.Checkbutton(
-            footer,
+            mode_row,
             text="显示 Debug 框",
             variable=self.debug_boxes,
             command=self._toggle_debug_boxes,
@@ -669,18 +748,19 @@ class ControlPanel:
             cursor="hand2",
         )
         self.debug_button.pack(side="left", padx=(16, 6), pady=12, ipadx=12, ipady=7)
-        tk.Checkbutton(
-            footer,
-            text="后台按键",
-            variable=self.delivery,
-            command=lambda: self._schedule_settings_save(reconfigure=True),
-            bg=BG,
-            fg=FG,
-            selectcolor=ENTRY_BG,
-            activebackground=BG,
-            activeforeground=FG,
-            font=FONT,
-        ).pack(side="left", padx=8)
+        delivery_combo = ttk.Combobox(
+            mode_row,
+            textvariable=self.delivery,
+            values=tuple(DELIVERY_LABELS.values()),
+            state="readonly",
+            width=22,
+        )
+        disable_combobox_mousewheel(delivery_combo)
+        delivery_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._schedule_settings_save(reconfigure=True),
+        )
+        delivery_combo.pack(side="left", padx=8)
         self.arm_button = self._compact_button(footer, "启动挂机", self._toggle_arm, accent=True)
         self.arm_button.pack(side="right", padx=(6, 16), pady=12, ipadx=18, ipady=7)
         self._compact_button(footer, "退出程序", self.quit).pack(side="right", padx=6, pady=12, ipadx=12, ipady=7)
@@ -921,7 +1001,7 @@ class ControlPanel:
         return bool(value)
 
     def _refresh_capture_status(self, config: dict[str, Any]) -> None:
-        counts = template_counts()
+        counts = template_counts(config)
         status_values: dict[str, tuple[str, str]] = {}
         for key in ("hp_bar", "mp_bar", "minimap", "player_marker", "combat_region", "platform_center", "targeting_range"):
             complete = self._item_complete(config, key)
@@ -976,6 +1056,7 @@ class ControlPanel:
         minimum: float | None = None,
         maximum: float | None = None,
         on_adjust: Callable[[str], None] | None = None,
+        direct_numeric_input: bool = False,
     ) -> None:
         row = tk.Frame(parent, bg=PANEL)
         row.pack(fill="x", padx=8, pady=2)
@@ -1001,6 +1082,21 @@ class ControlPanel:
                 font=FONT_SMALL,
                 cursor="hand2",
                 width=6,
+            ).pack(side="right", padx=(4, 0))
+        if direct_numeric_input:
+            tk.Button(
+                row,
+                text="输入",
+                command=lambda: self._prompt_numeric_entry(entry, label, minimum, maximum, on_adjust),
+                bg=BUTTON_BG,
+                fg=FG,
+                activebackground=BUTTON_ACTIVE,
+                activeforeground=FG,
+                relief="flat",
+                font=FONT_SMALL,
+                cursor="hand2",
+                takefocus=False,
+                width=5,
             ).pack(side="right", padx=(4, 0))
         if adjust_step is not None:
             def adjust(delta: float) -> None:
@@ -1049,6 +1145,38 @@ class ControlPanel:
         if capture:
             entry.bind("<Button-1>", lambda _event: self._capture_key(key))
         (self._entries if entries is None else entries)[key] = entry
+
+    def _prompt_numeric_entry(
+        self,
+        entry: tk.Entry,
+        label: str,
+        minimum: float | None,
+        maximum: float | None,
+        on_adjust: Callable[[str], None] | None,
+    ) -> None:
+        try:
+            initial_value = float(entry.get().strip())
+        except ValueError:
+            initial_value = minimum if minimum is not None else 0.0
+        value = simpledialog.askfloat(
+            "输入数字",
+            f"请输入{label}：",
+            parent=self.root,
+            initialvalue=initial_value,
+            minvalue=minimum,
+            maxvalue=maximum,
+        )
+        if value is None:
+            return
+        text = adjusted_numeric_text(str(value), 0.0, minimum, maximum)
+        try:
+            if on_adjust is not None:
+                on_adjust(text)
+        except Exception as exc:
+            messagebox.showerror("保存参数失败", str(exc), parent=self.root)
+            return
+        entry.delete(0, "end")
+        entry.insert(0, text)
 
     def _threshold_control(self, parent: tk.Misc, variable: tk.IntVar, label: str) -> None:
         wrap = tk.Frame(parent, bg=PANEL)
@@ -1148,7 +1276,7 @@ class ControlPanel:
                 value = self._nested(config, key)
                 entry.delete(0, "end")
                 entry.insert(0, str(value))
-            self.delivery.set(input_delivery(config) == "background")
+            self.delivery.set(DELIVERY_LABELS[input_delivery(config)])
             self.hp_threshold_percent.set(int(round(float(config["behavior"]["hp_threshold"]) * 100)))
             self.mp_threshold_percent.set(int(round(float(config["behavior"]["mp_threshold"]) * 100)))
             self.fallback_patrol.set(bool(config["behavior"].get("fallback_patrol")))
@@ -1159,6 +1287,9 @@ class ControlPanel:
             minimap_assist = getattr(self, "minimap_assist", None)
             if minimap_assist is not None:
                 minimap_assist.set(bool(config["vision"].get("player_minimap_assist_enabled", True)))
+            for slot, variable in getattr(self, "buff_enabled", {}).items():
+                variable.set(bool(config["buffs"][slot].get("enabled", False)))
+            self._refresh_buff_toggle_buttons()
             self._load_performance_monitor_settings(config)
         finally:
             self._loading_settings = previous_loading
@@ -1227,6 +1358,8 @@ class ControlPanel:
                 adjust_step=field.step,
                 minimum=field.minimum,
                 maximum=field.maximum,
+                capture=field.capture_key,
+                direct_numeric_input=field.direct_numeric_input,
                 on_adjust=lambda text, path=field.path: self._preview_strategy_setting(path, text),
             )
         for field in strategy.choice_fields:
@@ -1253,6 +1386,7 @@ class ControlPanel:
                 font=FONT,
             )
             combo.pack(side="right", fill="x", expand=True)
+            disable_combobox_mousewheel(combo)
             combo.bind(
                 "<<ComboboxSelected>>",
                 lambda _event, path=field.path, selected=variable, choices=label_to_value:
@@ -1518,15 +1652,52 @@ class ControlPanel:
         save_config(self.config_path, config)
         self.bot.preview_targeting_setting(path, value)
 
-    def _preview_common_setting(self, path: str, text: str) -> None:
+    def _preview_common_setting(self, path: str, text: Any) -> None:
         config = load_config(self.config_path)
         current = self._nested(config, path)
-        value: Any = float(text)
-        if isinstance(current, int) and path.endswith("minutes"):
-            value = int(float(text))
+        if isinstance(current, bool):
+            value: Any = bool(text)
+        else:
+            value = float(text)
+            if isinstance(current, int) and path.endswith("minutes"):
+                value = int(float(text))
         self._nested(config, path, value)
         save_config(self.config_path, config)
         self.bot.preview_config_setting(path, value)
+
+    def _refresh_buff_toggle_buttons(self) -> None:
+        for slot, button in getattr(self, "_buff_toggle_buttons", {}).items():
+            variable = self.buff_enabled.get(slot)
+            if variable is None:
+                continue
+            enabled = bool(variable.get())
+            index = slot.rsplit("_", 1)[-1]
+            button.configure(
+                text=f"Buff {index}：{'开启' if enabled else '关闭'}",
+                bg="#163844" if enabled else BUTTON_BG,
+                fg=ACCENT if enabled else FG,
+                activebackground="#194858" if enabled else BUTTON_ACTIVE,
+                activeforeground=ACCENT if enabled else FG,
+            )
+
+    def _toggle_buff_slot(self, slot: str) -> None:
+        variable = getattr(self, "buff_enabled", {}).get(slot)
+        if variable is None:
+            return
+        enabled = bool(variable.get())
+        if self.busy:
+            variable.set(not enabled)
+            self._refresh_buff_toggle_buttons()
+            return
+        try:
+            self._preview_common_setting(f"buffs.{slot}.enabled", enabled)
+        except Exception as exc:
+            variable.set(not enabled)
+            messagebox.showerror("保存 Buff 开关失败", str(exc), parent=self.root)
+            self._refresh_buff_toggle_buttons()
+            return
+        self._refresh_buff_toggle_buttons()
+        self.bot.notify(f"Buff {slot.rsplit('_', 1)[-1]} 已{'开启' if enabled else '关闭'}", 3.0)
 
     def _schedule_settings_save(self, reconfigure: bool = False) -> None:
         if self._loading_settings:
@@ -1552,8 +1723,8 @@ class ControlPanel:
         selected_category = self._refresh_monster_categories()
         if selected_category != self.bot.active_monster_category:
             self._activate_monster_category(selected_category, notify=False)
-        counts = template_counts()
         config = load_config(self.config_path)
+        counts = template_counts(config)
         calibration = config.get("calibration", {})
         status_ready = "状态区✓" if calibration.get("status_regions_complete") else "状态区待采"
         recognition_ready = "识别区✓" if calibration.get("recognition_region_complete") else "识别区待采"
@@ -1567,7 +1738,8 @@ class ControlPanel:
         self._refresh_capture_status(config)
 
     def _refresh_monster_categories(self, preferred: str | None = None) -> str:
-        categories = list_monster_categories()
+        roots = self.bot.template_roots
+        categories = list_monster_categories(roots.monster, roots.filter)
         current = self.bot.active_monster_category if preferred is None else preferred
         self._monster_category_lookup = {item.label: item.name for item in categories}
         values = list(self._monster_category_lookup)
@@ -1617,7 +1789,14 @@ class ControlPanel:
             name = simpledialog.askstring("新建怪物分类", "输入分类名称：", parent=self.root)
             if name is None or not name.strip():
                 raise RuntimeError("已取消新建怪物分类")
-            created.append(create_monster_category(name))
+            roots = self.bot.template_roots
+            created.append(
+                create_monster_category(
+                    name,
+                    monster_root=roots.monster,
+                    filter_root=roots.filter,
+                )
+            )
 
         self._run_tool("新建怪物分类", action)
         if created:
@@ -1646,7 +1825,15 @@ class ControlPanel:
             )
             if name is None or not name.strip():
                 raise RuntimeError("已取消重命名怪物分类")
-            renamed.append(rename_monster_category(category, name))
+            roots = self.bot.template_roots
+            renamed.append(
+                rename_monster_category(
+                    category,
+                    name,
+                    monster_root=roots.monster,
+                    filter_root=roots.filter,
+                )
+            )
 
         self._run_tool("分类重命名", action)
         if renamed:
@@ -1665,7 +1852,15 @@ class ControlPanel:
             )
             return
         def action() -> None:
-            item = next((entry for entry in list_monster_categories() if entry.name == category), None)
+            roots = self.bot.template_roots
+            item = next(
+                (
+                    entry
+                    for entry in list_monster_categories(roots.monster, roots.filter)
+                    if entry.name == category
+                ),
+                None,
+            )
             if item is None:
                 raise RuntimeError(f'怪物分类“{category}”不存在')
             confirmed = messagebox.askyesno(
@@ -1676,7 +1871,12 @@ class ControlPanel:
             )
             if not confirmed:
                 raise RuntimeError("已取消删除怪物分类")
-            trash_monster_category(category)
+            trash_monster_category(
+                category,
+                monster_root=roots.monster,
+                filter_root=roots.filter,
+                trash_root=self.bot.template_trash_dir,
+            )
 
         self._run_tool("分类删除", action)
 
@@ -1830,7 +2030,11 @@ class ControlPanel:
             active_kind[0] = None
             for kind, group in groups.items():
                 listbox = group["listbox"]
-                items = list_template_items(kind, group["category"])
+                items = list_template_items(
+                    kind,
+                    group["category"],
+                    roots=self.bot.template_roots,
+                )
                 group["items"] = items
                 listbox.delete(0, "end")
                 for template in items:
@@ -1885,7 +2089,13 @@ class ControlPanel:
             ):
                 return
             try:
-                trash_template(kind, template.filename, group["category"])
+                trash_template(
+                    kind,
+                    template.filename,
+                    group["category"],
+                    roots=self.bot.template_roots,
+                    trash_root=self.bot.template_trash_dir,
+                )
             except Exception as exc:
                 messagebox.showerror("删除采集图片失败", str(exc), parent=dialog)
                 return
@@ -2028,6 +2238,7 @@ class ControlPanel:
 
     def _tick(self) -> None:
         if self.worker_errors:
+            self._worker_failed(self.worker_errors[0])
             return
         now = time.monotonic()
         armed = self.bot.armed
@@ -2058,17 +2269,17 @@ class ControlPanel:
             fg=ACCENT if self.bot.calibration_overlay_visible else MUTED,
         )
         self._refresh_debug_item_buttons()
-        potion_enabled = self.bot.auto_potion.standalone_enabled
+        potion_enabled = self.bot.auto_potion.enabled
         potion_state = self.bot.auto_potion.display_state(now)
-        self.standalone_potion.set(potion_enabled)
+        self.auto_potion_enabled.set(potion_enabled)
         self.potion_button.configure(
-            text=f"独立自动喝药：{potion_state}",
+            text=f"全局自动喝药：{potion_state}",
             fg=ACCENT if potion_enabled else FG,
         )
         notice = self.bot.notice if self.bot.notice and self.bot.notice_until >= now else ""
         text = f"{mode}｜{state}｜血 {hp:.0%} 蓝 {mp:.0%}"
         if potion_enabled:
-            text += f"｜独立喝药 {potion_state}"
+            text += f"｜自动喝药 {potion_state}"
         if notice:
             text += f"\n{notice}"
         self.status.set(text)
@@ -2261,11 +2472,21 @@ class ControlPanel:
         self.bot.set_calibration_overlay_visible(bool(self.debug_boxes.get()))
         self._refresh_debug_item_buttons()
 
-    def _toggle_standalone_potion(self) -> None:
+    def _toggle_auto_potion(self) -> None:
+        variable = getattr(self, "auto_potion_enabled", None)
+        if variable is None:
+            variable = self.standalone_potion
         if self.busy:
-            self.standalone_potion.set(self.bot.auto_potion.standalone_enabled)
+            variable.set(self.bot.auto_potion.enabled)
             return
-        self.bot.request_standalone_potion(bool(self.standalone_potion.get()))
+        request = getattr(self.bot, "request_auto_potion", None)
+        if request is None:
+            request = self.bot.request_standalone_potion
+        request(bool(variable.get()))
+
+    def _toggle_standalone_potion(self) -> None:
+        """兼容旧调用；开关现在控制全部自动喝药。"""
+        self._toggle_auto_potion()
 
     def _save_settings(self) -> None:
         self._persist_settings(apply_runtime=True, notify=True, show_error=True)
@@ -2295,15 +2516,28 @@ class ControlPanel:
                         value = int(float(raw))
                 else:
                     value = raw.lower()
-                    if key.startswith("keys."):
+                    is_buff_key = key.startswith("buffs.") and key.endswith(".key")
+                    if key.startswith("keys.") or (is_buff_key and value):
                         vk_for(value)
                 self._nested(config, key, value)
+            for slot, variable in getattr(self, "buff_enabled", {}).items():
+                self._nested(config, f"buffs.{slot}.enabled", bool(variable.get()))
             strategy = self._selected_strategy()
             config["strategy"]["active"] = strategy.key
+            strategy_key_paths = {
+                f"strategy.options.{strategy.key}.{field.path}"
+                for field in strategy.setting_fields
+                if field.capture_key
+            }
             for key, entry in self._strategy_entries.items():
                 raw = entry.get().strip()
                 current = self._nested(config, key)
-                value = float(raw) if isinstance(current, (int, float)) and not isinstance(current, bool) else raw
+                if isinstance(current, (int, float)) and not isinstance(current, bool):
+                    value = float(raw)
+                else:
+                    value = raw.lower() if key in strategy_key_paths else raw
+                    if key in strategy_key_paths and value:
+                        vk_for(value)
                 self._nested(config, key, value)
             for key, variable in self._strategy_toggles.items():
                 self._nested(config, key, bool(variable.get()))
@@ -2317,7 +2551,9 @@ class ControlPanel:
                 value = float(raw) if isinstance(current, (int, float)) and not isinstance(current, bool) else raw
                 self._nested(config, key, value)
             config.setdefault("input", {})
-            config["input"]["delivery"] = "background" if self.delivery.get() else "foreground"
+            config["input"]["delivery"] = next(
+                key for key, label in DELIVERY_LABELS.items() if label == self.delivery.get()
+            )
             config.setdefault("window", {})
             config["window"]["topmost_while_armed"] = bool(self.topmost_while_armed.get())
             performance_monitor = config.setdefault("performance_monitor", {})
@@ -2351,6 +2587,9 @@ class ControlPanel:
                     "window.topmost_while_armed",
                     "vision.player_minimap_assist_enabled",
                 ):
+                    self.bot.preview_config_setting(key, self._nested(config, key))
+                for slot in getattr(self, "buff_enabled", {}):
+                    key = f"buffs.{slot}.enabled"
                     self.bot.preview_config_setting(key, self._nested(config, key))
             if notify:
                 self.bot.notify("配置已保存", 3.0)

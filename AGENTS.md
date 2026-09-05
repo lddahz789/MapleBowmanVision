@@ -8,9 +8,10 @@
 
 ## 这是什么
 
-Windows 上的 **经典冒险岛 / 怀旧服** 弓箭手视觉挂机原型。
+Windows 上的 **NewMaple 与经典冒险岛 / 怀旧服** 视觉挂机原型。
 
-- 目标进程通常是 `Maplestory_Classic.exe`，窗口标题含 `MapleStory` 或 `冒险岛`。
+- 默认档案目标是 `NewMaple.exe` / `NewMaple`；`classic` 档案仍匹配 `Maplestory_Classic.exe` 与 `MapleStory` / `冒险岛`。
+- 两个档案的配置、校准和采集素材必须隔离，不能跨客户端复用。
 - 只做：窗口客户区截图 → OpenCV 模板/HSV → `SendInput` 扫描码（后台模式再补 `PostMessage`）。
 - 仓库：https://github.com/lddahz789/MapleBowmanVision
 
@@ -21,6 +22,8 @@ Windows 上的 **经典冒险岛 / 怀旧服** 弓箭手视觉挂机原型。
 - 不要读游戏内存、不要抓包、不要注入进程、不要写内核/过滤驱动。
 - 不要从 `MapleStoryAutoLevelUp-Optimized`（Artale）搬符文解密、跑图、组队红条主定位。
 - 不要用 `PostMessage` 代替扫描码作为唯一后台方案：经典版读 `GetAsyncKeyState` / DirectInput，不吃窗口消息。失焦后若只 PostMessage，角色会停。
+- 用户于 2026-09-05 明确要求尝试 PostMessage 后台版本：允许新增独立的 `window_message` 实验模式，保留 classic/旧 `background` 扫描码兼容逻辑。实验模式必须仅向绑定输入窗口投递消息、使用窗口截图，不得静默回退到全局 SendInput；游戏是否接受按键须与 API 投递成功分开报告。
+- 用户随后实测确认 NewMaple 可后台挂机；后续修复应保留 `window_message` 路径及其失焦运行能力。
 - 不要替换 Tk 窗口过程（`GWL_WNDPROC`）来做 `WS_EX_NOACTIVATE`：64 位上会 `OverflowError`。面板只用扩展样式。
 - 不要提交个人 `config.json`、`assets/**/*.png`、`logs/`。默认配置是 `config.example.json`。
 - 不要 `git commit`，除非用户明确要求。
@@ -37,15 +40,21 @@ control_panel.py     # 再导出 mbv.panel
 Start.bat            # 唯一日常入口；UAC 后进入输入待命，不自动启动挂机
 Setup.bat / setup_env.py
 config.example.json
+profiles/newmaple/
+  config.example.json # NewMaple 默认配置；个人 config.json 不提交
+  assets/             # NewMaple 独立模板与回收站
 CHANGELOG.md
 STRATEGIES.md       # 职业策略接口、配置与协作扩展规范
 mbv/
-  paths.py           # ROOT、assets、logs
+  paths.py           # ROOT、运行档案、分档 assets、logs
   template_store.py  # 五类采集图片、怪物分类与可恢复删除
   config.py          # load/save、SessionLog
   performance.py     # FPS、分段耗时、CPU/内存滚动快照
   win32.py           # ctypes、完整性级别
   input.py           # Keyboard、VK、SendInput/PostMessage
+  background_capture.py # 隔离进程 PrintWindow 截图与超时处理
+  background_probe.py # 只读窗口截图与姓名板匹配诊断
+  buffs.py           # 三组定时 Buff 的独立调度
   window.py          # 找窗口、客户区截图
   vision.py          # ROI、血蓝、模板、玩家融合、攻击框
   calibrate.py       # 状态区/识别区独立校准、冻结帧采集、框选策略索敌范围
@@ -77,9 +86,10 @@ assets/{monsters,player,player_head,player_title}/
 - **稳定战斗锚点**：姓名板/头部/称号的原始框只提供水平中心，高度必须用 `PlayerAnchor.box` 的统一脚底 Y；HUD、选敌和攻击范围采集共用 `last_attack_anchor`。轻量 EMA 只平滑小抖动，大幅移动立即跳转。
 - **冻结帧采集**：`capture_frozen_selection` 先截图，把帧传给 `interactive_overlay(..., frozen_frame=)`，裁切同一帧。不要改回「先框再截第二张图」。
 - **小地图标记采集**：点选时用 `magnified_roi_preview` 放大小地图，但 HSV 必须通过 `map_magnified_point` 映射回原始冻结帧，再用 `analyze_player_marker_sample` 提取点击附近的连续亮色并做唯一性验证；不得直接从插值预览或固定 `5×5` 背景中位数取色。保存采集位置供首帧消歧。
-- **姓名板身份去重与遮挡补位**：名字字形阈值只使用模板 Alpha 有效区；多模板候选先分别保留并计算身份分，再用 `deduplicate_nameplate_detections` 跨模板去重。不得让身份无效但原始相关分较高的模板提前压掉有效模板。姓名板已确认本人后，头部/称号可在预测位置和辅助最大位移约束内连续续跟踪。首次或完全丢失时，普通辅助命中不得认人；只有达到 `player_auxiliary_identity_threshold` 且连续多帧位置一致的辅助模板才可建立受限身份。
+- **姓名板身份去重与遮挡补位**：名字字形阈值只使用模板 Alpha 有效区；多模板候选先分别保留并计算身份分，再用 `deduplicate_nameplate_detections` 跨模板去重。不得让身份无效但原始相关分较高的模板提前压掉有效模板。姓名板已确认本人且普通 hold 超时后，可在预测位置附近用 `player_nameplate_recovery_threshold` 生成受限候选，但仍须通过本人字形、辅助最大位移和连续多帧确认；首次全图识别不得使用这个较低阈值。头部/称号可在预测位置和辅助最大位移约束内连续续跟踪；在 `player_auxiliary_continuation_seconds` 内也只允许最后可靠位置附近的辅助候选连续多帧恢复，不得任意换锁。首次或无姓名板身份时，普通辅助命中不得认人；只有达到 `player_auxiliary_identity_threshold` 且连续多帧位置一致的辅助模板才可建立受限身份。
 - **小地图静止确认**：以最近一次可靠姓名板命中，或姓名板身份已建立后的连续头部命中，固定记录 `(唯一实时小地图标记, 视觉 PlayerAnchor, 小地图尺寸)`；不得与上一帧滚动比较，配置初始标记、称号及仅靠辅助模板建立的启动身份都不能建基准。两路视觉暂失且称号也无有效位置时，当前标记距固定基准不超过 2 像素且不超过 0.2 秒，才可返回 `小地图静止确认` 锚点；该返回不得调用 `track.record()`、刷新身份/视觉时间、速度或基准。移动、缺失、多候选、尺寸变化或超时必须同帧清基准并阻断通用 hold，移动后回原点也不能复活。
 - **职业策略**：策略只放 `mbv/strategies/`，必须实现注册元数据、目标选择和动作决策；不得在 `mbv/bot.py` 增加按职业分支。完整规范见 `STRATEGIES.md`。
+- **弓箭手动态技能分流**：AOE、单体、近身技能键属于 `strategy.options.bowman_dynamic`，由策略字段的 `capture_key` 生成采集控件。近身判定与聚怪判定使用怪物检测框尺寸归一化，不能写死屏幕像素；近身必须使用进入/退出双阈值，策略只返回技能键，公共执行器负责实际发键。
 - **通用索敌区与策略多区域**：所有职业策略共享 `targeting.box.{forward,back,up,down}`，相对稳定战斗锚点并随朝向翻转。标飞 `target_regions` 同样跟随稳定战斗锚点，但保持屏幕方向、不随面向翻转；多个区域只做候选并集与优先级。旧策略/`behavior.bow_attack_box` 只用于一次性兼容迁移。
 - **只转向动作**：策略需要预先面向目标时返回 `StrategyDecision(action="face")`，由公共执行器释放左右移动键后仅短按一次目标方向；策略不得用 `move` 模拟转向，也不得直接发键。
 - **姓名板丢失恢复**：超过 `vision.player_hold_seconds` 仍未命中有效姓名板时，由 `BowmanBot` 在职业策略之前按 `behavior.player_lost_move_seconds` 交替左右位移；恢复姓名板、喝药、暂停或改配置时必须释放恢复按键并重置状态。
@@ -88,14 +98,24 @@ assets/{monsters,player,player_head,player_title}/
 - **Debug 框 / F7**：默认显示全部框；F7 只控制总显隐，各项通过 `calibration_overlay_hidden_items` 独立排除且切换总开关时保留。HUD 用 `overlay_draw_plan`，与采集时 `overlay.hide()` 独立。
 - **性能监控**：视觉 worker 每个成功帧只向 `PerformanceMonitor` 提交一次聚合数据；Tk 主线程低频读取冻结快照。整帧耗时不含末尾 FPS 节流，轻量喝药未执行的检测阶段不得补零，禁止从 worker 直接更新 Tk。
 - **面板不抢焦点**：`prevent_window_activate` 只设 `WS_EX_NOACTIVATE`。
-- **配置持久化**：挂机配置的鼠标控件要自动写入个人 `config.json`；`ControlPanel.quit/_destroy` 退出前再调用统一 `_persist_settings`。新增策略参数不能只改运行内存或 Entry。
+- **配置持久化**：挂机配置的鼠标控件要自动写入当前档案的个人 `config.json`；`ControlPanel.quit/_destroy` 退出前再调用统一 `_persist_settings`。新增策略参数不能只改运行内存或 Entry。
+- **全局喝药与定时 Buff**：喝药会话开关关闭时，挂机和暂停状态都不得发送药键。三组 Buff 各有持久化独立开关，关闭时保留按键、间隔和上次发送时间；空按键或零间隔同样表示禁用。Buff 只能在挂机运行时调度；同到期时每帧最多发送一个。F8/失焦暂停、单项开关与配置刷新必须保留每项上次发送时间，避免尚在游戏冷却期时误发并重新计时。每次 Buff 先保留停攻准备时间，再使用较长按键和施法保护窗口；窗口内不得恢复攻击或发送下一 Buff。
+- **下拉框滚轮保护**：所有 `ttk.Combobox` 都必须绑定 `disable_combobox_mousewheel`，防止滚动控制面板时误改选项。
+- **运行档案隔离**：`Start.bat` 默认 `newmaple`，`Start.bat classic` 才使用原怀旧服。所有模板采集、分类管理、删除回收和运行时加载都必须通过当前配置解析素材根目录，不能重新写死根目录 `assets/`。
+- **独立后台实验**：`window_message` 同时启用纯窗口按键和窗口截图；启动不切前台、不置顶，失焦时隐藏 HUD。PrintWindow 放在可终止的辅助进程，超时、空白或失败暂停挂机；最小化不支持，非空缓存画面仍可能陈旧，不能把截图成功当作游戏持续渲染或施法成功的证明。旧 `postmessage/window` 别名保持兼容含义。重复发键和抬键必须持同一把锁，所有输入模式暂停都要实际释放按住的键。
 - **配置**：`load_config` 要求 `version == 1`，并补输入、识别锚点和 `strategy`；旧弓箭框迁移只能缩放一次。
+- **连续帧确认**：每次 `_track_player` 开始调用 `track.begin_frame()`；同帧多次扫描不得增加确认帧数。空帧、歧义帧通过 `mark_miss()` 清理本帧未更新的待确认候选；暂停或真实视觉记录也要清除旧确认链。
+- **Buff 准备与公平调度**：0.45 秒准备期跨帧推进，不阻塞视觉循环；暂停、退出、关闭单项、换按键或配置刷新不得让旧准备任务发键。发键前复核窗口，前台模式才要求焦点；已完成的 0.18 秒按键保持与 1.2 秒保护窗口保留。到期项目按最早到期时间调度，避免短间隔槽位饿死后续槽位；准备取消不得消耗冷却。
+- **配置落盘保护**：`save_config` 先序列化，再同目录写临时文件、flush/fsync 和原子替换；上一份可解析配置写入 `config.json.bak`，备份和临时文件禁止提交。原子落盘不等于解决多实例并发覆盖。
+- **线程异常提示**：worker 只记录异常，由 Tk 主线程 `_tick` 消费并显示；不要在 except 中注册延后捕获异常变量的 lambda，也不要从 worker 操作 Tk。
+- **移动与位移验证**：原地攻击每帧优先判断小地图安全点，不限周期动作之后。纯窗口移动走 `Keyboard.movement_down` 的抬按脉冲，不能改变普通攻击/转向或回退全局输入；重复投递错误必须交回主循环处理。短步跨帧准备/按住/验证，输入层独立限时抬键；仅唯一实时标记向正确方向移动至少 0.5 像素才能记完成，三轮失败暂停。普通回位记录有向进展，连续 2 秒无进展重试、4 秒暂停；暂停、配置、药/Buff/识别中断必须释放移动键，旧准备阶段不得直接算完成。
 
 ## 怎么跑
 
 ```bat
 Setup.bat
 Start.bat
+Start.bat classic
 ```
 
 测试（在仓库根，用项目 venv）：

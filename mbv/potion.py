@@ -16,7 +16,7 @@ class AutoPotionController:
     """独立维护补药冷却和会话状态，不直接操作键盘或窗口。"""
 
     def __init__(self) -> None:
-        self.standalone_enabled = False
+        self.enabled = False
         self.last_hp_at = float("-inf")
         self.last_mp_at = float("-inf")
         self.last_action = ""
@@ -24,16 +24,25 @@ class AutoPotionController:
         self.waiting_foreground = False
         self.unavailable_reason = ""
 
-    def set_standalone_enabled(self, enabled: bool) -> None:
-        if enabled and not self.standalone_enabled:
+    def set_enabled(self, enabled: bool) -> None:
+        if enabled and not self.enabled:
             self.last_action = ""
             self.last_action_at = 0.0
-        self.standalone_enabled = bool(enabled)
+        self.enabled = bool(enabled)
         self.waiting_foreground = False
         self.unavailable_reason = ""
 
+    @property
+    def standalone_enabled(self) -> bool:
+        """兼容旧调用；现在表示全局自动喝药是否启用。"""
+        return self.enabled
+
+    def set_standalone_enabled(self, enabled: bool) -> None:
+        """兼容旧调用；新代码使用 set_enabled。"""
+        self.set_enabled(enabled)
+
     def set_unavailable(self, reason: str) -> None:
-        if self.standalone_enabled:
+        if self.enabled:
             self.unavailable_reason = str(reason).strip()
             self.waiting_foreground = False
 
@@ -62,7 +71,7 @@ class AutoPotionController:
         self.waiting_foreground = False
 
     def display_state(self, now: float) -> str:
-        if not self.standalone_enabled:
+        if not self.enabled:
             return "关闭"
         if self.unavailable_reason:
             return self.unavailable_reason

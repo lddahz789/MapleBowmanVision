@@ -9,6 +9,12 @@ diagnostics/
 
 # Personal calibration and captured templates
 config.json
+config.json.bak
+.config.json.*.tmp
+profiles/*/config.json
+profiles/*/assets/**/*.png
+profiles/*/assets/**/*.anchor.json
+profiles/*/assets/template_trash/
 assets/monsters/*.png
 assets/monsters/**/*.png
 assets/monster_filters/*.png

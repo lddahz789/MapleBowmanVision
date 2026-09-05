@@ -90,6 +90,58 @@ class MinimapStationaryIntegrationTests(unittest.TestCase):
         instance.player_track.last_global_at = 9.9
         return instance
 
+    def test_player_recognition_logs_loss_scores_and_reacquisition_once(self):
+        instance = self.blank_bot()
+        instance.log = MagicMock()
+
+        missing = instance._record_player_recognition_result(
+            None,
+            10.0,
+            nameplate_score=0.68,
+            nameplate_count=0,
+            best_identity_score=-1.0,
+            head_score=0.73,
+            title_score=0.69,
+            global_scan=True,
+            minimap_guard_active=False,
+            marker_unambiguous=True,
+        )
+        instance._record_player_recognition_result(
+            None,
+            12.0,
+            nameplate_score=0.67,
+            nameplate_count=0,
+            best_identity_score=-1.0,
+            head_score=0.72,
+            title_score=0.68,
+            global_scan=True,
+            minimap_guard_active=False,
+            marker_unambiguous=True,
+        )
+        recovered = instance._record_player_recognition_result(
+            nameplate_anchor(),
+            13.0,
+            nameplate_score=0.91,
+            nameplate_count=1,
+            best_identity_score=0.98,
+            head_score=0.76,
+            title_score=0.72,
+            global_scan=True,
+            minimap_guard_active=False,
+            marker_unambiguous=True,
+        )
+
+        self.assertIsNone(missing)
+        self.assertIsNotNone(recovered)
+        self.assertEqual(
+            [item.args[0] for item in instance.log.write.call_args_list],
+            ["player_recognition_lost", "player_recognition_reacquired"],
+        )
+        self.assertEqual(
+            instance.log.write.call_args_list[1].kwargs["lost_seconds"],
+            3.0,
+        )
+
     def track(
         self,
         instance: runtime_bot.BowmanBot,
@@ -425,6 +477,46 @@ class MinimapStationaryIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(title_anchor)
         self.assertTrue(title_anchor.source.startswith("称号勋章"))
         self.assertIsNone(held)
+
+    def test_known_nameplate_identity_reacquires_nearby_head_after_hold_expires(self):
+        instance, vision, _nameplate = self.establish_nameplate_reference()
+        vision["player_hold_seconds"] = 0.01
+        own_head = head_detection(score=0.81)
+        instance._detect_player_auxiliary.return_value = ([own_head], own_head.score, [], -1.0)
+
+        first = self.track(instance, vision, 11.00, MARKER)
+        second = self.track(instance, vision, 11.05, MARKER)
+        recovered = self.track(instance, vision, 11.10, MARKER)
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertIsNotNone(recovered)
+        self.assertTrue(recovered.source.startswith("头部"))
+        self.assertEqual(recovered.raw_box, own_head.box)
+        # 低于首次辅助认人的 0.90 门槛；这里只恢复空间续跟踪，不刷新身份时间。
+        self.assertLess(own_head.score, vision["player_auxiliary_identity_threshold"])
+        self.assertEqual(instance.player_track.last_identity_at, 10.0)
+        self.assertFalse(instance.player_track.minimap_stationary_blocked)
+
+    def test_low_score_auxiliary_cannot_start_identity_or_revive_stale_identity(self):
+        own_head = head_detection(score=0.81)
+
+        fresh = self.blank_bot()
+        fresh_vision = dict(self.vision)
+        fresh._detect_player_auxiliary.return_value = ([own_head], own_head.score, [], -1.0)
+        startup_results = [
+            self.track(fresh, fresh_vision, now, MARKER)
+            for now in (1.00, 1.05, 1.10)
+        ]
+
+        stale, stale_vision, _nameplate = self.establish_nameplate_reference()
+        stale_vision["player_hold_seconds"] = 0.01
+        stale_vision["player_auxiliary_continuation_seconds"] = 1.0
+        stale._detect_player_auxiliary.return_value = ([own_head], own_head.score, [], -1.0)
+        stale_result = self.track(stale, stale_vision, 11.01, MARKER)
+
+        self.assertEqual(startup_results, [None, None, None])
+        self.assertIsNone(stale_result)
 
 
 class PlayerMarkerObservationTests(unittest.TestCase):

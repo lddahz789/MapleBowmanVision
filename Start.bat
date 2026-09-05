@@ -6,7 +6,22 @@ set "PYTHON=%ROOT%.venv\Scripts\python.exe"
 set "PYTHONW=%ROOT%.venv\Scripts\pythonw.exe"
 cd /d "%ROOT%"
 
-if /I not "%~1"=="--elevated" goto :elevate
+if /I "%~1"=="--elevated" (
+  set "PROFILE=%~2"
+  goto :profile
+)
+
+set "PROFILE=%~1"
+if not defined PROFILE set "PROFILE=newmaple"
+goto :elevate
+
+:profile
+if not defined PROFILE set "PROFILE=newmaple"
+if /I "%PROFILE%"=="classic" goto :validate
+if /I "%PROFILE%"=="newmaple" goto :validate
+echo 不支持的运行档案：%PROFILE%。请使用 newmaple 或 classic。
+pause >nul
+exit /b 2
 
 :validate
 rem 不能只检查文件是否存在：虚拟环境可能仍在，但它指向的 Python 已被删除。
@@ -16,11 +31,11 @@ if errorlevel 1 goto :repair
 if not exist "%PYTHONW%" goto :repair
 
 :run
-start "" /b "%PYTHONW%" "%ROOT%maple_bowman.py" --enable-input
+start "" /b "%PYTHONW%" "%ROOT%maple_bowman.py" --profile "%PROFILE%" --enable-input
 exit /b 0
 
 :elevate
-powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList '--elevated' -WorkingDirectory '%ROOT%' -Verb RunAs"
+powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList @('--elevated','%PROFILE%') -WorkingDirectory '%ROOT%' -Verb RunAs"
 if errorlevel 1 (
   echo 无法请求管理员权限，请在 UAC 提示中选择“是”。
   pause >nul
