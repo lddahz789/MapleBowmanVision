@@ -22,6 +22,7 @@ from mbv.background_capture import BackgroundCapture, BackgroundCaptureError
 from mbv.overlay import RuntimeOverlay
 from mbv.performance import PerformanceMonitor
 from mbv.player_tracking import PlayerTrackState
+from mbv.minimap_localization import background_is_stable, background_snapshot
 from mbv.potion import AutoPotionController, PotionAction
 from mbv.strategies import active_strategy, missing_recognition_data, strategy_settings
 from mbv.strategies.base import StrategyActionContext, TargetSelectionContext, horizontal_overlap_ratio
@@ -75,6 +76,16 @@ from mbv.window import (
 
 STATE_LABELS = {
     "MOVEMENT_PREPARE": "停攻等待移动",
+    "HYBRID_WAIT_IDLE": "等待键鼠空闲后临时切前台移动",
+    "HYBRID_WAIT_FRAME": "已切前台，等待新画面确认位置",
+    "HYBRID_ROUTE_YIELD": "路线分段抬键，游戏保持前台",
+    "PICKUP_POINT_INVALID": "请采集与安全点同平台的小地图拾取点",
+    "PICKUP_OUTBOUND_LEFT": "向左前往拾取点并沿途拾取",
+    "PICKUP_OUTBOUND_RIGHT": "向右前往拾取点并沿途拾取",
+    "PICKUP_COLLECT": "目标点停留拾取",
+    "PICKUP_WAIT_LOCALIZATION": "拾取暂缓，等待角色定位恢复",
+    "PICKUP_START_RETURN": "拾取结束，开始返回安全点",
+    "PICKUP_RETURNED": "已回安全点，重新计时拾取与定时右移",
     "PERIODIC_STEP_VERIFY": "检查向右小步实际位移",
     "MOVEMENT_RETRY": "移动无进展，重新按键尝试",
     "PAUSED": "已暂停",
@@ -88,6 +99,8 @@ STATE_LABELS = {
     "CHASE_LEFT": "向左接近目标",
     "CHASE_RIGHT": "向右接近目标",
     "PLAYER_SCREEN_LOST": "正在识别玩家位置",
+    "MINIMAP_WAITING_VISUAL": "小地图已定位，等待画面定位恢复",
+    "MINIMAP_VISUAL_TIMEOUT": "遮挡导航已超时，停止移动等待视觉恢复",
     "PLAYER_RECOVER_LEFT": "姓名板丢失，向左位移",
     "PLAYER_RECOVER_RIGHT": "姓名板丢失，向右位移",
     "TARGET_OUT_OF_RANGE": "战斗区暂无有效目标",
@@ -126,6 +139,8 @@ STATE_LABELS = {
 PLAYER_LOST_RECOVERY_PAUSE_SECONDS = 0.08
 DYNAMIC_DIRECTION_CHANGE_MIN_TAP_SECONDS = 0.06
 DYNAMIC_DIRECTION_CHANGE_SETTLE_SECONDS = 0.08
+ATTACK_TURN_IDLE_SECONDS = 0.6
+ATTACK_TURN_REFRESH_SECONDS = 5.0
 
 DEFAULT_PLAYER_AUXILIARY_INTERVAL_SECONDS = 0.5
 JUMP_ATTACK_LEAD_SECONDS = 0.05
@@ -191,8 +206,9 @@ class BowmanBot:
         self.strategy = active_strategy(config)
         self.input_authorized = input_authorized
         self.delivery = input_delivery(config)
-        self.background_input = self.delivery in {"background", "window_message"}
+        self.background_input = self.delivery in {"background", "window_message", "hybrid"}
         self.keyboard = Keyboard(self.delivery)
+        self._configure_hybrid_cancellation()
         self.template_roots = template_roots_from_config(config)
         self.template_trash_dir = template_trash_from_config(config)
         self.active_monster_category = str(config["vision"].get("active_monster_category", "")).strip()
@@ -218,13 +234,14 @@ class BowmanBot:
         self.last_attack = 0.0
         self.last_jump = 0.0
         self.last_jump_attack = 0.0
-        self.attack_facing_ready_at = 0.0
+        self._reset_attack_facing()
         self.last_strategy_attack_skill: str | None = None
         self.last_periodic_step = 0.0
         self.periodic_step_pending_return = False
         self.step_motion: StepMotion | None = None
         self.move_progress: MoveProgress | None = None
         self.last_pickup = 0.0
+        self.strategy_runtime_state: dict[str, Any] = {}
         self.started_at = 0.0
         self.hotkey_state: dict[str, bool] = {}
         self.hotkey_stop = threading.Event()
@@ -338,6 +355,10 @@ class BowmanBot:
 
     def disarm(self, reason: str) -> None:
         was_armed = self.armed
+        self.strategy_runtime_state = {}
+        self._strategy_localization_missing_since = None
+        self._strategy_localization_gap = 0.0
+        self._strategy_was_interrupted = False
         self.buff_preparation = None
         self.step_motion = None
         self.move_progress = None
@@ -346,7 +367,7 @@ class BowmanBot:
             track.cancel_reacquisition()
         self.armed = False
         self.state = "PAUSED"
-        self.attack_facing_ready_at = 0.0
+        self._reset_attack_facing()
         self.last_strategy_attack_skill = None
         self.periodic_step_pending_return = False
         try:
@@ -418,10 +439,19 @@ class BowmanBot:
                 8.0,
             )
             return
-        self.keyboard.bind_window(window.hwnd)
+        try:
+            self.keyboard.bind_window(window.hwnd)
+            if self.delivery == "hybrid":
+                self.keyboard.check_health()
+                self._hybrid_input_fault = False
+        except OSError as exc:
+            if self.delivery != "hybrid":
+                raise
+            self.notify(f"混合后台无法重新启动：{exc}", 8.0)
+            return
         topmost_while_armed = bool(
             self.config.get("window", {}).get("topmost_while_armed", True)
-        ) and self.delivery != "window_message"
+        ) and self.delivery not in {"window_message", "hybrid"}
         if int(user32.GetForegroundWindow()) != window.hwnd and (
             not self.background_input or topmost_while_armed
         ):
@@ -445,9 +475,13 @@ class BowmanBot:
         self.armed = True
         self.state = "SCANNING"
         self.started_at = time.monotonic()
-        self.attack_facing_ready_at = 0.0
+        self._reset_attack_facing()
         self.last_strategy_attack_skill = None
         self.last_periodic_step = self.started_at
+        self.strategy_runtime_state = {}
+        self._strategy_localization_missing_since = None
+        self._strategy_localization_gap = 0.0
+        self._strategy_was_interrupted = False
         self.periodic_step_pending_return = False
         self.log.write(
             "arm",
@@ -457,7 +491,9 @@ class BowmanBot:
             input_hwnd=self.keyboard.hwnd,
             window_topmost=topmost_while_armed,
         )
-        if self.delivery == "window_message":
+        if self.delivery == "hybrid":
+            self.notify("已启动混合后台：技能用窗口消息，移动切到游戏前台后不再切回原窗口；键鼠操作会中断移动。", 8.0)
+        elif self.delivery == "window_message":
             self.notify("已启动独立后台实验模式：仅窗口消息与窗口截图；请确认角色确实响应。", 8.0)
         elif self.background_input:
             window_mode = "游戏窗口置顶" if topmost_while_armed else "游戏窗口不置顶"
@@ -765,15 +801,16 @@ class BowmanBot:
                 if new_delivery != self.delivery:
                     self.keyboard.release_all()
                     self.delivery = new_delivery
-                    self.background_input = new_delivery in {"background", "window_message"}
+                    self.background_input = new_delivery in {"background", "window_message", "hybrid"}
                     self.keyboard = Keyboard(self.delivery)
+                    self._configure_hybrid_cancellation()
                     if hwnd:
                         self.keyboard.bind_window(hwnd)
                 self.config = config
                 self.template_roots = template_roots_from_config(config)
                 self.template_trash_dir = template_trash_from_config(config)
                 self.strategy = active_strategy(config)
-                self.attack_facing_ready_at = 0.0
+                self._reset_attack_facing()
                 self.last_strategy_attack_skill = None
                 self.last_periodic_step = time.monotonic()
                 self.periodic_step_pending_return = False
@@ -852,12 +889,12 @@ class BowmanBot:
         keys = self.config["keys"]
         opposite = "left" if direction == "right" else "right"
         self.keyboard.up(keys[opposite])
-        if getattr(self, "delivery", "foreground") == "window_message":
+        if getattr(self, "delivery", "foreground") in {"window_message", "hybrid"}:
             self.keyboard.movement_down(keys[direction])
         else:
             self.keyboard.down(keys[direction])
         self.direction = direction
-        self.attack_facing_ready_at = 0.0
+        self._reset_attack_facing()
         self.state = f"PATROL_{direction.upper()}"
 
     def stop_move(self) -> None:
@@ -887,6 +924,12 @@ class BowmanBot:
         motion = getattr(self, "step_motion", None)
         if motion is None:
             return False
+        if not self._prepare_hybrid_movement():
+            # 尚未发键的空闲等待不消耗短步尝试或动作总时限。
+            if motion.phase == "prepare":
+                motion.started = now
+                motion.deadline = now + 0.6
+            return True
         if now - motion.started > 12.0:
             self.disarm("小步动作长时间无法完成，请检查识别、补药与移动输入")
             return True
@@ -902,7 +945,7 @@ class BowmanBot:
             duration = min(0.5, motion.seconds * motion.attempts)
             self.keyboard.movement_down(self.config["keys"][motion.direction], seconds=duration)
             self.direction = motion.direction
-            self.attack_facing_ready_at = 0.0
+            self._reset_attack_facing()
             motion.phase = "hold"
             motion.deadline = now + duration
             self.state = "PERIODIC_STEP_RIGHT"
@@ -982,6 +1025,8 @@ class BowmanBot:
 
     def recover_player_nameplate(self, now: float) -> None:
         """三路玩家定位均丢失时，以固定屏幕方向交替左右位移。"""
+        if not self._prepare_hybrid_movement():
+            return
         behavior = self.config["behavior"]
         keys = self.config["keys"]
         move_seconds = max(0.05, min(2.0, float(behavior["player_lost_move_seconds"])))
@@ -1005,9 +1050,12 @@ class BowmanBot:
         if direction not in {"left", "right"}:
             direction = "left"
         self.stop_move()
-        self.keyboard.down(keys[direction])
+        if getattr(self, "delivery", "foreground") == "hybrid":
+            self.keyboard.movement_down(keys[direction], seconds=min(0.5, move_seconds))
+        else:
+            self.keyboard.down(keys[direction])
         self.direction = direction
-        self.attack_facing_ready_at = 0.0
+        self._reset_attack_facing()
         self.player_lost_recovery_direction = direction
         self.player_lost_recovery_started_at = now
         self.state = f"PLAYER_RECOVER_{direction.upper()}"
@@ -1016,6 +1064,48 @@ class BowmanBot:
             direction=direction,
             seconds=round(move_seconds, 3),
         )
+
+    def _reset_attack_facing(self) -> None:
+        # 移动方向只是输入意图，不能作为下一次攻击转向已被游戏接受的证据。
+        self.attack_facing_ready_at = 0.0
+        self.attack_turn_direction: str | None = None
+        self.attack_turn_requested_at = 0.0
+
+    def _prepare_attack_turn(self, desired: str, now: float) -> bool:
+        """非持续按方向的攻击：停攻、独立点按、跨帧等待；不宣称视觉确认。"""
+        previous = getattr(self, "attack_turn_direction", None)
+        requested_at = getattr(self, "attack_turn_requested_at", 0.0)
+        needs_turn = (previous != desired or self.direction != desired
+                      or now - requested_at >= ATTACK_TURN_REFRESH_SECONDS)
+        if needs_turn:
+            self.state = f"FACE_TARGET_{desired.upper()}"
+            # 必须先等上一技能动作结束；在动作中加长点按仍可能被吞掉。
+            if now - self.last_attack < max(
+                ATTACK_TURN_IDLE_SECONDS,
+                float(self.config["behavior"]["attack_interval_seconds"]),
+            ):
+                return False
+            tap_seconds = max(
+                DYNAMIC_DIRECTION_CHANGE_MIN_TAP_SECONDS,
+                float(self.config["behavior"]["face_tap_seconds"]),
+            )
+            self.keyboard.tap(self.config["keys"][desired], tap_seconds)
+            self.direction = desired
+            self.attack_turn_direction = desired
+            self.attack_turn_requested_at = now
+            self.attack_facing_ready_at = time.monotonic() + DYNAMIC_DIRECTION_CHANGE_SETTLE_SECONDS
+            self.log.write(
+                "attack_face_prepare", direction=desired, previous_direction=previous,
+                reason="refresh" if previous == desired else "new_direction_or_invalidated",
+                tap_seconds=round(tap_seconds, 3), idle_seconds=ATTACK_TURN_IDLE_SECONDS,
+                settle_seconds=DYNAMIC_DIRECTION_CHANGE_SETTLE_SECONDS,
+                facing_verified=False,
+            )
+            return False
+        if time.monotonic() < self.attack_facing_ready_at:
+            self.state = f"FACE_TARGET_{desired.upper()}"
+            return False
+        return True
 
     def face_and_attack(
         self,
@@ -1034,6 +1124,8 @@ class BowmanBot:
         dead = float(behavior["attack_dead_zone"])
         if abs(target_x - player_x) <= dead and self.direction is not None:
             desired = self.direction
+        if not face_each_attack and not self._prepare_attack_turn(desired, now):
+            return
         self.state = f"ATTACK_{desired.upper()}"
         if now - self.last_attack >= float(behavior["attack_interval_seconds"]):
             # NewMaple 在上一技能动作尚未结束时，可能忽略与下一次技能同时到达的换向。
@@ -1064,8 +1156,8 @@ class BowmanBot:
             ):
                 self.state = f"FACE_TARGET_{desired.upper()}"
                 return
-            # 已确认面向后，每次攻击仍短暂按住目标方向，在方向键按下期间发送技能。
-            # 原地策略保持原行为，只在换边时点按方向。
+            # 动态路径在方向键按下期间发送技能；发键成功不代表已视觉确认面向。
+            # 非持续按方向的路径已在上方独立转向，不在每次攻击时按住方向造成位移。
             if face_each_attack:
                 direction_key = keys[desired]
                 try:
@@ -1076,9 +1168,6 @@ class BowmanBot:
                 finally:
                     self.keyboard.up(direction_key)
             else:
-                if self.direction != desired:
-                    self.keyboard.tap(keys[desired], float(behavior["face_tap_seconds"]))
-                    self.direction = desired
                 self.keyboard.tap(selected_attack_key)
             self.last_attack = now
             self.log.write(
@@ -1089,6 +1178,7 @@ class BowmanBot:
                 distance=round(abs(target_x - player_x), 3),
                 skill=str(attack_skill or "single"),
                 key=selected_attack_key,
+                facing_verified=False,
             )
 
     def face_target(
@@ -1126,7 +1216,10 @@ class BowmanBot:
             self.stop_move()
         else:
             self.move(direction)
-        self.keyboard.tap(self.config["keys"]["jump"])
+        if getattr(self, "delivery", "foreground") == "hybrid":
+            self.keyboard.movement_tap(self.config["keys"]["jump"])
+        else:
+            self.keyboard.tap(self.config["keys"]["jump"])
         self.last_jump = now
         self.state = state
         self.log.write("safe_return_jump", direction=direction or "up")
@@ -1136,9 +1229,15 @@ class BowmanBot:
         keys = self.config["keys"]
         self.stop_move()
         try:
-            self.keyboard.down(keys["down"])
+            if getattr(self, "delivery", "foreground") == "hybrid":
+                self.keyboard.movement_down(keys["down"])
+            else:
+                self.keyboard.down(keys["down"])
             time.sleep(DOWN_JUMP_LEAD_SECONDS)
-            self.keyboard.tap(keys["jump"])
+            if getattr(self, "delivery", "foreground") == "hybrid":
+                self.keyboard.movement_tap(keys["jump"])
+            else:
+                self.keyboard.tap(keys["jump"])
         finally:
             self.keyboard.up(keys["down"])
         self.last_jump = now
@@ -1181,6 +1280,38 @@ class BowmanBot:
             attack_key=attack_key,
         )
 
+    def _configure_hybrid_cancellation(self) -> None:
+        if self.delivery == "hybrid":
+            self.keyboard.hybrid.cancelled = lambda: (
+                not self.armed or self.f8_requested.is_set() or self.f9_requested.is_set()
+                or self.vision_suspended.is_set()
+            )
+
+    def _prepare_hybrid_movement(self, cooperative: bool = False) -> bool:
+        if getattr(self, "delivery", "foreground") != "hybrid":
+            return True
+        self._hybrid_motion_requested = True
+        progress = getattr(self, "move_progress", None) if cooperative else None
+        if cooperative and self.keyboard.hybrid.yield_if_due():
+            self._hybrid_motion_requested = False
+            self.stop_move()
+            self.move_progress = progress
+            self.state = "HYBRID_ROUTE_YIELD"
+            return False
+        was_active = bool(self.keyboard.hybrid.active)
+        if self.keyboard.prepare_movement():
+            if not was_active:
+                # 激活耗时可能让传入位置过期；实际移动必须等下一帧重新识别。
+                self.stop_move()
+                self.move_progress = progress
+                self.state = "HYBRID_WAIT_FRAME"
+                return False
+            return True
+        self.stop_move()
+        self.move_progress = progress
+        self.state = "HYBRID_WAIT_IDLE"
+        return False
+
     def act(
         self,
         window: WindowInfo,
@@ -1197,23 +1328,42 @@ class BowmanBot:
         eligible_detections: tuple[Detection, ...] = (),
     ) -> None:
         with self.action_lock:
-            if not self.armed:
-                self._try_auto_potion(window, hp, mp, now)
-                return
-            self._act(
-                window,
-                hp,
-                mp,
-                marker,
-                player_box,
-                target_box,
-                chase_box,
-                combat_width,
-                has_monster_candidates,
-                now,
-                combat_height,
-                eligible_detections,
-            )
+            try:
+                if not self.armed:
+                    # 输入故障需用户显式重新启动；暂停喝药不能反复触发同一异常。
+                    if not (getattr(self, "delivery", "foreground") == "hybrid"
+                            and getattr(self, "_hybrid_input_fault", False)):
+                        self._try_auto_potion(window, hp, mp, now)
+                    return
+                self._hybrid_motion_requested = False
+                self._strategy_decision_made = False
+                try:
+                    self._act(window, hp, mp, marker, player_box, target_box, chase_box,
+                              combat_width, has_monster_candidates, now, combat_height, eligible_detections)
+                finally:
+                    self._strategy_was_interrupted = not self._strategy_decision_made
+                    if self._strategy_was_interrupted:
+                        self._reset_attack_facing()
+                    if getattr(self, "delivery", "foreground") == "hybrid":
+                        try:
+                            if self._hybrid_motion_requested and self.armed:
+                                self.keyboard.movement_heartbeat()
+                            else:
+                                self.keyboard.finish_movement()
+                        finally:
+                            for event, result in self.keyboard.movement_events():
+                                self.log.write(event, result=result)
+                        self.keyboard.check_health()
+            except OSError as exc:
+                if getattr(self, "delivery", "foreground") != "hybrid":
+                    raise
+                self._hybrid_input_fault = True
+                self.log.write("hybrid_input_error", error=str(exc), action="pause")
+                try:
+                    self.disarm(f"混合后台输入异常：{exc}；已暂停发键，请检查后按 F8 重新启动")
+                except OSError as release_error:
+                    self.log.write("hybrid_release_error", error=str(release_error))
+                    self.notify(f"混合后台已暂停，但抬键失败：{release_error}。请手动检查方向键。", 10.0)
 
     def _act(
         self,
@@ -1251,10 +1401,6 @@ class BowmanBot:
         if marker is None and now - self.marker_last_seen >= float(behavior["max_marker_lost_seconds"]):
             self.disarm("小地图玩家标记丢失")
             return
-        if self._try_auto_potion(window, hp, mp, now):
-            return
-        if self._try_auto_buff(now):
-            return
         nameplate_lost_seconds = max(
             0.0,
             float(self.config["vision"].get("player_hold_seconds", 0.8)),
@@ -1263,22 +1409,65 @@ class BowmanBot:
             now - float(getattr(self, "last_nameplate_seen_at", now))
             >= nameplate_lost_seconds
         )
-        if bool(behavior.get("player_lost_recovery_enabled", True)) and nameplate_lost:
+        track = getattr(self, "player_track", None)
+        localized = player_box is not None and (
+            not nameplate_lost or (
+                track is not None and (
+                    track.last_seen_at == now or track.minimap_stationary_evidence is not None
+                )
+            )
+        )
+        marker_trusted = marker is not None and bool(getattr(self, "live_marker_unambiguous", True))
+        self._observe_navigation_localization(now, localized and marker_trusted)
+        if self._try_auto_potion(window, hp, mp, now):
+            return
+        if self._try_auto_buff(now):
+            return
+        if not marker_trusted:
+            self._reset_player_lost_recovery(release_key=True)
+            self._interrupt_step()
+            self.stop_move()
+            self.state = "MARKER_LOST"
+            return
+        minimap_primary = (
+            bool(self.config["vision"].get("player_minimap_assist_enabled", True))
+            and bool(getattr(self, "live_marker_unambiguous", False))
+            and track is not None and track.has_nameplate_identity()
+        )
+        minimap_only = not localized and minimap_primary
+        if minimap_only:
+            # 地图坐标只能用于导航。旧屏幕锚点和选敌结果必须全部隔离。
+            player_box = target_box = chase_box = None
+            eligible_detections = ()
+            self.last_attack_anchor = None
+            self._reset_player_lost_recovery(release_key=True)
+            limit = float(self.config["vision"].get("player_minimap_navigation_seconds", 10.0))
+            if (limit <= 0.0 or track.minimap_navigation_seen_at <= 0.0
+                    or not (0.0 <= now - track.minimap_navigation_seen_at <= limit)):
+                self._interrupt_step()
+                self.stop_move()
+                self.state = "MINIMAP_VISUAL_TIMEOUT"
+                return
+        if (not localized and not minimap_only
+                and getattr(self, "strategy_runtime_state", {}).get("navigation_active", False)):
+            # 导航中不能使用过期的屏幕框继续攻击，也不能离开既定路线盲走找人。
+            self._reset_player_lost_recovery(release_key=True)
+            self._interrupt_step()
+            self.stop_move()
+            self.state = "PLAYER_SCREEN_LOST"
+            return
+        if (not localized and not minimap_only
+                and bool(behavior.get("player_lost_recovery_enabled", True)) and nameplate_lost):
             self._interrupt_step()
             self.recover_player_nameplate(now)
             return
-        if player_box is None:
+        if player_box is None and not minimap_only:
             self._reset_player_lost_recovery(release_key=True)
             self._interrupt_step()
             self.stop_move()
             self.state = "PLAYER_SCREEN_LOST"
             return
         self._reset_player_lost_recovery(release_key=True)
-        if marker is None or not getattr(self, "live_marker_unambiguous", True):
-            self._interrupt_step()
-            self.stop_move()
-            self.state = "MARKER_LOST"
-            return
         if self._advance_periodic_step(marker, now):
             return
         decision = self.strategy.decide(
@@ -1306,16 +1495,53 @@ class BowmanBot:
                 ),
                 eligible_detections=eligible_detections,
                 previous_attack_skill=getattr(self, "last_strategy_attack_skill", None),
+                minimap_only=minimap_only,
+                started_at=self.started_at,
+                runtime_state=dict(getattr(self, "strategy_runtime_state", {})),
+                localization_lost_seconds=getattr(self, "_strategy_localization_gap", 0.0),
+                action_interrupted=getattr(self, "_strategy_was_interrupted", False),
             )
         )
+        self._strategy_decision_made = True
+        if decision.action != "attack":
+            self._reset_attack_facing()
+        self._strategy_localization_gap = 0.0
+        if minimap_only and decision.action not in {"stop", "move", "jump", "down_jump"}:
+            # 公共门禁：策略扩展也不能在只有地图位置时发攻击、拾取或新短步。
+            self._interrupt_step()
+            self.stop_move()
+            self.state = "MINIMAP_WAITING_VISUAL"
+            return
         if decision.attack_skill is not None:
             self.last_strategy_attack_skill = decision.attack_skill
+        if decision.runtime_state is not None:
+            previous = getattr(self, "strategy_runtime_state", {})
+            self.strategy_runtime_state = dict(decision.runtime_state)
+            if previous != self.strategy_runtime_state and (
+                previous.get("phase") != self.strategy_runtime_state.get("phase")
+                or previous.get("return_reason") != self.strategy_runtime_state.get("return_reason")
+                or now - getattr(self, "_strategy_state_logged_at", 0.0) >= 1.0
+            ):
+                self.log.write("strategy_runtime_state", strategy=self.strategy.key,
+                               state=self.strategy_runtime_state)
+                self._strategy_state_logged_at = now
+        if decision.reset_periodic_step:
+            self.last_periodic_step = now
+            self.periodic_step_pending_return = False
         if decision.periodic_step_return_complete:
             self.periodic_step_pending_return = False
         if decision.target_seen:
             self.last_target_seen = now
         if decision.action != "move":
             self.move_progress = None
+        if decision.pickup_interval_seconds is not None:
+            self._validate_route_pickup_key()
+        if decision.action in {"move", "chase", "step", "jump", "down_jump"}:
+            if not self._prepare_hybrid_movement(cooperative=decision.cooperative_movement):
+                return
+        elif getattr(self, "delivery", "foreground") == "hybrid":
+            self.keyboard.finish_movement()
+            self.keyboard.check_health()
         if decision.action == "face":
             self.face_target(
                 str(decision.direction),
@@ -1335,6 +1561,9 @@ class BowmanBot:
             self.chase_target(float(decision.target_x), float(decision.player_x))
         elif decision.action == "move":
             self._move_with_feedback(str(decision.direction), marker, now, decision.state)
+            if (decision.pickup_interval_seconds is not None and not minimap_only
+                    and self.armed and self.state == decision.state):
+                self._tap_route_pickup(now, decision.pickup_interval_seconds)
         elif decision.action == "step":
             self.periodic_step(
                 str(decision.direction),
@@ -1356,12 +1585,42 @@ class BowmanBot:
             )
         elif decision.action == "pickup":
             self.stop_move()
-            self.keyboard.tap(keys["pickup"])
-            self.last_pickup = now
+            if decision.pickup_interval_seconds is not None:
+                self._tap_route_pickup(now, decision.pickup_interval_seconds)
+            else:
+                self.keyboard.tap(keys["pickup"])
+                self.last_pickup = now
             self.state = decision.state
         else:
             self.stop_move()
             self.state = decision.state
+
+    def _observe_navigation_localization(self, now: float, localized: bool) -> None:
+        """观察中断跨越所有行动门禁；恢复首帧也保留丢失时长供策略决策。"""
+        if not getattr(self, "strategy_runtime_state", {}).get("navigation_active", False):
+            self._strategy_localization_missing_since = None
+            self._strategy_localization_gap = 0.0
+            return
+        since = getattr(self, "_strategy_localization_missing_since", None)
+        if since is not None:
+            self._strategy_localization_gap = max(
+                getattr(self, "_strategy_localization_gap", 0.0), max(0.0, now - since))
+        if localized:
+            self._strategy_localization_missing_since = None
+        elif since is None:
+            self._strategy_localization_missing_since = now
+
+    def _validate_route_pickup_key(self) -> None:
+        keys = self.config["keys"]
+        if vk_for(keys["pickup"]) in {vk_for(keys[key]) for key in ("left", "right", "down", "jump")}:
+            raise RuntimeError("路线拾取键不能与移动或跳跃键相同，请修改拾取按键")
+
+    def _tap_route_pickup(self, now: float, interval: float) -> None:
+        self._validate_route_pickup_key()
+        if now - self.last_pickup >= max(0.1, interval):
+            # 普通输入通道：混合后台仍是 PostMessage，不能抬掉正在使用的方向键。
+            self.keyboard.tap(self.config["keys"]["pickup"])
+            self.last_pickup = now
 
     def _detect_player_nameplate(
         self,
@@ -1486,7 +1745,7 @@ class BowmanBot:
         marker_unambiguous: bool = False,
         marker_size: tuple[int, int] | None = None,
     ) -> PlayerAnchor | None:
-        """名字确认身份；视觉暂失时，小地图只证明旧视觉位置是否仍可短时沿用。"""
+        """名字确认身份；小地图与固定背景联合证明遮挡时旧屏幕位置能否短时沿用。"""
         self.nameplate_visible_this_frame = False
         # 配置热更新会原子替换 tracker；本帧始终使用同一个实例，旧结果不会回写新状态。
         track = self.player_track
@@ -1532,6 +1791,15 @@ class BowmanBot:
             track.invalidate_minimap_assist()
         elif minimap_guard_active:
             # 始终与上次真实视觉命中的固定 marker 比较，不与上一帧滚动比较。
+            limit = float(vision.get("player_minimap_assist_max_seconds", 0.2))
+            radius_pixels = 2.0
+            reference = track.minimap_stationary_reference
+            age = now - reference.seen_at
+            extended_limit = float(vision.get("player_minimap_occlusion_seconds", 3.0))
+            if (age > limit and age <= extended_limit
+                    and background_is_stable(reference.background, background_snapshot(scene))):
+                limit = extended_limit
+                radius_pixels = 0.5
             stationary_anchor = track.minimap_stationary_anchor(
                 marker,
                 now,
@@ -1539,8 +1807,9 @@ class BowmanBot:
                 scene_height,
                 map_width,
                 map_height,
-                max_seconds=float(vision.get("player_minimap_assist_max_seconds", 0.2)),
+                max_seconds=limit,
                 marker_unambiguous=marker_unambiguous,
+                radius_pixels=radius_pixels,
             )
         player_hold = float(vision.get("player_hold_seconds", 0.8))
         previous_anchor = track.anchor_within_hold(now, player_hold)
@@ -1866,6 +2135,7 @@ class BowmanBot:
                     map_height,
                     head_continuous=previous_anchor is not None,
                     marker_unambiguous=marker_unambiguous,
+                    background=background_snapshot(scene),
                 )
             return finish(anchor)
         track.mark_miss()
@@ -1905,6 +2175,7 @@ class BowmanBot:
         )
         print("按键投递：" + {
             "window_message": "纯窗口消息（移动采用按下/抬起脉冲，不发送全局按键）。",
+            "hybrid": "混合后台（技能窗口消息；移动临时激活游戏并使用 SendInput）。",
             "background": "后台扫描码（失焦仍 SendInput，并补发窗口消息）。",
             "foreground": "前台 SendInput（游戏必须在前台）。",
         }[self.delivery])
@@ -1954,7 +2225,7 @@ class BowmanBot:
                     vision = self.config["vision"]
                     capture_started_ns = time.perf_counter_ns()
                     try:
-                        if self.delivery == "window_message":
+                        if self.delivery in {"window_message", "hybrid"}:
                             frame = background_capture.capture(window)
                         else:
                             background_capture.close()
@@ -2261,7 +2532,12 @@ class BowmanBot:
                         for index, area in enumerate(areas, start=1):
                             if not isinstance(area, dict) or not bool(area.get("enabled", True)):
                                 continue
-                            if area.get("space") == PLAYER_RELATIVE_REGION_SPACE:
+                            if field.capture_kind == "point" and field.coordinate_space == "minimap":
+                                ax = int(round(float(area.get("x", .5)) * minimap_rect[2])) - 4
+                                ay = int(round(float(area.get("y", .5)) * minimap_rect[3])) - 4
+                                aw = ah = 8
+                                area_origin_x, area_origin_y = minimap_rect[:2]
+                            elif area.get("space") == PLAYER_RELATIVE_REGION_SPACE:
                                 if current_player_anchor is None:
                                     continue
                                 left, top, right, bottom = player_relative_region_rect(
@@ -2323,7 +2599,7 @@ class BowmanBot:
                         banner = "按键未授权｜请从 Start.bat 启动｜F7 Debug 框｜F9 / Ctrl+Shift+Q 退出"
                     overlay.update(
                         {
-                            "background_hidden": self.delivery == "window_message"
+                            "background_hidden": self.delivery in {"window_message", "hybrid"}
                             and int(user32.GetForegroundWindow()) != window.hwnd,
                             "left": current_window.left,
                             "top": current_window.top,

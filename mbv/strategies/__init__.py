@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from mbv.strategies.base import CombatStrategy
+from mbv.strategies.base import CombatStrategy, valid_point
 from mbv.strategies.bowman.dynamic import BowmanDynamicStrategy
 from mbv.strategies.common.stationary_attack import StationaryAttackStrategy
 from mbv.strategies.thief.throwing_star import ThrowingStarSafeStrategy
@@ -55,6 +55,10 @@ def missing_recognition_data(config: dict[str, Any], strategy: CombatStrategy) -
             )
         else:
             has_enabled_item = bool(recognition.get(f"{field.recognition_key}_captured"))
+            if field.capture_kind == "point":
+                has_enabled_item = (has_enabled_item
+                    and recognition.get(f"{field.recognition_key}_space") == field.coordinate_space
+                    and valid_point(recognition.get(field.recognition_key)))
         if (
             field.enable_setting
             and bool(settings.get(field.enable_setting))

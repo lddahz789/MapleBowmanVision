@@ -305,6 +305,19 @@ def load_config(path: Path) -> dict[str, Any]:
         0.1,
         min(0.2, minimap_assist_seconds),
     )
+    # 旧的 0.2 秒静止补位保留；更长遮挡必须额外通过固定背景稳定校验。
+    for key, default, minimum, maximum in (
+        ("player_minimap_occlusion_seconds", 3.0, 0.0, 5.0),
+        ("player_minimap_navigation_seconds", 10.0, 0.0, 30.0),
+    ):
+        raw = config["vision"].get(key, default)
+        try:
+            value = float(raw) if not isinstance(raw, bool) else default
+        except (TypeError, ValueError):
+            value = default
+        if not math.isfinite(value):
+            value = default
+        config["vision"][key] = max(minimum, min(maximum, value))
     return config
 
 

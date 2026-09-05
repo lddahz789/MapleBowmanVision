@@ -1,9 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import math
 from typing import Any, Literal, Protocol
 
 from mbv.vision import Detection
+
+
+def valid_point(value: Any) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(value.get(axis), (int, float)) and not isinstance(value.get(axis), bool)
+        and math.isfinite(value[axis]) and 0.0 <= value[axis] <= 1.0
+        for axis in ("x", "y")
+    )
 
 
 def horizontal_overlap_ratio(
@@ -41,6 +50,7 @@ class StrategyToggleField:
 
     path: str
     label: str
+    live_preview: bool = False
 
 
 @dataclass(frozen=True)
@@ -54,7 +64,7 @@ class StrategyChoiceField:
 
 @dataclass(frozen=True)
 class StrategyCaptureField:
-    """面板按策略生成的矩形采集入口。"""
+    """面板按策略生成的矩形或点位采集入口。"""
 
     recognition_key: str
     button_label: str
@@ -64,6 +74,7 @@ class StrategyCaptureField:
     settings_path: str | None = None
     multiple: bool = False
     coordinate_space: str = "combat"
+    capture_kind: Literal["rectangle", "point"] = "rectangle"
 
 
 @dataclass(frozen=True)
@@ -112,6 +123,12 @@ class StrategyActionContext:
     periodic_step_pending_return: bool = False
     eligible_detections: tuple[Detection, ...] = ()
     previous_attack_skill: str | None = None
+    # 运行层已确认唯一实时小地图标记；只能回安全位置或等待，不得攻击/追怪。
+    minimap_only: bool = False
+    started_at: float = 0.0
+    runtime_state: dict[str, Any] = field(default_factory=dict)
+    localization_lost_seconds: float = 0.0
+    action_interrupted: bool = False
 
 
 @dataclass(frozen=True)
@@ -140,6 +157,11 @@ class StrategyDecision:
     periodic_step_return_complete: bool = False
     attack_key: str | None = None
     attack_skill: str | None = None
+    # 会话状态由运行层保存，不在全局注册的策略实例中保存。
+    runtime_state: dict[str, Any] | None = None
+    reset_periodic_step: bool = False
+    pickup_interval_seconds: float | None = None
+    cooperative_movement: bool = False
 
 
 class CombatStrategy(Protocol):

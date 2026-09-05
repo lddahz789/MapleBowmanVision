@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
+
+import numpy as np
 
 from mbv.vision import PlayerAnchor
 
@@ -23,6 +25,7 @@ class MinimapStationaryReference:
     seen_at: float
     scene_size: tuple[int, int]
     minimap_size: tuple[int, int]
+    background: np.ndarray | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,8 @@ class PlayerTrackState:
     minimap_stationary_reference: MinimapStationaryReference | None = None
     minimap_stationary_evidence: MinimapStationaryEvidence | None = None
     minimap_stationary_blocked: bool = False
+    # 与可靠视觉同帧配对过的唯一小地图标记；导航也不能无限沿用身份。
+    minimap_navigation_seen_at: float = 0.0
 
     def anchor_within_hold(self, now: float, hold_seconds: float) -> PlayerAnchor | None:
         if self.anchor is not None and now - self.last_seen_at <= max(0.0, float(hold_seconds)):
@@ -157,6 +162,7 @@ class PlayerTrackState:
         *,
         head_continuous: bool,
         marker_unambiguous: bool,
+        background: np.ndarray | None = None,
     ) -> bool:
         """记录固定静止基准；只接受姓名板或其后连续跟踪到的头部。"""
         source = anchor.source.split("（", 1)[0]
@@ -187,7 +193,9 @@ class PlayerTrackState:
             seen_at=float(now),
             scene_size=(width, height),
             minimap_size=(map_width, map_height),
+            background=background.copy() if background is not None else None,
         )
+        self.minimap_navigation_seen_at = float(now)
         self.minimap_stationary_evidence = None
         self.minimap_stationary_blocked = False
         return True
@@ -203,6 +211,7 @@ class PlayerTrackState:
         *,
         max_seconds: float,
         marker_unambiguous: bool,
+        radius_pixels: float = MINIMAP_STATIONARY_RADIUS_PIXELS,
     ) -> PlayerAnchor | None:
         """小地图近似静止时短时沿用旧视觉锚点，不滚动刷新任何时间。"""
         self.minimap_stationary_evidence = None
@@ -240,7 +249,7 @@ class PlayerTrackState:
             (current_marker[1] - reference.marker[1]) * map_height,
         )
         distance_pixels = math.hypot(*delta_pixels)
-        if distance_pixels > MINIMAP_STATIONARY_RADIUS_PIXELS + 1e-9:
+        if distance_pixels > radius_pixels + 1e-9:
             # 一旦观察到可信移动，旧基准永久失效；即使随后走回原点也不能复活。
             self.invalidate_minimap_assist(block_hold=True)
             return None

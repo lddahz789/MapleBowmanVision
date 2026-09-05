@@ -15,6 +15,7 @@ from mbv.calibrate import (
     calibrate,
     capture_combat_region,
     capture_platform_center,
+    capture_minimap_point,
     capture_player_marker,
     capture_status_region,
     capture_strategy_area,
@@ -62,6 +63,7 @@ DELIVERY_LABELS = {
     "foreground": "前台按键",
     "background": "兼容后台（全局按键）",
     "window_message": "独立后台（实验）",
+    "hybrid": "混合后台（移动后留前台）",
 }
 TEMPLATE_GROUPS = (
     ("monster", "怪物模板"),
@@ -569,7 +571,7 @@ class ControlPanel:
         ).pack(fill="x", padx=8, pady=(5, 2))
         tk.Checkbutton(
             settings,
-            text="屏幕三路定位都丢失时，用小地图判断是否仍在原地",
+            text="小地图主导航与遮挡辅助定位",
             variable=self.minimap_assist,
             command=self._schedule_settings_save,
             bg=PANEL,
@@ -583,7 +585,7 @@ class ControlPanel:
         ).pack(fill="x", padx=8, pady=(5, 2))
         tk.Label(
             settings,
-            text="与上次可靠视觉命中时的本人标记相比，2 像素内且不超过 0.2 秒会短时沿用旧位置；不会滚动续时。标记移动、丢失或多重命中会立即停用这次沿用；若屏幕视觉仍未恢复则暂停动作。",
+            text="本人身份确认后，遮挡时仍可按唯一实时小地图标记回安全点（默认最长 10 秒），到位等待视觉恢复。标记近乎静止且多处背景稳定时可补位最多 3 秒；背景不支持时只保留原 0.2 秒补位。不滚动续时，标记移动、丢失或歧义立即停用旧坐标。",
             bg=PANEL,
             fg=MUTED,
             font=FONT_SMALL,
@@ -591,6 +593,15 @@ class ControlPanel:
             justify="left",
             anchor="w",
         ).pack(fill="x", padx=8, pady=(0, 4))
+        for key, label, maximum in (
+            ("player_minimap_occlusion_seconds", "遮挡静止补位秒", 5.0),
+            ("player_minimap_navigation_seconds", "遮挡导航最长秒", 30.0),
+        ):
+            self._labeled_entry(
+                settings, "vision." + key, label, adjust_step=0.5,
+                minimum=0.0, maximum=maximum, direct_numeric_input=True,
+                on_adjust=lambda _text: self._schedule_settings_save(),
+            )
         self._threshold_control(settings, self.hp_threshold_percent, "HP 自动喝药阈值")
         self._threshold_control(settings, self.mp_threshold_percent, "MP 自动喝药阈值")
         self.potion_button = tk.Checkbutton(
@@ -1398,7 +1409,9 @@ class ControlPanel:
             row.pack(fill="x", padx=8, pady=3)
             capture_button = self._compact_button(
                 row,
-                field.button_label,
+                (field.button_label + (" ✓" if config.get("recognition", {}).get(
+                    f"{field.recognition_key}_captured") else "（待采）"))
+                if field.capture_kind == "point" else field.button_label,
                 lambda selected=field: self._capture_strategy_area(selected),
             )
             capture_button.pack(side="left", fill="x", expand=True, ipady=3)
@@ -1627,7 +1640,10 @@ class ControlPanel:
         self._nested(config, f"strategy.options.{strategy.key}.{path}", value)
         save_config(self.config_path, config)
         if strategy.key == self.bot.strategy.key:
-            self.bot.apply_config(config)
+            if any(field.path == path and field.live_preview for field in strategy.toggle_fields):
+                self.bot.preview_strategy_setting(path, value)
+            else:
+                self.bot.apply_config(config)
 
     def _preview_strategy_choice(
         self,
@@ -2412,7 +2428,10 @@ class ControlPanel:
         stable_anchor = self.bot.last_attack_anchor
 
         def action() -> None:
-            if field.multiple and field.settings_path:
+            if field.capture_kind == "point" and field.coordinate_space == "minimap":
+                capture_minimap_point(self.config_path, field.recognition_key, field.prompt,
+                                      parent=self.root)
+            elif field.multiple and field.settings_path:
                 capture_strategy_region(
                     self.config_path,
                     strategy.key,
@@ -2586,6 +2605,8 @@ class ControlPanel:
                     "behavior.player_lost_recovery_enabled",
                     "window.topmost_while_armed",
                     "vision.player_minimap_assist_enabled",
+                    "vision.player_minimap_occlusion_seconds",
+                    "vision.player_minimap_navigation_seconds",
                 ):
                     self.bot.preview_config_setting(key, self._nested(config, key))
                 for slot in getattr(self, "buff_enabled", {}):

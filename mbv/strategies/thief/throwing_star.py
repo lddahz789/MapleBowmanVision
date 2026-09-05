@@ -313,12 +313,12 @@ class ThrowingStarSafeStrategy:
         )
 
     def decide(self, context: StrategyActionContext) -> StrategyDecision:
-        if context.player_box is None:
+        if context.player_box is None and not context.minimap_only:
             return StrategyDecision("stop", "PLAYER_SCREEN_LOST")
 
         anchor_x, anchor_y = context.player_anchor or (
-            context.player_box[0] + context.player_box[2] / 2.0,
-            float(context.player_box[1]),
+            context.player_box[0] + context.player_box[2] / 2.0 if context.player_box else 0.0,
+            float(context.player_box[1]) if context.player_box else 0.0,
         )
         player_x = anchor_x / max(1, context.combat_width)
         player_y = anchor_y / max(1, context.combat_height)
@@ -378,6 +378,9 @@ class ThrowingStarSafeStrategy:
                     player_x=player_x,
                 )
             safe_patrol_bounds = (left, right)
+
+        if context.minimap_only:
+            return StrategyDecision("stop", "MINIMAP_WAITING_VISUAL")
 
         if context.target_box is not None:
             target_x = (context.target_box[0] + context.target_box[2] / 2) / max(1, context.combat_width)

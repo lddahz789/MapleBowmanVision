@@ -87,6 +87,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--enable-input", action="store_true", help="明确启用真实左右键试验")
     parser.add_argument("--confirm-bot-stopped", action="store_true", help="确认原挂机及其它发键器已停止")
+    parser.add_argument("--shared-key-state", action="store_true",
+                        help="测试线程键盘状态共享（仅状态/状态加异步消息），不修改日常配置")
     args = parser.parse_args()
     config = load_config(profile_paths("newmaple").config)
     window = find_game_window(config)
@@ -94,6 +96,7 @@ def main() -> int:
     targets = list(dict.fromkeys([resolve_input_hwnd(window.hwnd), window.hwnd, *child_windows(window.hwnd)]))
     targets = [h for h in targets if window_process_path(h)[0] == pid]
     metadata = {"root": window.hwnd, "pid": pid, "path": path,
+                "shared_key_state": args.shared_key_state,
                 "foreground": window_is_foreground(window.hwnd),
                 "targets": [{"hwnd": h, "class": window_class_name(h)} for h in targets]}
     print(json.dumps(metadata, ensure_ascii=False), flush=True)
@@ -116,6 +119,7 @@ def main() -> int:
     capture = BackgroundCapture()
     events = []
     started = time.monotonic()
+    initial_foreground = int(user32.GetForegroundWindow() or 0)
 
     def emit(event, **data):
         row = {"ts": time.time(), "event": event, **data}
@@ -133,6 +137,11 @@ def main() -> int:
             raise RuntimeError("游戏窗口已变化")
         if window_is_foreground(window.hwnd):
             raise RuntimeError("游戏回到前台，终止后台对照测试")
+        if args.shared_key_state:
+            if int(user32.GetForegroundWindow() or 0) != initial_foreground:
+                raise RuntimeError("前台窗口变化，停止共享状态试验")
+            if any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in range(1, 256)):
+                raise RuntimeError("检测到真实键鼠输入，停止共享状态试验")
         if any(user32.GetAsyncKeyState(vk_for(k)) & 0x8000 for k in ("left", "right", "up", "down", "f8", "f9")):
             raise RuntimeError("检测到手动按键，停止测试")
 
@@ -153,7 +162,8 @@ def main() -> int:
         emit("probe_start", **metadata, own_integrity=own_level, game_integrity=game_level)
         initial = observe()
         for hwnd in targets:
-            for variant in VARIANTS:
+            variants = (Variant("state_only", "standard"), Variant("state_post", "standard")) if args.shared_key_state else VARIANTS
+            for variant in variants:
                 for direction in ("left", "right"):
                     before = observe()
                     time.sleep(0.15)
@@ -165,13 +175,21 @@ def main() -> int:
                     # 目标身份每组复核，禁止将消息发向其它应用。
                     if window_process_path(hwnd)[0] != pid:
                         raise RuntimeError("输入目标身份变化")
-                    sent = send_trial(hwnd, direction, variant, guard, expected_pid=pid)
+                    state_result = {}
+                    if args.shared_key_state:
+                        from mbv.shared_state_probe import isolated_trial
+                        state_result = isolated_trial(hwnd, pid, direction,
+                                                      variant.transport == "state_post", guard)
+                        sent = state_result["updates"] if state_result["messages"] else 0
+                    else:
+                        sent = send_trial(hwnd, direction, variant, guard, expected_pid=pid)
                     time.sleep(0.25)
                     after = observe()
                     delta = after[0] - before[0]
                     emit("trial", hwnd=hwnd, direction=direction, **asdict(variant),
                          before=before, after=after, dx_pixels=round(delta, 4),
                          dy_pixels=round(after[1] - before[1], 4), keydowns=sent,
+                         shared_state_result=state_result,
                          foreground=False, result="displacement_observed" if abs(delta) >= 0.5 else "no_displacement")
                     if abs(delta) >= 0.5 or abs(after[1] - before[1]) >= 0.5:
                         emit("probe_stop", reason="发现位移，停止自动遍历，需人工复核方向与归因")

@@ -10,6 +10,12 @@ from mbv.strategies.base import (
     TargetSelection,
     TargetSelectionContext,
 )
+from mbv.strategies.melee import (
+    bounded_number as _bounded_number,
+    choose_melee_skill,
+    normalize_melee_settings,
+    normalized_player_gap,
+)
 from mbv.vision import (
     Detection,
     attack_rect_from_player,
@@ -18,18 +24,6 @@ from mbv.vision import (
     player_anchor_center,
     point_in_attack_rect,
 )
-
-
-def _bounded_number(value: Any, default: float, minimum: float, maximum: float) -> float:
-    try:
-        if isinstance(value, bool):
-            raise TypeError
-        number = float(value)
-    except (TypeError, ValueError):
-        number = default
-    if not math.isfinite(number):
-        number = default
-    return max(minimum, min(maximum, number))
 
 
 def normalized_monster_gap(
@@ -54,17 +48,6 @@ def normalized_monster_gap(
         + math.sqrt(max(1.0, float(second_width * second_height)))
     ) / 2.0
     return math.hypot(horizontal_gap, vertical_gap) / max(1.0, average_size)
-
-
-def normalized_player_gap(
-    player_x: float,
-    target: tuple[int, int, int, int],
-) -> float:
-    """玩家水平中心到怪物边缘的间隙，以当前怪物宽度为单位。"""
-    target_x, _target_y, target_width, _target_height = target
-    target_center_x = float(target_x) + float(target_width) / 2.0
-    edge_gap = max(0.0, abs(target_center_x - float(player_x)) - float(target_width) / 2.0)
-    return edge_gap / max(1.0, float(target_width))
 
 
 def nearby_monster_count(
@@ -120,28 +103,9 @@ def choose_bowman_attack_skill(
 ) -> tuple[str, str | None]:
     """近身优先，其次聚怪 AOE，最后使用单体技能。"""
     single_key = str(settings.get("single_skill_key", "")).strip().lower() or None
-    melee_key = str(settings.get("melee_skill_key", "")).strip().lower() or None
+    melee_key = choose_melee_skill(player_x, target_box, settings, previous_skill)
     aoe_key = str(settings.get("aoe_skill_key", "")).strip().lower() or None
-    enter_distance = _bounded_number(
-        settings.get("melee_enter_distance_multiplier"),
-        0.35,
-        0.0,
-        3.0,
-    )
-    exit_distance = max(
-        enter_distance,
-        _bounded_number(
-            settings.get("melee_exit_distance_multiplier"),
-            0.9,
-            0.0,
-            5.0,
-        ),
-    )
-    player_gap = normalized_player_gap(player_x, target_box)
-    if melee_key and (
-        player_gap <= enter_distance
-        or (previous_skill == "melee" and player_gap <= exit_distance)
-    ):
+    if melee_key:
         return "melee", melee_key
 
     cluster_distance = _bounded_number(
@@ -254,7 +218,8 @@ class BowmanDynamicStrategy:
     }
 
     def normalize_settings(self, settings: dict[str, Any]) -> None:
-        for key in ("aoe_skill_key", "single_skill_key", "melee_skill_key"):
+        normalize_melee_settings(settings)
+        for key in ("aoe_skill_key", "single_skill_key"):
             value = settings.get(key, "")
             settings[key] = str(value).strip().lower() if isinstance(value, str) else ""
         settings["aoe_min_monsters"] = int(
@@ -262,14 +227,6 @@ class BowmanDynamicStrategy:
         )
         settings["aoe_cluster_distance_multiplier"] = _bounded_number(
             settings.get("aoe_cluster_distance_multiplier"), 0.75, 0.0, 4.0
-        )
-        enter_distance = _bounded_number(
-            settings.get("melee_enter_distance_multiplier"), 0.35, 0.0, 3.0
-        )
-        settings["melee_enter_distance_multiplier"] = enter_distance
-        settings["melee_exit_distance_multiplier"] = max(
-            enter_distance,
-            _bounded_number(settings.get("melee_exit_distance_multiplier"), 0.9, 0.0, 5.0),
         )
 
     def select_targets(self, context: TargetSelectionContext) -> TargetSelection:
@@ -353,11 +310,11 @@ class BowmanDynamicStrategy:
         )
 
     def decide(self, context: StrategyActionContext) -> StrategyDecision:
-        if context.player_box is None:
+        if context.player_box is None and not context.minimap_only:
             return StrategyDecision("stop", "PLAYER_SCREEN_LOST")
 
         combat_anchor_x = context.player_anchor[0] if context.player_anchor is not None else (
-            context.player_box[0] + context.player_box[2] / 2
+            context.player_box[0] + context.player_box[2] / 2 if context.player_box else 0.0
         )
         combat_player_x = combat_anchor_x / max(1, context.combat_width)
         if context.marker is None:
@@ -415,6 +372,9 @@ class BowmanDynamicStrategy:
                 direction=direction,
                 player_x=marker_x,
             )
+
+        if context.minimap_only:
+            return StrategyDecision("stop", "MINIMAP_WAITING_VISUAL")
 
         if context.target_box is not None:
             target_x = (context.target_box[0] + context.target_box[2] / 2) / max(1, context.combat_width)

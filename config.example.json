@@ -100,7 +100,9 @@
     "player_auxiliary_identity_threshold": 0.9,
     "player_auxiliary_reacquire_confirm_frames": 3,
     "player_minimap_assist_enabled": true,
-    "player_minimap_assist_max_seconds": 0.2
+    "player_minimap_assist_max_seconds": 0.2,
+    "player_minimap_occlusion_seconds": 3.0,
+    "player_minimap_navigation_seconds": 10.0
   },
   "keys": {
     "attack": "shift",
@@ -144,6 +146,15 @@
         "platform_return_jump_interval_seconds": 0.45
       },
       "stationary_attack": {
+        "route_pickup_enabled": false,
+        "route_pickup_interval_seconds": 180.0,
+        "route_pickup_dwell_seconds": 1.5,
+        "route_pickup_timeout_seconds": 90.0,
+        "route_pickup_visual_grace_seconds": 1.0,
+        "route_pickup_collect_timeout_seconds": 60.0,
+        "melee_skill_key": "",
+        "melee_enter_distance_multiplier": 0.35,
+        "melee_exit_distance_multiplier": 0.9,
         "periodic_step_interval_seconds": 45.0,
         "periodic_step_seconds": 0.12,
         "platform_center_tolerance": 0.015,

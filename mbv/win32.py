@@ -111,6 +111,16 @@ user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetWindow.restype = wintypes.HWND
 user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetAncestor.restype = wintypes.HWND
+user32.GetForegroundWindow.argtypes = []
+user32.GetForegroundWindow.restype = ctypes.c_size_t
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+for _focus_api in ("SetForegroundWindow", "BringWindowToTop"):
+    getattr(user32, _focus_api).argtypes = [wintypes.HWND]
+    getattr(user32, _focus_api).restype = wintypes.BOOL
+for _focus_api in ("SetActiveWindow", "SetFocus"):
+    getattr(user32, _focus_api).argtypes = [wintypes.HWND]
+    getattr(user32, _focus_api).restype = wintypes.HWND
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 TOKEN_QUERY = 0x0008
 TOKEN_INTEGRITY_LEVEL = 25

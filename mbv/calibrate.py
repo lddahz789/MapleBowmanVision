@@ -91,6 +91,14 @@ def _invalidate_combat_dependents(config: dict[str, Any]) -> None:
     _invalidate_strategy_combat_areas(config)
 
 
+def _invalidate_strategy_minimap_points(config: dict[str, Any]) -> None:
+    for strategy in list_strategies():
+        for field in strategy.capture_fields:
+            if field.capture_kind == "point" and field.coordinate_space == "minimap":
+                config.setdefault("recognition", {})[f"{field.recognition_key}_captured"] = False
+                _invalidate_calibration_item(config, field.recognition_key)
+
+
 def _prepare_window_calibration(config: dict[str, Any], window: WindowInfo) -> None:
     calibration = config.setdefault("calibration", {})
     previous = calibration.get("window_size")
@@ -120,6 +128,7 @@ def _prepare_window_calibration(config: dict[str, Any], window: WindowInfo) -> N
             recognition = config.setdefault("recognition", {})
             recognition["platform_center_captured"] = False
             recognition["throwing_star_safe_output_area_captured"] = False
+            _invalidate_strategy_minimap_points(config)
             _invalidate_strategy_combat_areas(config)
     calibration["window_size"] = current
 
@@ -153,6 +162,7 @@ def capture_status_region(
     region = normalized_roi(result.rectangle, shape)
     config.setdefault("regions", {})[key] = region
     if key == "minimap":
+        _invalidate_strategy_minimap_points(config)
         _invalidate_calibration_item(config, "player_marker")
         _invalidate_calibration_item(config, "platform_center")
         _invalidate_calibration_item(config, "throwing_star_safe_output_area")
@@ -389,6 +399,12 @@ def capture_combat_region(config_path: Path, parent: Any = None) -> dict[str, fl
 
 def capture_platform_center(config_path: Path, parent: Any = None) -> dict[str, float]:
     """放大小地图并独立记录目标平台的安全中心点。"""
+    return capture_minimap_point(config_path, "platform_center", "点击目标平台的安全中心点", parent)
+
+
+def capture_minimap_point(config_path: Path, recognition_key: str, prompt: str,
+                          parent: Any = None) -> dict[str, float]:
+    """冻结并放大小地图，保存相对小地图的独立采样点。"""
     config = load_config(config_path)
     window = find_game_window(config)
     _prepare_window_calibration(config, window)
@@ -400,14 +416,14 @@ def capture_platform_center(config_path: Path, parent: Any = None) -> dict[str, 
     preview_frame, preview_rect, zoom = magnified_roi_preview(frozen_frame, minimap_rect)
     result = interactive_overlay(
         window,
-        f"小地图已放大 {zoom:.1f} 倍，点击目标平台的安全中心点",
+        f"小地图已放大 {zoom:.1f} 倍，{prompt}",
         "point",
         guide_rect=preview_rect,
         parent=parent,
         frozen_frame=preview_frame,
     )
     if result.cancelled or result.point is None:
-        raise RuntimeError("已取消平台中心采集")
+        raise RuntimeError("已取消小地图点位采集")
     try:
         px, py = map_magnified_point(result.point, preview_rect, minimap_rect)
     except ValueError as exc:
@@ -418,10 +434,10 @@ def capture_platform_center(config_path: Path, parent: Any = None) -> dict[str, 
         "y": round(max(0.0, min(1.0, (py - my) / max(1, mh))), 6),
     }
     recognition = config.setdefault("recognition", {})
-    recognition["platform_center"] = center
-    recognition["platform_center_space"] = "minimap"
-    recognition["platform_center_captured"] = True
-    _mark_calibration_item(config, "platform_center")
+    recognition[recognition_key] = center
+    recognition[f"{recognition_key}_space"] = "minimap"
+    recognition[f"{recognition_key}_captured"] = True
+    _mark_calibration_item(config, recognition_key)
     refresh_calibrated(config)
     save_config(config_path, config)
     return center
@@ -510,6 +526,7 @@ def calibrate(config_path: Path, parent: Any = None) -> None:
     _invalidate_calibration_item(config, "platform_center")
     _invalidate_calibration_item(config, "throwing_star_safe_output_area")
     config.setdefault("recognition", {})["platform_center_captured"] = False
+    _invalidate_strategy_minimap_points(config)
     config["recognition"]["throwing_star_safe_output_area_captured"] = False
     for key in STATUS_ITEM_KEYS:
         _mark_calibration_item(config, key)

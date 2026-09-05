@@ -69,13 +69,15 @@ def name_for_vk(code: int) -> str:
 
 def input_delivery(config: dict[str, Any]) -> str:
     raw = str(config.get("input", {}).get("delivery", "foreground")).strip().lower()
+    if raw == "hybrid":
+        return "hybrid"
     if raw in {"window_message", "message_only"}:
         return "window_message"
     if raw in {"background", "postmessage", "window"}:
         return "background"
     if raw in {"foreground", "sendinput", "focus"}:
         return "foreground"
-    raise ValueError(f"不支持的按键投递方式：{raw!r}，请使用 foreground、background 或 window_message")
+    raise ValueError(f"不支持的按键投递方式：{raw!r}，请使用 foreground、background、window_message 或 hybrid")
 
 
 def key_lparam(vk: int, key_up: bool, *, was_down: bool = False, repeat: int = 1) -> int:
@@ -157,7 +159,7 @@ def window_is_foreground(hwnd: int) -> bool:
 
 class Keyboard:
     def __init__(self, delivery: str = "foreground") -> None:
-        if delivery not in {"foreground", "background", "window_message"}:
+        if delivery not in {"foreground", "background", "window_message", "hybrid"}:
             raise ValueError(f"不支持的按键投递方式：{delivery!r}")
         self.delivery = delivery
         self.root_hwnd = 0
@@ -170,13 +172,19 @@ class Keyboard:
         self._movement_pulses: dict[int, tuple[bool, float]] = {}
         self._movement_deadlines: dict[int, float] = {}
         self._repeat_error: OSError | None = None
+        self.hybrid = None
+        if delivery == "hybrid":
+            from mbv.hybrid_movement import HybridMovement
+            self.hybrid = HybridMovement(lambda vk, key_up: self._send_input(vk, key_up))
 
     def bind_window(self, hwnd: int) -> None:
+        if self.hybrid is not None:
+            self.hybrid.bind(int(hwnd))
         self.root_hwnd = int(hwnd)
         self.hwnd = resolve_input_hwnd(hwnd)
 
     def _ensure_repeat_thread(self) -> None:
-        if self.delivery not in {"background", "window_message"} and not self._movement_deadlines:
+        if self.delivery not in {"background", "window_message", "hybrid"} and not self._movement_deadlines:
             return
         thread = self._repeat_thread
         if thread is not None and thread.is_alive() and not self._repeat_stop.is_set():
@@ -221,12 +229,17 @@ class Keyboard:
 
     def check_health(self) -> None:
         with self._lock:
+            if self.hybrid is not None:
+                self.hybrid.check()
             if self._repeat_error is not None:
                 raise OSError(f"后台持续按键投递失败：{self._repeat_error}")
 
     def movement_down(self, key: str, seconds: float | None = None) -> None:
         """只对纯窗口模式的位移启用脉冲；攻击/转向和旧扫描码路径不变。"""
         code = vk_for(key)
+        if self.hybrid is not None:
+            self.hybrid.down(code, seconds)
+            return
         with self._lock:
             self.check_health()
             if self.delivery != "window_message":
@@ -238,6 +251,35 @@ class Keyboard:
             if seconds is not None:
                 self._movement_deadlines[code] = time.monotonic() + max(0.03, min(0.5, seconds))
             self._ensure_repeat_thread()
+
+    def prepare_movement(self) -> bool:
+        return self.hybrid is None or self.hybrid.begin()
+
+    def movement_tap(self, key: str, seconds: float = 0.035) -> None:
+        if self.hybrid is None:
+            self.tap(key, seconds)
+            return
+        try:
+            self.movement_down(key, seconds)
+            time.sleep(max(0.01, min(0.5, seconds)))
+        finally:
+            self.up(key)
+        self.check_health()
+
+    def finish_movement(self) -> None:
+        if self.hybrid is not None:
+            self.hybrid.finish()
+
+    def movement_heartbeat(self) -> None:
+        if self.hybrid is not None:
+            self.hybrid.heartbeat()
+
+    def movement_events(self) -> list[tuple[str, str]]:
+        if self.hybrid is None:
+            return []
+        with self.hybrid.lock:
+            events, self.hybrid.events = self.hybrid.events, []
+            return events
 
     def _release_hardware(self) -> None:
         for vk in list(self._hardware_down):
@@ -292,7 +334,7 @@ class Keyboard:
             raise OSError("键盘输入发送失败")
 
     def _dispatch(self, vk: int, key_up: bool, *, was_down: bool = False) -> None:
-        if self.delivery == "window_message":
+        if self.delivery in {"window_message", "hybrid"}:
             # 实验模式只向一个已绑定窗口排队，不重复 SendMessage、不发 WM_CHAR，
             # 也不伪造焦点事件或回退到全局扫描码。
             if not self.hwnd or not user32.IsWindow(self.hwnd):
@@ -335,6 +377,8 @@ class Keyboard:
 
     def up(self, key: str) -> None:
         code = vk_for(key)
+        if self.hybrid is not None:
+            self.hybrid.up(code)
         with self._lock:
             if code not in self.held:
                 return
@@ -359,6 +403,7 @@ class Keyboard:
             self._dispatch(code, True, was_down=True)
 
     def release_all(self) -> None:
+        self.finish_movement()
         with self._lock:
             self._repeat_stop.set()
             held = list(self.held)

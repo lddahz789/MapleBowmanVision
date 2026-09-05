@@ -1574,8 +1574,11 @@ class CoreTests(unittest.TestCase):
         instance.last_attack = 0.0
         instance.log = MagicMock()
 
-        instance.face_and_attack(0.2, 0.5, 10.0, face_each_attack=False)
-        instance.face_and_attack(0.2, 0.5, 11.0, face_each_attack=False)
+        with patch("mbv.bot.time.monotonic", return_value=10.0):
+            instance.face_and_attack(0.2, 0.5, 10.0, face_each_attack=False)
+        for now in (10.1, 11.0):
+            with patch("mbv.bot.time.monotonic", return_value=now):
+                instance.face_and_attack(0.2, 0.5, now, face_each_attack=False)
 
         left_taps = [call for call in instance.keyboard.tap.call_args_list if call.args[0] == "left"]
         attack_taps = [call for call in instance.keyboard.tap.call_args_list if call.args[0] == "shift"]

@@ -25,7 +25,9 @@
 - 标识：`stationary_attack`
 - 描述：使用左右两个面向索敌区的并集选择最近同层怪物，不受当前朝向限制；仅在目标换边时短按方向键并原地攻击。每隔 45 秒向右短走一步，随后按小地图位置优先回到平台安全点，回位后继续输出。
 - 依赖采集：小地图与玩家标记、小地图平台安全点、战斗识别区、玩家定位模板、怪物模板。
-- 决策优先级：输入/窗口安全 → HP/MP 补药与 Buff → 平时及周期短步后的平台安全点回位 → 定时向右短步 → 区内攻击 → 原地等待。只要实时位置超出容差，即使没有周期短步也优先回位。
+- 决策优先级：输入/窗口安全 → HP/MP 补药与 Buff → 平时及周期短步后的平台安全点回位 → 定时向右短步 → 区内目标近身技能 → 普通攻击 → 原地等待。只要实时位置超出容差，即使没有周期短步也优先回位。
+- `melee_skill_key`：原地策略独立采集的近身技能键；留空关闭，不继承弓箭手动态的按键。对当前最近同层目标判定近身，远离后恢复公共 `keys.attack`，不追怪、不连续按方向键。
+- `melee_enter_distance_multiplier` / `melee_exit_distance_multiplier`：默认 `0.35` / `0.9`，支持直接输入数字。稳定玩家水平锚点到目标框边缘的间隙除以怪物宽度，小于等于进入值时使用近身技能；已进入时持续使用，直到超过退出值。退出值不能小于进入值；逻辑与弓箭手动态共用 `mbv/strategies/melee.py`，配置分别保存。
 - 索敌框：使用公共 `targeting.box`，框随角色朝向左右翻转。
 - `periodic_step_interval_seconds`：两次向右短步之间的间隔，默认 45 秒。
 - `periodic_step_seconds`：向右短步首轮的按键时长，默认 0.12 秒。先跨帧停攻 0.6 秒，输入层独立计时抬键（调度精度约 50 毫秒），抬键后等待 0.25 秒再验证。无位移时最多三轮，后续时长分别为首轮的 2 倍和 3 倍、单轮上限 0.5 秒。
@@ -34,7 +36,19 @@
 - 短步必须在唯一实时小地图标记中观察到正确方向至少 0.5 像素位移，才更新周期计时并进入待回位；未移动不能直接判为“回位完成”。反向位移或三轮无位移会暂停，不能把消息发送成功等同于游戏移动成功。
 - 公共 `move` 执行器在最近攻击后保留 0.6 秒停攻时间；同方向连续 2 秒无进展重新抬按一次，4 秒仍无进展则暂停。进展依据唯一实时小地图位置，记录 `movement_start/progress/retry/failed`。
 - `window_message` 模式的移动使用约 0.10 秒按下、0.05 秒抬起的脉冲。攻击/转向短按不改变，classic/旧后台模式仍使用原扫描码；不伪造焦点、不向其它窗口发送全局按键。此方式仍需客户端实测，游戏不接受窗口移动消息时会安全失败。
+- `hybrid` 模式的实际移动由公共层获取限时前台授权，使用独立扫描码通道；攻击和转向仍为窗口消息。原地短步验证与返回安全点尽量共用一次焦点授权，遇药/Buff、定位安全门或停止则释放移动，按用户授权不再恢复原窗口。策略不得自行切焦点或改变键盘投递模式，移动动作仍必须通过小地图位移验证。
 - `platform_return_jump_interval_seconds`：回安全点需要跨层时，连续跳跃之间的最短间隔。
+
+### 原地定时路线拾取
+
+- `route_pickup_enabled` 默认关闭，热切换并保存；`route_pickup_interval_seconds` 默认 180 秒（5–86400），`route_pickup_dwell_seconds` 默认 1.5 秒（0.3–10），`route_pickup_timeout_seconds` 默认 90 秒（5–600），`route_pickup_visual_grace_seconds` 默认 1 秒（0.2–3），`route_pickup_collect_timeout_seconds` 默认 60 秒（10–600），均支持直接输入。原有去程上限和停留数值保留，使用公共 `keys.pickup`。
+- `capture_fields` 声明 `stationary_pickup_point`，类型为 `point`、坐标空间为 `minimap`。复用安全点的冻结放大小地图采样流程，保存于当前档案的 `recognition`，带独立 `_space/_captured` 标记；启用时必须采样。目标必须与安全点同层且在回位半径之外，路径需可步行，不提供障碍寻路。
+- 决策顺序：公共安全/药/Buff → 活跃路线的返程（忽略怪物）或去程（遇区内同层怪物先攻击，否则移动并拾取）→ 原有安全点回位 → 到期路线 → 周期右移 → 原地攻击。新路线只能从安全点发起，不打断已执行的周期短步及其回位。
+- 会话阶段为 `idle → outbound → collect → returning → idle`。短暂定位丢失在原阶段停止所有路线输入，默认等待 1 秒，恢复继续；超出宽限、关闭开关、点位失效或掉层改为返程。返程仍复用原水平/跳跃回位，不攻击；仅有小地图时不发拾取键，位置完全不可用或导航到期仍停止。
+- `outbound_started_at` 只限制当前到点前路段（含清怪/等待），到点立即切换独立计时；被击退离开目标点需回到目标点时重新计该路段。`collection_started_at` 为首次到点时刻，到点阶段默认最多 60 秒（含清怪/中断），不反复刷新，以免无限打怪。`dwell_elapsed` 累计有效拾取时间，清怪、短暂丢失及上游药/Buff 只暂停累计，不清零；相邻有效帧间隔大于 0.5 秒或缺少近期拾取发键记录不计入。有效拾取达到目标后返程。
+- 返程状态写入 `return_reason`：`collected`、`outbound_timeout`、`collection_timeout`、`localization_timeout`、`disabled`、`point_invalid`、`off_platform`；到家保留原因用于诊断。阶段/返程原因变化立即记录，其余进度最多每秒记录一次。
+- 运行层持有 `runtime_state`，策略注册实例无可变会话状态；完整到家才记录下一次拾取时间。观察到离开安全范围后完成回位，发 `reset_periodic_step` 重启右移倒计时；没有实际离开（例如一直原地清怪后超时）不能冒充位移而推迟右移。暂停/重新启动清空路线；药/Buff 跨帧暂停保留路线。
+- 拾取使用决策的 `pickup_interval_seconds`，移动执行器先检查实际行动状态，再限频发送普通拾取键，不为拾取抬方向键。在混合后台下拾取仍为窗口消息；`cooperative_movement` 请求约 2.5 秒一段的前台移动，分段抬键但不恢复原窗口，不重置有向位移无进展监控，不取消原 watchdog 保护。
 
 ## 当前策略：标飞安全输出
 
@@ -85,6 +99,9 @@
 - `TargetSelectionContext` 输入的是同一帧已经完成的检测结果以及公共 `target_area`。策略不得重新执行模板匹配；标飞多索敌区从自身 `settings` 读取并相对稳定角色锚点换算，屏幕方向固定且不随面向翻转。
 - `player_anchor` 是公共视觉层提供的稳定战斗锚点；策略选敌和行动判断必须使用它，不得重新采用姓名板、头部或称号原始框的纵向中心。
 - `StrategyActionContext` 包含归一化位置、已选目标、当前索敌区候选、上次攻击技能、公共行为配置和策略设置。策略返回动作意图与可选技能键，`BowmanBot` 统一执行按键并写运行状态。
+- `runtime_state` 是运行层隔离的会话字典，决策可返回替换值；`started_at` 为本次挂机启动时间。导航任务设置 `navigation_active=true` 时，公共层在定位丢失后只等待，不执行左右找人位移；仍保留其它安全门。`StrategyToggleField.live_preview` 允许声明经过策略状态机处理的热开关，其余开关继续按原流程刷新配置。
+- 导航期间公共层在药/Buff和定位门禁前记录连续定位缺失，`localization_lost_seconds` 同时覆盖丢失期间及恢复首个决策帧，避免上游提前返回而漏记；`action_interrupted` 表示上一行动帧未进入策略决策，策略不得将这段时间算作有效拾取。暂停/重新启动清除这些会话观测，不修改身份记录或延长小地图导航期限。
+- `StrategyActionContext.minimap_only=true` 表示运行层只有经过身份配对的唯一实时小地图位置，屏幕玩家与目标坐标均不可用。三种策略只允许原有安全点／安全区回位或等待；到位返回 `MINIMAP_WAITING_VISUAL`，不得攻击、追怪、拾取或启动新周期短步。公共层保留窗口、药/Buff、标记唯一性、导航时限与实际位移验证，并拒绝该模式下的攻击类决策。不得把小地图比例直接当作屏幕比例。
 - `StrategyDecision.action` 目前支持 `stop`、`face`、`attack`、`chase`、`move`、`step`、`jump`、`down_jump`、`jump_attack`、`pickup`。`face` 只短按方向键改变面向，不得保持方向键或进入移动；`step` 以限定时长短按移动键，并由公共执行器记录周期动作和待回位状态。需要新动作时先扩展公共动作执行器和测试，不要在策略里直接发键。
 - `StrategyDecision.face_each_attack` 仅对 `attack` 生效；为 `true` 时每次按住目标方向，等待 `behavior.face_tap_seconds` 后在按键仍按下时攻击，发出后再释放方向。需要尽量保持原位的策略可设为 `false`，此时只在目标换边时点按方向。
 - 面板“框选通用索敌范围”始终写入 `targeting.box`，与当前选中的职业策略无关。
@@ -117,6 +134,9 @@
         "platform_return_jump_interval_seconds": 0.45
       },
       "stationary_attack": {
+        "melee_skill_key": "",
+        "melee_enter_distance_multiplier": 0.35,
+        "melee_exit_distance_multiplier": 0.9,
         "periodic_step_interval_seconds": 45.0,
         "periodic_step_seconds": 0.12,
         "platform_center_tolerance": 0.015,
