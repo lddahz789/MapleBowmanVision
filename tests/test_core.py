@@ -1606,13 +1606,13 @@ class CoreTests(unittest.TestCase):
         with patch("mbv.bot.time.monotonic", return_value=20.0):
             instance.face_and_attack(0.8, 0.2, 10.0, face_each_attack=True)
 
-        instance.keyboard.tap.assert_called_once_with("right", 0.06)
+        instance.keyboard.tap.assert_called_once_with("right", 0.025)
         self.assertNotIn(call.tap("shift"), instance.keyboard.method_calls)
         self.assertEqual(instance.direction, "right")
         self.assertEqual(instance.state, "FACE_TARGET_RIGHT")
         self.assertEqual(instance.attack_facing_ready_at, 20.08)
         self.assertEqual(instance.last_attack, 0.0)
-        self.assertEqual(instance.log.write.call_args.kwargs["previous_direction"], "left")
+        self.assertIsNone(instance.log.write.call_args.kwargs["previous_direction"])
 
     def test_bowman_dynamic_attacks_after_prepared_direction_is_stable(self):
         from mbv import bot as runtime_bot
@@ -1628,6 +1628,7 @@ class CoreTests(unittest.TestCase):
         }
         instance.keyboard = MagicMock()
         instance.direction = "right"
+        instance.attack_turn_direction = "right"
         instance.last_attack = 0.0
         instance.attack_facing_ready_at = 9.0
         instance.log = MagicMock()
@@ -1637,13 +1638,9 @@ class CoreTests(unittest.TestCase):
         ) as sleep:
             instance.face_and_attack(0.8, 0.2, 10.0, face_each_attack=True)
 
-        calls = instance.keyboard.method_calls
-        direction_down = calls.index(call.down("right"))
-        attack = calls.index(call.tap("shift"))
-        direction_releases = [index for index, item in enumerate(calls) if item == call.up("right")]
-        self.assertLess(direction_down, attack)
-        self.assertTrue(any(index > attack for index in direction_releases))
-        self.assertEqual(sleep.call_args_list, [call(0.025)])
+        instance.keyboard.down.assert_not_called()
+        instance.keyboard.tap.assert_called_once_with("shift")
+        sleep.assert_not_called()
         self.assertEqual(instance.last_attack, 10.0)
 
     def test_bowman_dynamic_does_not_attack_while_target_side_keeps_flipping(self):
@@ -1670,7 +1667,7 @@ class CoreTests(unittest.TestCase):
 
         self.assertEqual(
             instance.keyboard.tap.call_args_list,
-            [call("right", 0.06), call("left", 0.06)],
+            [call("right", 0.025), call("left", 0.025)],
         )
         self.assertNotIn(call.tap("shift"), instance.keyboard.method_calls)
 
@@ -1688,6 +1685,7 @@ class CoreTests(unittest.TestCase):
         }
         instance.keyboard = MagicMock()
         instance.direction = "right"
+        instance.attack_turn_direction = "right"
         instance.last_attack = 0.0
         instance.attack_facing_ready_at = 0.0
         instance.log = MagicMock()
@@ -1705,7 +1703,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(instance.log.write.call_args.kwargs["skill"], "aoe")
         self.assertEqual(instance.log.write.call_args.kwargs["key"], "a")
 
-    def test_bowman_dynamic_releases_facing_key_when_attack_fails(self):
+    def test_bowman_dynamic_attack_failure_never_holds_facing_key(self):
         from mbv import bot as runtime_bot
 
         instance = runtime_bot.BowmanBot.__new__(runtime_bot.BowmanBot)
@@ -1720,6 +1718,7 @@ class CoreTests(unittest.TestCase):
         instance.keyboard = MagicMock()
         instance.keyboard.tap.side_effect = OSError("攻击键失败")
         instance.direction = "right"
+        instance.attack_turn_direction = "right"
         instance.last_attack = 0.0
         instance.attack_facing_ready_at = 0.0
         instance.log = MagicMock()
@@ -1728,6 +1727,8 @@ class CoreTests(unittest.TestCase):
             instance.face_and_attack(0.8, 0.2, 10.0, face_each_attack=True)
 
         instance.keyboard.up.assert_any_call("right")
+        instance.keyboard.down.assert_not_called()
+        instance.keyboard.tap.assert_called_once_with("shift")
         self.assertEqual(instance.last_attack, 0.0)
 
     def test_bowman_strategy_consumes_common_target_area(self):

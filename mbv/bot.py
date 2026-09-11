@@ -75,15 +75,21 @@ from mbv.window import (
 )
 
 STATE_LABELS = {
+    "HYBRID_TURN_DEFERRED": "后台不主动转向，等待游戏下次位于前台",
+    "HYBRID_ATTACK_FIXED": "后台沿用游戏当前朝向攻击（未转向）",
+    "HYBRID_JUMP_ATTACK_FIXED": "后台沿用游戏当前朝向跳攻（未转向）",
+    "HYBRID_WAIT_LOCALIZATION": "后台等待角色定位恢复，不切前台左右找人",
     "MOVEMENT_PREPARE": "停攻等待移动",
-    "HYBRID_WAIT_IDLE": "等待键鼠空闲后临时切前台移动",
-    "HYBRID_WAIT_FRAME": "已切前台，等待新画面确认位置",
+    "HYBRID_WAIT_IDLE": "游戏在后台，等待按键释放后切前台移动/转向（鼠标移动不影响）",
+    "HYBRID_WAIT_IDLE_FOREGROUND": "游戏已在前台，等待按键释放后移动/转向（鼠标移动不影响）",
+    "HYBRID_WAIT_FRAME": "已取得前台授权，等待新画面确认位置",
     "HYBRID_ROUTE_YIELD": "路线分段抬键，游戏保持前台",
     "PICKUP_POINT_INVALID": "请采集与安全点同平台的小地图拾取点",
     "PICKUP_OUTBOUND_LEFT": "向左前往拾取点并沿途拾取",
     "PICKUP_OUTBOUND_RIGHT": "向右前往拾取点并沿途拾取",
     "PICKUP_COLLECT": "目标点停留拾取",
     "PICKUP_WAIT_LOCALIZATION": "拾取暂缓，等待角色定位恢复",
+    "PICKUP_CLEAR_WAIT": "清怪后短暂确认，暂缓移动和拾取",
     "PICKUP_START_RETURN": "拾取结束，开始返回安全点",
     "PICKUP_RETURNED": "已回安全点，重新计时拾取与定时右移",
     "PERIODIC_STEP_VERIFY": "检查向右小步实际位移",
@@ -137,10 +143,13 @@ STATE_LABELS = {
 }
 
 PLAYER_LOST_RECOVERY_PAUSE_SECONDS = 0.08
-DYNAMIC_DIRECTION_CHANGE_MIN_TAP_SECONDS = 0.06
+DYNAMIC_DIRECTION_CHANGE_MIN_TAP_SECONDS = 0.02
 DYNAMIC_DIRECTION_CHANGE_SETTLE_SECONDS = 0.08
 ATTACK_TURN_IDLE_SECONDS = 0.6
-ATTACK_TURN_REFRESH_SECONDS = 5.0
+ATTACK_FACING_VISUAL_GRACE_SECONDS = 0.5
+FOREGROUND_RETURN_RELEASE_SECONDS = 0.12
+FOREGROUND_RETURN_TAP_SECONDS = 0.08
+FOREGROUND_RETURN_SETTLE_SECONDS = 0.12
 
 DEFAULT_PLAYER_AUXILIARY_INTERVAL_SECONDS = 0.5
 JUMP_ATTACK_LEAD_SECONDS = 0.05
@@ -224,6 +233,9 @@ class BowmanBot:
         self.player_head_templates = load_templates(self.template_roots.head)
         self.player_title_templates = load_templates(self.template_roots.title)
         self.log = SessionLog()
+        from mbv.verification_alert import VerificationAlert
+        self.verification_alert = VerificationAlert()
+        self.verification_alert_status = ""
         self.performance = PerformanceMonitor(max(2.0, float(config["capture"]["fps"])))
         self.armed = False
         self.state = "PAUSED"
@@ -286,6 +298,36 @@ class BowmanBot:
         self.notice_until = time.monotonic() + seconds
         self.log.write("notice", message=message)
         print(message)
+
+    def _observe_verification_alert(self, frame: np.ndarray, now: float) -> None:
+        # 与行动决策隔离：命中/报错都不得发键、停机、切窗或更改策略状态。
+        from mbv.verification_alert import KEYWORD, play_alert_sound
+        monitor = self.verification_alert
+        settings = self.config.get("verification_alert", {})
+        if self.config.get("profile") != "newmaple":
+            settings = {"enabled": False}
+        try:
+            match = monitor.observe(frame, settings, now)
+            if not settings.get("enabled", False):
+                self.verification_alert_status = ""
+            if match is None:
+                return
+            self.verification_alert_status = time.strftime("最近提醒 %H:%M:%S：") + "检测到狩猎验证，请人工处理（挂机未暂停）"
+            play_alert_sound()
+            try:
+                self.log.write("verification_alert", keyword=KEYWORD, method="chat_glyph_template",
+                               score=round(match.score, 4), box=match.box, action="sound_only",
+                               armed=self.armed)
+            except Exception:
+                self.verification_alert_status += "；提醒日志不可用"
+        except Exception as exc:
+            # 仅本提醒器停用到配置变化，不能将识别/声音/日志异常变成挂机异常。
+            monitor.failed = True
+            self.verification_alert_status = f"验证提醒不可用：{exc}（挂机不受影响）"
+            try:
+                self.log.write("verification_alert_error", error=str(exc))
+            except Exception:
+                pass
 
     def monitor_hotkeys(self) -> None:
         self.hotkey_thread_id = int(ctypes.windll.kernel32.GetCurrentThreadId())
@@ -372,6 +414,7 @@ class BowmanBot:
         self.periodic_step_pending_return = False
         try:
             self.keyboard.release_all()
+            self._pickup_held_key = None
             self._reset_player_lost_recovery(release_key=False)
         finally:
             if getattr(self, "window_topmost", False):
@@ -492,7 +535,7 @@ class BowmanBot:
             window_topmost=topmost_while_armed,
         )
         if self.delivery == "hybrid":
-            self.notify("已启动混合后台：技能用窗口消息，移动切到游戏前台后不再切回原窗口；键鼠操作会中断移动。", 8.0)
+            self.notify("已启动混合后台：后台沿用当前朝向发技能，不为转向切窗；实际移动切前台后不切回，鼠标位移不打断。", 8.0)
         elif self.delivery == "window_message":
             self.notify("已启动独立后台实验模式：仅窗口消息与窗口截图；请确认角色确实响应。", 8.0)
         elif self.background_input:
@@ -605,6 +648,7 @@ class BowmanBot:
             self.stop_move()
             self._reset_player_lost_recovery(release_key=False)
         self.buff_preparation = None
+        self._invalidate_facing_for_auxiliary_key(action.key)
         self.keyboard.tap(action.key)
         self.auto_potion.record(action, now)
         if self.armed:
@@ -666,6 +710,7 @@ class BowmanBot:
             self.disarm("补 Buff 前游戏窗口已不可用或失去前台")
             return True
         self.buff_preparation = None
+        self._invalidate_facing_for_auxiliary_key(action.key)
         self.keyboard.tap(action.key, BUFF_KEY_HOLD_SECONDS)
         cast_at = time.monotonic()
         auto_buff.record(action, cast_at)
@@ -895,9 +940,12 @@ class BowmanBot:
             self.keyboard.down(keys[direction])
         self.direction = direction
         self._reset_attack_facing()
+        self._note_foreground_motion()
         self.state = f"PATROL_{direction.upper()}"
 
-    def stop_move(self) -> None:
+    def stop_move(self, *, keep_pickup: bool = False) -> None:
+        if not keep_pickup:
+            self._release_pickup()
         keys = self.config["keys"]
         self.keyboard.up(keys["left"])
         self.keyboard.up(keys["right"])
@@ -944,6 +992,7 @@ class BowmanBot:
             self.stop_move()
             duration = min(0.5, motion.seconds * motion.attempts)
             self.keyboard.movement_down(self.config["keys"][motion.direction], seconds=duration)
+            self._note_foreground_motion()
             self.direction = motion.direction
             self._reset_attack_facing()
             motion.phase = "hold"
@@ -1025,7 +1074,12 @@ class BowmanBot:
 
     def recover_player_nameplate(self, now: float) -> None:
         """三路玩家定位均丢失时，以固定屏幕方向交替左右位移。"""
-        if not self._prepare_hybrid_movement():
+        hybrid = getattr(self, "delivery", "foreground") == "hybrid"
+        ready = (self._prepare_hybrid_movement(allow_focus=False) if hybrid
+                 else self._prepare_hybrid_movement())
+        if not ready:
+            if hybrid and self.state == "HYBRID_TURN_DEFERRED":
+                self.state = "HYBRID_WAIT_LOCALIZATION"
             return
         behavior = self.config["behavior"]
         keys = self.config["keys"]
@@ -1056,6 +1110,7 @@ class BowmanBot:
             self.keyboard.down(keys[direction])
         self.direction = direction
         self._reset_attack_facing()
+        self._note_foreground_motion()
         self.player_lost_recovery_direction = direction
         self.player_lost_recovery_started_at = now
         self.state = f"PLAYER_RECOVER_{direction.upper()}"
@@ -1065,20 +1120,68 @@ class BowmanBot:
             seconds=round(move_seconds, 3),
         )
 
+    def _invalidate_facing_for_auxiliary_key(self, key: str) -> None:
+        # 普通药/Buff不改变左右面向；若用户绑定到方向/跳跃键，仍按移动处理。
+        keys = self.config.get("keys", {})
+        movement_vks = {vk_for(name) for name in ("left", "right", "up", "down")}
+        movement_vks.update(vk_for(keys[name]) for name in ("left", "right", "up", "down", "jump")
+                            if keys.get(name))
+        if vk_for(key) in movement_vks:
+            self._reset_attack_facing()
+
+    def _note_foreground_motion(self) -> None:
+        if getattr(self, "delivery", "foreground") == "foreground":
+            self._foreground_reorient_required = True
+            self._foreground_turn_candidate = None
+
     def _reset_attack_facing(self) -> None:
         # 移动方向只是输入意图，不能作为下一次攻击转向已被游戏接受的证据。
         self.attack_facing_ready_at = 0.0
         self.attack_turn_direction: str | None = None
         self.attack_turn_requested_at = 0.0
+        self.attack_facing_missing_since: float | None = None
+        self._foreground_turn_candidate = None
 
-    def _prepare_attack_turn(self, desired: str, now: float) -> bool:
+    def _observe_attack_facing_localization(self, now: float, localized: bool) -> None:
+        """短暂视觉空帧不撤销刚发的转向；这不授予任何攻击/导航权限。"""
+        missing_since = getattr(self, "attack_facing_missing_since", None)
+        if not localized and missing_since is None:
+            missing_since = now
+        if (missing_since is not None
+                and now - missing_since >= ATTACK_FACING_VISUAL_GRACE_SECONDS):
+            self._reset_attack_facing()
+        # 恢复首帧也检查完整丢失时长，不能只统计丢失帧。
+        self.attack_facing_missing_since = None if localized else missing_since
+
+    def _prepare_attack_turn(self, desired: str, now: float, tap_seconds: float | None = None) -> bool:
         """非持续按方向的攻击：停攻、独立点按、跨帧等待；不宣称视觉确认。"""
+        hybrid = getattr(self, "delivery", "foreground") == "hybrid"
+        if hybrid:
+            guard = self.keyboard.hybrid
+            if guard.desktop.foreground() != guard.hwnd:
+                # 后台只发送技能，不补无效的消息方向，也不伪造已完成转向的缓存。
+                self.state = "HYBRID_TURN_DEFERRED"
+                return False
         previous = getattr(self, "attack_turn_direction", None)
-        requested_at = getattr(self, "attack_turn_requested_at", 0.0)
-        needs_turn = (previous != desired or self.direction != desired
-                      or now - requested_at >= ATTACK_TURN_REFRESH_SECONDS)
+        # 同侧持续输出不定时补方向键；真实移动、焦点变化和定位失效仍会清缓存。
+        needs_turn = previous != desired or self.direction != desired
+        return_turn = (getattr(self, "delivery", "foreground") == "foreground"
+                       and getattr(self, "_foreground_reorient_required", False))
+        protected_turn = (getattr(self, "delivery", "foreground") == "foreground"
+                          and (return_turn or tap_seconds is not None))
+        needs_turn = needs_turn or return_turn
         if needs_turn:
             self.state = f"FACE_TARGET_{desired.upper()}"
+            if protected_turn:
+                candidate = getattr(self, "_foreground_turn_candidate", None)
+                if candidate is None or candidate[0] != desired:
+                    self._foreground_turn_candidate = (
+                        desired, time.monotonic() + FOREGROUND_RETURN_RELEASE_SECONDS)
+                    self.log.write("foreground_return_turn_wait", direction=desired,
+                                   release_seconds=FOREGROUND_RETURN_RELEASE_SECONDS)
+                    return False
+                if time.monotonic() < candidate[1]:
+                    return False
             # 必须先等上一技能动作结束；在动作中加长点按仍可能被吞掉。
             if now - self.last_attack < max(
                 ATTACK_TURN_IDLE_SECONDS,
@@ -1087,21 +1190,45 @@ class BowmanBot:
                 return False
             tap_seconds = max(
                 DYNAMIC_DIRECTION_CHANGE_MIN_TAP_SECONDS,
-                float(self.config["behavior"]["face_tap_seconds"]),
+                float(self.config["behavior"]["face_tap_seconds"] if tap_seconds is None else tap_seconds),
             )
-            self.keyboard.tap(self.config["keys"][desired], tap_seconds)
+            if protected_turn:
+                tap_seconds = max(FOREGROUND_RETURN_TAP_SECONDS, tap_seconds,
+                                  float(self.config["behavior"]["face_tap_seconds"]))
+            if hybrid:
+                # 只借用已有前台，不为攻击切窗；输入层再次复核，避免焦点检查竞态。
+                if not self._prepare_hybrid_movement(allow_focus=False):
+                    return False
+                tap_seconds = min(0.1, tap_seconds)
+                try:
+                    self.keyboard.movement_tap(self.config["keys"][desired], tap_seconds)
+                    self.keyboard.movement_heartbeat()  # 发键结束再复核焦点/取消状态。
+                finally:
+                    self._hybrid_motion_requested = False
+                    self.keyboard.finish_movement()
+                self.keyboard.check_health()
+            else:
+                self.keyboard.tap(self.config["keys"][desired], tap_seconds)
             self.direction = desired
             self.attack_turn_direction = desired
             self.attack_turn_requested_at = now
-            self.attack_facing_ready_at = time.monotonic() + DYNAMIC_DIRECTION_CHANGE_SETTLE_SECONDS
+            settle_seconds = (FOREGROUND_RETURN_SETTLE_SECONDS if protected_turn
+                              else DYNAMIC_DIRECTION_CHANGE_SETTLE_SECONDS)
+            self.attack_facing_ready_at = time.monotonic() + settle_seconds
+            if protected_turn:
+                self._foreground_reorient_required = False
+                self._foreground_turn_candidate = None
             self.log.write(
                 "attack_face_prepare", direction=desired, previous_direction=previous,
-                reason="refresh" if previous == desired else "new_direction_or_invalidated",
+                reason=("foreground_after_movement" if return_turn else
+                        "foreground_route_combat" if protected_turn else "new_direction_or_invalidated"),
                 tap_seconds=round(tap_seconds, 3), idle_seconds=ATTACK_TURN_IDLE_SECONDS,
-                settle_seconds=DYNAMIC_DIRECTION_CHANGE_SETTLE_SECONDS,
+                settle_seconds=settle_seconds,
                 facing_verified=False,
+                channel="foreground_scancode" if hybrid else "normal",
             )
             return False
+        self._foreground_turn_candidate = None
         if time.monotonic() < self.attack_facing_ready_at:
             self.state = f"FACE_TARGET_{desired.upper()}"
             return False
@@ -1115,6 +1242,7 @@ class BowmanBot:
         face_each_attack: bool = True,
         attack_key: str | None = None,
         attack_skill: str | None = None,
+        face_tap_seconds: float | None = None,
     ) -> None:
         behavior = self.config["behavior"]
         keys = self.config["keys"]
@@ -1124,61 +1252,31 @@ class BowmanBot:
         dead = float(behavior["attack_dead_zone"])
         if abs(target_x - player_x) <= dead and self.direction is not None:
             desired = self.direction
-        if not face_each_attack and not self._prepare_attack_turn(desired, now):
+        # 保留 face_each_attack 参数兼容策略接口，但所有模式都只在需要时独立转向。
+        # 不能在每次技能前按住方向，否则客户端会将其解释为前进。
+        # 路线清怪的稳定交接覆盖整个清怪阶段，而不是只覆盖移动后第一击。
+        # 此强度仅用于纯前台；混合不抢焦点与其它模式的时序保持不变。
+        turn_ready = self._prepare_attack_turn(
+            desired, now, face_tap_seconds if getattr(self, "delivery", "foreground") == "foreground" else None)
+        deferred = (getattr(self, "delivery", "foreground") == "hybrid"
+                    and not turn_ready and self.state == "HYBRID_TURN_DEFERRED")
+        if not turn_ready and not deferred:
             return
-        self.state = f"ATTACK_{desired.upper()}"
+        self.state = "HYBRID_ATTACK_FIXED" if deferred else f"ATTACK_{desired.upper()}"
         if now - self.last_attack >= float(behavior["attack_interval_seconds"]):
-            # NewMaple 在上一技能动作尚未结束时，可能忽略与下一次技能同时到达的换向。
-            # 动态策略换边时先独立转向并等待下一帧再次确认目标仍在同侧，避免内部方向
-            # 已更新、角色画面却仍朝旧方向。目标左右抖动时也只会转向，不会朝错误方向出手。
-            if face_each_attack and self.direction != desired:
-                previous = self.direction
-                tap_seconds = max(
-                    DYNAMIC_DIRECTION_CHANGE_MIN_TAP_SECONDS,
-                    float(behavior["face_tap_seconds"]),
-                )
-                self.keyboard.tap(keys[desired], tap_seconds)
-                self.direction = desired
-                self.attack_facing_ready_at = (
-                    time.monotonic() + DYNAMIC_DIRECTION_CHANGE_SETTLE_SECONDS
-                )
-                self.state = f"FACE_TARGET_{desired.upper()}"
-                self.log.write(
-                    "attack_face_prepare",
-                    direction=desired,
-                    previous_direction=previous,
-                    tap_seconds=round(tap_seconds, 3),
-                    settle_seconds=DYNAMIC_DIRECTION_CHANGE_SETTLE_SECONDS,
-                )
-                return
-            if face_each_attack and time.monotonic() < float(
-                getattr(self, "attack_facing_ready_at", 0.0)
-            ):
-                self.state = f"FACE_TARGET_{desired.upper()}"
-                return
-            # 动态路径在方向键按下期间发送技能；发键成功不代表已视觉确认面向。
-            # 非持续按方向的路径已在上方独立转向，不在每次攻击时按住方向造成位移。
-            if face_each_attack:
-                direction_key = keys[desired]
-                try:
-                    self.keyboard.down(direction_key)
-                    time.sleep(float(behavior["face_tap_seconds"]))
-                    self.direction = desired
-                    self.keyboard.tap(selected_attack_key)
-                finally:
-                    self.keyboard.up(direction_key)
-            else:
-                self.keyboard.tap(selected_attack_key)
+            self.keyboard.tap(selected_attack_key)
             self.last_attack = now
             self.log.write(
                 "attack",
-                direction=desired,
+                direction=None if deferred else desired,
                 player_x=round(player_x, 3),
                 target_x=round(target_x, 3),
                 distance=round(abs(target_x - player_x), 3),
                 skill=str(attack_skill or "single"),
                 key=selected_attack_key,
                 facing_verified=False,
+                **({"requested_direction": desired, "turn_deferred": deferred}
+                   if getattr(self, "delivery", "foreground") == "hybrid" else {}),
             )
 
     def face_target(
@@ -1192,6 +1290,11 @@ class BowmanBot:
         if desired not in {"left", "right"}:
             raise ValueError(f"目标面向无效：{direction}")
         self.stop_move()
+        if getattr(self, "delivery", "foreground") == "hybrid":
+            if not self._prepare_attack_turn(desired, time.monotonic(), tap_seconds):
+                return
+            self.state = state
+            return
         if self.direction != desired:
             duration = (
                 float(self.config["behavior"]["face_tap_seconds"])
@@ -1255,7 +1358,13 @@ class BowmanBot:
         keys = self.config["keys"]
         self.stop_move()
         desired = "left" if target_x < player_x else "right"
-        if self.direction != desired:
+        deferred = False
+        if getattr(self, "delivery", "foreground") == "hybrid":
+            turn_ready = self._prepare_attack_turn(desired, now)
+            deferred = not turn_ready and self.state == "HYBRID_TURN_DEFERRED"
+            if not turn_ready and not deferred:
+                return
+        elif self.direction != desired:
             self.keyboard.tap(keys[desired], float(self.config["behavior"]["face_tap_seconds"]))
             self.direction = desired
         jump_key = keys["jump"]
@@ -1270,14 +1379,16 @@ class BowmanBot:
             self.keyboard.up(jump_key)
         self.last_jump_attack = now
         self.last_attack = now
-        self.state = state
+        self.state = "HYBRID_JUMP_ATTACK_FIXED" if deferred else state
         self.log.write(
             "jump_attack",
-            state=state,
-            direction=desired,
+            state=self.state,
+            direction=None if deferred else desired,
             overlap_ratio=round(overlap_ratio, 4),
             jump_key=jump_key,
             attack_key=attack_key,
+            **({"requested_direction": desired, "turn_deferred": deferred, "facing_verified": False}
+               if getattr(self, "delivery", "foreground") == "hybrid" else {}),
         )
 
     def _configure_hybrid_cancellation(self) -> None:
@@ -1287,7 +1398,7 @@ class BowmanBot:
                 or self.vision_suspended.is_set()
             )
 
-    def _prepare_hybrid_movement(self, cooperative: bool = False) -> bool:
+    def _prepare_hybrid_movement(self, cooperative: bool = False, *, allow_focus: bool = True) -> bool:
         if getattr(self, "delivery", "foreground") != "hybrid":
             return True
         self._hybrid_motion_requested = True
@@ -1299,8 +1410,13 @@ class BowmanBot:
             self.state = "HYBRID_ROUTE_YIELD"
             return False
         was_active = bool(self.keyboard.hybrid.active)
-        if self.keyboard.prepare_movement():
+        if not was_active:
+            self._release_pickup()  # 新移动租约的空闲检查不能被自己保持的拾取键卡住。
+        ready = (self.keyboard.prepare_movement() if allow_focus
+                 else self.keyboard.prepare_movement(allow_focus=False))
+        if ready:
             if not was_active:
+                self._reset_attack_facing()
                 # 激活耗时可能让传入位置过期；实际移动必须等下一帧重新识别。
                 self.stop_move()
                 self.move_progress = progress
@@ -1309,7 +1425,13 @@ class BowmanBot:
             return True
         self.stop_move()
         self.move_progress = progress
-        self.state = "HYBRID_WAIT_IDLE"
+        guard = self.keyboard.hybrid
+        if not allow_focus and guard.desktop.foreground() != guard.hwnd:
+            self._hybrid_motion_requested = False
+            self.state = "HYBRID_TURN_DEFERRED"
+            return False
+        self.state = ("HYBRID_WAIT_IDLE_FOREGROUND"
+                      if guard.desktop.foreground() == guard.hwnd else "HYBRID_WAIT_IDLE")
         return False
 
     def act(
@@ -1336,24 +1458,28 @@ class BowmanBot:
                         self._try_auto_potion(window, hp, mp, now)
                     return
                 self._hybrid_motion_requested = False
+                self._pickup_requested = False
                 self._strategy_decision_made = False
                 try:
                     self._act(window, hp, mp, marker, player_box, target_box, chase_box,
                               combat_width, has_monster_candidates, now, combat_height, eligible_detections)
                 finally:
                     self._strategy_was_interrupted = not self._strategy_decision_made
-                    if self._strategy_was_interrupted:
-                        self._reset_attack_facing()
-                    if getattr(self, "delivery", "foreground") == "hybrid":
-                        try:
-                            if self._hybrid_motion_requested and self.armed:
-                                self.keyboard.movement_heartbeat()
-                            else:
-                                self.keyboard.finish_movement()
-                        finally:
-                            for event, result in self.keyboard.movement_events():
-                                self.log.write(event, result=result)
-                        self.keyboard.check_health()
+                    try:
+                        if not getattr(self, "_pickup_requested", False):
+                            self._release_pickup()
+                    finally:
+                        if getattr(self, "delivery", "foreground") == "hybrid":
+                            try:
+                                if self._hybrid_motion_requested and self.armed:
+                                    self.keyboard.movement_heartbeat()
+                                elif not (getattr(self, "_pickup_requested", False)
+                                          and not self.keyboard.hybrid.active):
+                                    self.keyboard.finish_movement()
+                            finally:
+                                for event, result in self.keyboard.movement_events():
+                                    self.log.write(event, result=result)
+                            self.keyboard.check_health()
             except OSError as exc:
                 if getattr(self, "delivery", "foreground") != "hybrid":
                     raise
@@ -1364,6 +1490,29 @@ class BowmanBot:
                 except OSError as release_error:
                     self.log.write("hybrid_release_error", error=str(release_error))
                     self.notify(f"混合后台已暂停，但抬键失败：{release_error}。请手动检查方向键。", 10.0)
+            finally:
+                self._record_action_state(now, player_box, target_box, marker, has_monster_candidates)
+
+    def _record_action_state(self, now: float,
+                             player_box: tuple[int, int, int, int] | None,
+                             target_box: tuple[int, int, int, int] | None,
+                             marker: tuple[float, float] | None,
+                             has_monster_candidates: bool) -> None:
+        """记录真实行动门禁，不将没有攻击日志一律推断为按键通道慢。"""
+        log = getattr(self, "log", None)
+        if log is None:
+            return
+        state = str(getattr(self, "state", "UNKNOWN"))
+        previous, last_at = getattr(self, "_action_state_log", (None, float("-inf")))
+        # 状态变化最多一秒一次，稳定状态五秒一次；不逐帧刷日志。
+        if now - last_at < (1.0 if state != previous else 5.0):
+            return
+        self._action_state_log = (state, now)
+        log.write("action_state", state=state, delivery=getattr(self, "delivery", "foreground"),
+                  armed=bool(self.armed), player_candidate=player_box is not None,
+                  target_candidate=target_box is not None, marker_available=marker is not None,
+                  monster_candidates=bool(has_monster_candidates),
+                  since_attack_seconds=round(max(0., now - getattr(self, "last_attack", now)), 3))
 
     def _act(
         self,
@@ -1418,7 +1567,18 @@ class BowmanBot:
             )
         )
         marker_trusted = marker is not None and bool(getattr(self, "live_marker_unambiguous", True))
+        self._observe_attack_facing_localization(now, localized)
         self._observe_navigation_localization(now, localized and marker_trusted)
+        if not marker_trusted:
+            self._reset_attack_facing()
+        if getattr(self, "delivery", "foreground") == "hybrid":
+            foreground = int(user32.GetForegroundWindow()) == window.hwnd
+            previous = getattr(self, "_hybrid_attack_foreground", foreground)
+            self._hybrid_attack_foreground = foreground
+            if foreground != previous:
+                self._reset_attack_facing()
+                self.log.write("hybrid_attack_focus_changed", foreground=foreground,
+                               action="invalidate_turn")
         if self._try_auto_potion(window, hp, mp, now):
             return
         if self._try_auto_buff(now):
@@ -1503,7 +1663,9 @@ class BowmanBot:
             )
         )
         self._strategy_decision_made = True
-        if decision.action != "attack":
+        # 无目标、原地等待或拾取本身不改变朝向。移动/转向动作仍立即作废缓存，
+        # 视觉缺失由上方的独立短宽限处理，不能每个非攻击帧都再插入 0.6 秒停攻。
+        if decision.action not in {"attack", "stop", "pickup", "face", "jump_attack"}:
             self._reset_attack_facing()
         self._strategy_localization_gap = 0.0
         if minimap_only and decision.action not in {"stop", "move", "jump", "down_jump"}:
@@ -1536,11 +1698,17 @@ class BowmanBot:
             self.move_progress = None
         if decision.pickup_interval_seconds is not None:
             self._validate_route_pickup_key()
+        else:
+            self._release_pickup()
         if decision.action in {"move", "chase", "step", "jump", "down_jump"}:
             if not self._prepare_hybrid_movement(cooperative=decision.cooperative_movement):
                 return
-        elif getattr(self, "delivery", "foreground") == "hybrid":
-            self.keyboard.finish_movement()
+        elif (getattr(self, "delivery", "foreground") == "hybrid"
+              and decision.action not in {"attack", "face", "jump_attack"}):
+            # 到点时结束移动租约；后续原地拾取帧不能每帧 finish 抬掉技能键。
+            if self.keyboard.hybrid.active or decision.pickup_interval_seconds is None:
+                self._release_pickup()
+                self.keyboard.finish_movement()
             self.keyboard.check_health()
         if decision.action == "face":
             self.face_target(
@@ -1556,6 +1724,7 @@ class BowmanBot:
                 face_each_attack=decision.face_each_attack,
                 attack_key=decision.attack_key,
                 attack_skill=decision.attack_skill,
+                face_tap_seconds=decision.face_tap_seconds,
             )
         elif decision.action == "chase":
             self.chase_target(float(decision.target_x), float(decision.player_x))
@@ -1563,7 +1732,7 @@ class BowmanBot:
             self._move_with_feedback(str(decision.direction), marker, now, decision.state)
             if (decision.pickup_interval_seconds is not None and not minimap_only
                     and self.armed and self.state == decision.state):
-                self._tap_route_pickup(now, decision.pickup_interval_seconds)
+                self._hold_route_pickup(now)
         elif decision.action == "step":
             self.periodic_step(
                 str(decision.direction),
@@ -1584,9 +1753,9 @@ class BowmanBot:
                 decision.state,
             )
         elif decision.action == "pickup":
-            self.stop_move()
+            self.stop_move(keep_pickup=decision.pickup_interval_seconds is not None)
             if decision.pickup_interval_seconds is not None:
-                self._tap_route_pickup(now, decision.pickup_interval_seconds)
+                self._hold_route_pickup(now)
             else:
                 self.keyboard.tap(keys["pickup"])
                 self.last_pickup = now
@@ -1615,12 +1784,27 @@ class BowmanBot:
         if vk_for(keys["pickup"]) in {vk_for(keys[key]) for key in ("left", "right", "down", "jump")}:
             raise RuntimeError("路线拾取键不能与移动或跳跃键相同，请修改拾取按键")
 
-    def _tap_route_pickup(self, now: float, interval: float) -> None:
+    def _release_pickup(self) -> None:
+        key = getattr(self, "_pickup_held_key", None)
+        if key is not None:
+            self.keyboard.up(key)
+            self._pickup_held_key = None
+            self._note_foreground_motion()
+            self.log.write("pickup_hold_release", key=key)
+
+    def _hold_route_pickup(self, now: float) -> None:
         self._validate_route_pickup_key()
-        if now - self.last_pickup >= max(0.1, interval):
-            # 普通输入通道：混合后台仍是 PostMessage，不能抬掉正在使用的方向键。
-            self.keyboard.tap(self.config["keys"]["pickup"])
-            self.last_pickup = now
+        key = self.config["keys"]["pickup"]
+        starting = getattr(self, "_pickup_held_key", None) != key
+        if starting:
+            self._release_pickup()
+        self._pickup_held_key = key  # 发键前登记，部分发送失败也要补偿抬键。
+        self.keyboard.hold(key)
+        self._pickup_requested = True
+        self.last_pickup = now
+        if starting:
+            self.log.write("pickup_hold_start", key=key, delivery=self.delivery,
+                           repeat_seconds=0.1, result="key_sent_unverified")
 
     def _detect_player_nameplate(
         self,
@@ -1630,23 +1814,35 @@ class BowmanBot:
         *,
         threshold: float | None = None,
     ) -> tuple[list[Detection], float, str | None]:
-        detections, score, template_name = find_detections(
-            scene,
-            self.player_templates,
-            (
-                float(vision.get("player_template_threshold", 0.76))
-                if threshold is None
-                else float(threshold)
-            ),
-            float(vision.get("player_detection_scale", 0.5)),
-            max_per_template=8,
-            nms_iou=0.35,
-            max_detections=max(8, len(self.player_templates) * 8),
-            structure_weight=0.55,
-            search_roi=search_roi,
-            nms_across_templates=False,
-        )
-        verified = verify_nameplate_identities(scene.scene, detections, self.player_templates)
+        templates = self.player_templates
+        strict_threshold = float(vision.get("player_template_threshold", 0.76))
+        match_threshold = strict_threshold if threshold is None else float(threshold)
+        scale = max(0.4, min(1.0, float(vision.get("player_detection_scale", 0.5))))
+        identity_threshold = float(vision.get("player_name_identity_threshold", 0.50))
+        verified: list[Detection] = []
+        score, template_name = -1.0, None
+        # 姓名细笔画在半分辨率下会随一像素位移消失；原图字形核验无法救回
+        # 已在候选门槛前被丢弃的名字。粗检无有效身份时，同 ROI 用原图复核。
+        # 不放宽阈值、不扩大 ROI，后续身份消歧和连续帧确认仍由 tracker 决定。
+        scales = (scale, 1.0) if scale < 1.0 and templates else (scale,)
+        for index, detection_scale in enumerate(scales):
+            detections, scan_score, scan_name = find_detections(
+                scene,
+                templates,
+                match_threshold if index == 0 else max(strict_threshold, match_threshold),
+                detection_scale,
+                max_per_template=8,
+                nms_iou=0.35,
+                max_detections=max(8, len(templates) * 8),
+                structure_weight=0.55,
+                search_roi=search_roi,
+                nms_across_templates=False,
+            )
+            if scan_score > score:
+                score, template_name = scan_score, scan_name
+            verified.extend(verify_nameplate_identities(scene.scene, detections, templates))
+            if any(d.identity_score is not None and d.identity_score >= identity_threshold for d in verified):
+                break
         return deduplicate_nameplate_detections(verified, nms_iou=0.35, max_detections=8), score, template_name
 
     def _detect_player_auxiliary(
@@ -2175,7 +2371,7 @@ class BowmanBot:
         )
         print("按键投递：" + {
             "window_message": "纯窗口消息（移动采用按下/抬起脉冲，不发送全局按键）。",
-            "hybrid": "混合后台（技能窗口消息；移动临时激活游戏并使用 SendInput）。",
+            "hybrid": "混合后台（技能前台 SendInput、后台 PostMessage；后台转向不切窗，实际移动才激活）。",
             "background": "后台扫描码（失焦仍 SendInput，并补发窗口消息）。",
             "foreground": "前台 SendInput（游戏必须在前台）。",
         }[self.delivery])
@@ -2244,6 +2440,9 @@ class BowmanBot:
                         time.sleep(0.1)
                         continue
                     stages_ns["capture"] = time.perf_counter_ns() - capture_started_ns
+                    alert_started_ns = time.perf_counter_ns()
+                    self._observe_verification_alert(frame, time.monotonic())
+                    stages_ns["verification_alert"] = time.perf_counter_ns() - alert_started_ns
                     preprocess_started_ns = time.perf_counter_ns()
                     hp_img, hp_rect = crop(frame, self.config["regions"]["hp_bar"])
                     mp_img, mp_rect = crop(frame, self.config["regions"]["mp_bar"])

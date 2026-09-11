@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 
@@ -14,7 +14,8 @@ from mbv import calibrate
 from mbv.bot import BowmanBot
 from mbv.config import load_config, save_config
 from mbv.strategies import get_strategy, missing_recognition_data, normalize_strategy_config
-from mbv.strategies.base import StrategyActionContext
+from mbv.strategies.base import StrategyActionContext, TargetSelectionContext
+from mbv.vision import Detection
 from mbv.window import WindowInfo
 
 
@@ -92,6 +93,8 @@ class RouteDecisionTests(unittest.TestCase):
         self.assertEqual((result.action, result.attack_key), ("attack", "m"))
         self.assertIsNone(result.pickup_interval_seconds)
         result = self.advance(target_box=None, now=211.)
+        self.assertEqual(result.state, "PICKUP_CLEAR_WAIT")
+        result = self.advance(now=211.5)
         self.assertEqual(result.state, "PICKUP_OUTBOUND_RIGHT")
 
     def test_dwell_requires_pickup_and_excludes_combat(self):
@@ -99,21 +102,28 @@ class RouteDecisionTests(unittest.TestCase):
         self.assertEqual(self.advance(marker=(.8, .5), now=182.).action, "pickup")
         self.assertEqual(self.advance(now=184.).action, "pickup")
         self.assertEqual(self.advance(now=185., target_box=(120, 90, 20, 20)).action, "attack")
-        self.assertEqual(self.advance(now=186., target_box=None, last_pickup=183.).action, "pickup")
+        self.assertEqual(self.advance(now=186., target_box=None, last_pickup=183.).state, "PICKUP_CLEAR_WAIT")
+        self.assertEqual(self.advance(now=186.5).action, "pickup")
         self.assertEqual(self.advance(now=188., last_pickup=187.).state, "PICKUP_COLLECT")
         self.assertEqual(self.finish_collection().state, "PICKUP_START_RETURN")
 
-    def test_return_ignores_monsters_and_completion_resets_timers(self):
+    def test_return_clears_monsters_before_moving_and_completion_resets_timers(self):
         self.advance()
         self.advance(marker=(.8, .5), now=182.)
         self.finish_collection()
         result = self.advance(now=185., target_box=(120, 90, 20, 20))
+        self.assertEqual(result.action, "attack")
+        self.assertEqual(result.runtime_state["phase"], "returning")
+        self.assertIsNone(result.pickup_interval_seconds)
+        self.assertEqual(self.advance(now=185.1, target_box=None).state, "PICKUP_CLEAR_WAIT")
+        result = self.advance(now=185.6)
         self.assertEqual(result.state, "RETURN_CENTER_LEFT")
         self.assertIsNone(result.attack_key)
         result = self.advance(marker=(.5, .5), now=188.)
         self.assertEqual(result.state, "PICKUP_RETURNED")
         self.assertTrue(result.reset_periodic_step)
         self.assertEqual(result.runtime_state["last_completed_at"], 188.)
+        self.context = replace(self.context, target_box=(120, 90, 20, 20))
         self.assertEqual(self.advance(now=232.9, last_periodic_step=188.).action, "attack")
         self.assertEqual(self.advance(now=233.).action, "step")
         self.assertEqual(self.decide(now=367.9, last_periodic_step=367.).action, "attack")
@@ -128,13 +138,16 @@ class RouteDecisionTests(unittest.TestCase):
         self.assertEqual(self.advance(marker=(.5, .5)).state, "PICKUP_RETURNED")
         self.assertEqual(self.decide(now=1000., last_periodic_step=999.).state, "SCANNING")
 
-    def test_timeout_returns_even_with_monsters(self):
+    def test_timeout_selects_return_phase_but_still_clears_monsters_first(self):
         self.advance()
         result = self.advance(marker=(.65, .5), now=271., target_box=(120, 90, 20, 20))
-        self.assertEqual(result.state, "RETURN_CENTER_LEFT")
+        self.assertEqual(result.action, "attack")
+        self.assertEqual(result.runtime_state["phase"], "returning")
+        self.assertEqual(result.runtime_state["return_reason"], "outbound_timeout")
 
     def test_no_displacement_does_not_postpone_periodic_step(self):
         self.advance(target_box=(120, 90, 20, 20))
+        self.advance(now=270., target_box=None)
         result = self.advance(now=271.)
         self.assertEqual(result.state, "PICKUP_RETURNED")
         self.assertFalse(result.reset_periodic_step)
@@ -196,7 +209,8 @@ class RouteDecisionTests(unittest.TestCase):
         self.advance()
         self.advance(now=182., marker=(.8, .5))
         result = self.advance(now=242., target_box=(120, 90, 20, 20))
-        self.assertEqual(result.state, "RETURN_CENTER_LEFT")
+        self.assertEqual(result.action, "attack")
+        self.assertEqual(result.runtime_state["phase"], "returning")
         self.assertEqual(result.runtime_state["return_reason"], "collection_timeout")
 
     def test_disabling_and_falling_take_priority_over_visual_grace(self):
@@ -232,6 +246,129 @@ class RouteDecisionTests(unittest.TestCase):
         self.advance()
         self.assertEqual(vars(self.strategy), before)
         self.assertEqual(self.decide(runtime_state={}, now=2.).state, "SCANNING")
+
+    def test_both_route_directions_wait_through_one_empty_frame_and_resume(self):
+        for phase in ("outbound", "returning"):
+            with self.subTest(phase=phase):
+                self.context = replace(self.context, now=182., marker=(.65, .5),
+                    runtime_state={"phase": phase, "route_started_at": 181.,
+                                   "return_reason": "collected", "navigation_active": True})
+                self.assertEqual(self.advance(target_box=(120, 90, 20, 20)).action, "attack")
+                self.assertEqual(self.advance(now=182.1, target_box=None).state, "PICKUP_CLEAR_WAIT")
+                self.assertEqual(self.advance(now=182.2, target_box=(120, 90, 20, 20)).action, "attack")
+                self.assertEqual(self.advance(now=182.3, target_box=None).state, "PICKUP_CLEAR_WAIT")
+                self.assertEqual(self.advance(now=182.6).action, "stop")
+                resumed = self.advance(now=182.8)
+                self.assertEqual((resumed.action, resumed.direction),
+                                 ("move", "right" if phase == "outbound" else "left"))
+
+    def test_return_melee_and_home_completion_wait_for_clear(self):
+        state = {"phase": "returning", "return_reason": "collected", "departed": True}
+        self.context = replace(self.context, runtime_state=state,
+                               settings={**self.context.settings, "melee_skill_key": "m"})
+        result = self.advance(target_box=(105, 90, 20, 20))
+        self.assertEqual((result.action, result.attack_key), ("attack", "m"))
+        self.assertFalse(result.reset_periodic_step)
+        self.assertEqual(self.advance(now=181.1, target_box=None).state, "PICKUP_CLEAR_WAIT")
+        done = self.advance(now=181.6)
+        self.assertEqual(done.state, "PICKUP_RETURNED")
+        self.assertTrue(done.reset_periodic_step)
+
+    def test_safety_returns_do_not_stop_for_monsters(self):
+        for reason in ("disabled", "point_invalid", "off_platform", "localization_timeout"):
+            result = self.decide(marker=(.65, .5), target_box=(120, 90, 20, 20),
+                runtime_state={"phase": "returning", "return_reason": reason})
+            self.assertEqual(result.state, "RETURN_CENTER_LEFT")
+            self.assertIsNone(result.attack_key)
+
+    def test_map_only_return_never_attacks_even_with_target_in_context(self):
+        result = self.decide(marker=(.65, .5), player_box=None, minimap_only=True,
+            target_box=(120, 90, 20, 20),
+            runtime_state={"phase": "returning", "return_reason": "collected"})
+        self.assertEqual(result.state, "RETURN_CENTER_LEFT")
+        self.assertIsNone(result.pickup_interval_seconds)
+
+    def test_route_clears_current_side_even_when_other_side_becomes_nearer(self):
+        left = Detection((50, 90, 20, 20), .9, "left")
+        right = Detection((110, 90, 20, 20), .9, "right")
+        for phase in ("outbound", "collect", "returning"):
+            with self.subTest(phase=phase):
+                state = {"phase": phase, "route_started_at": 181., "return_reason": "collected"}
+                first = self.decide(target_box=left.box, runtime_state=state)
+                result = self.decide(target_box=right.box, eligible_detections=(left, right),
+                                     now=181.2, runtime_state=first.runtime_state)
+                self.assertEqual(result.target_x, .15)
+                self.assertEqual(result.runtime_state["combat_side"], "left")
+                self.assertEqual(result.face_tap_seconds, .08)
+                self.assertIsNone(result.pickup_interval_seconds)
+
+    def test_side_loss_waits_then_switches_using_fresh_target_not_stale_box(self):
+        first = self.advance(target_box=(50, 90, 20, 20))
+        self.assertEqual(first.runtime_state["combat_side"], "left")
+        self.assertEqual(self.advance(now=181.1, target_box=(110, 90, 20, 20)).state, "PICKUP_CLEAR_WAIT")
+        self.assertEqual(self.advance(now=181.3).state, "PICKUP_CLEAR_WAIT")
+        result = self.advance(now=181.51, target_box=(130, 90, 20, 20))
+        self.assertEqual(result.target_x, .35)
+        self.assertEqual(result.runtime_state["combat_side"], "right")
+
+    def test_reappearing_side_and_interruption_reset_side_loss_confirmation(self):
+        left = Detection((50, 90, 20, 20), .9, "left")
+        self.advance(target_box=left.box)
+        self.advance(now=181.1, target_box=(110, 90, 20, 20))
+        result = self.advance(now=181.3, eligible_detections=(left,))
+        self.assertEqual(result.runtime_state["combat_side"], "left")
+        self.assertNotIn("combat_side_missing_since", result.runtime_state)
+        self.advance(now=181.4, eligible_detections=())
+        self.assertEqual(self.advance(now=182., action_interrupted=True).action, "stop")
+        self.assertEqual(self.advance(now=182.2, action_interrupted=False).action, "stop")
+        self.assertEqual(self.advance(now=182.5).runtime_state["combat_side"], "right")
+
+    def test_clear_episode_discards_side_lock_before_next_move(self):
+        self.advance(target_box=(50, 90, 20, 20))
+        self.advance(now=181.1, target_box=None)
+        result = self.advance(now=181.6)
+        self.assertEqual(result.action, "move")
+        self.assertNotIn("combat_side", result.runtime_state)
+
+    def test_return_combat_short_visual_loss_does_not_insert_opposite_move(self):
+        state = {"phase": "returning", "return_reason": "collected", "combat_pending": True}
+        result = self.decide(marker=(.65, .5), player_box=None, minimap_only=True,
+                             runtime_state=state, localization_lost_seconds=.2)
+        self.assertEqual(result.state, "PICKUP_WAIT_LOCALIZATION")
+        self.assertEqual(result.action, "stop")
+        result = self.decide(marker=(.65, .5), player_box=None, minimap_only=True,
+                             runtime_state=state, localization_lost_seconds=1.1)
+        self.assertEqual(result.state, "RETURN_CENTER_LEFT")
+        result = self.decide(marker=(.65, .5), player_box=None, minimap_only=True,
+                             runtime_state={**state, "return_reason": "disabled"})
+        self.assertEqual(result.state, "RETURN_CENTER_LEFT")
+
+    def test_selection_exports_only_current_bidirectional_eligible_detections(self):
+        left = Detection((50, 90, 20, 20), .9, "left")
+        right = Detection((110, 90, 20, 20), .9, "right")
+        outside = Detection((390, 90, 20, 20), .9, "outside")
+        upstairs = Detection((110, 0, 20, 20), .9, "upstairs")
+        context = TargetSelectionContext(
+            detections=[left, right, outside, upstairs], player_box=(90, 100, 20, 1),
+            player_raw_box=None, player_anchor=(100., 100.), scene_width=400, scene_height=200,
+            facing="right", target_area={"forward": .2, "back": .01, "up": .1, "down": .1},
+            settings=self.context.settings)
+        selection = self.strategy.select_targets(context)
+        self.assertEqual(selection.eligible_detections, (left, right))
+        self.assertEqual(selection.target, right)
+        self.assertEqual(self.strategy.select_targets(replace(context, player_box=None)).eligible_detections, ())
+        # 没进入路线的普通原地攻击不锁侧，也不请求路线转向时序。
+        result = self.decide(now=10., target_box=right.box, eligible_detections=(left, right),
+                             runtime_state={"combat_side": "left"})
+        self.assertEqual(result.target_x, .3)
+        self.assertIsNone(result.face_tap_seconds)
+
+    def test_buff_interruption_does_not_count_as_clear_confirmation(self):
+        self.advance(target_box=(120, 90, 20, 20))
+        self.advance(now=181.1, target_box=None)
+        self.assertEqual(self.advance(now=183., action_interrupted=True).state, "PICKUP_CLEAR_WAIT")
+        self.assertEqual(self.advance(now=183.2, action_interrupted=False).state, "PICKUP_CLEAR_WAIT")
+        self.assertEqual(self.advance(now=183.5).state, "PICKUP_OUTBOUND_RIGHT")
 
 
 class RouteCalibrationTests(unittest.TestCase):
@@ -386,6 +523,8 @@ class RouteRuntimeTests(unittest.TestCase):
         bot.last_attack_anchor = (100., 100.)
         bot.direction = None
         bot.keyboard = MagicMock()
+        bot.keyboard.hybrid.hwnd = 10
+        bot.keyboard.hybrid.desktop.foreground.return_value = 10
         bot.keyboard.prepare_movement.return_value = True
         bot.keyboard.movement_events.return_value = []
         bot.keyboard.hybrid.yield_if_due.return_value = False
@@ -397,21 +536,25 @@ class RouteRuntimeTests(unittest.TestCase):
         if fresh and player is not None:
             self.bot.last_nameplate_seen_at = now
         with patch("mbv.bot.user32.IsWindow", return_value=True), \
-             patch("mbv.bot.user32.IsIconic", return_value=False):
+             patch("mbv.bot.user32.IsIconic", return_value=False), \
+             patch("mbv.bot.user32.GetForegroundWindow", return_value=10), \
+             patch("mbv.bot.time.monotonic", return_value=now):
             self.bot.act(WindowInfo(10, "NewMaple", 0, 0, 800, 600), 1., 1., marker,
                          player, target, None, 400, target is not None, now, 200)
 
-    def test_movement_and_pickup_use_separate_channels_with_rate_limit(self):
+    def test_movement_and_pickup_use_separate_channels_with_continuous_hold(self):
         self.act()
         self.bot.keyboard.tap.assert_not_called()  # 移动准备期不拾取。
         self.act(now=181.1)
         self.bot.keyboard.movement_down.assert_called_with("right")
-        self.bot.keyboard.tap.assert_called_once_with(self.bot.config["keys"]["pickup"])
+        self.bot.keyboard.hold.assert_called_once_with(self.bot.config["keys"]["pickup"])
         self.bot.keyboard.down.assert_not_called()
         self.act(now=181.2, marker=(.52, .5))
-        self.assertEqual(self.bot.keyboard.tap.call_count, 1)
+        self.assertEqual(self.bot.keyboard.hold.call_count, 2)
         self.act(now=181.3, marker=(.54, .5))
-        self.assertEqual(self.bot.keyboard.tap.call_count, 2)
+        self.assertEqual(self.bot.keyboard.hold.call_count, 3)
+        self.bot.keyboard.tap.assert_not_called()
+        self.assertNotIn(call(self.bot.config["keys"]["pickup"]), self.bot.keyboard.up.call_args_list)
 
     def test_runtime_completion_resets_45_seconds_only_at_home(self):
         self.act()
@@ -419,10 +562,70 @@ class RouteRuntimeTests(unittest.TestCase):
         for tick in range(1, 18):
             self.act(marker=(.8, .5), now=182. + tick * .1)
         self.assertEqual(self.bot.last_periodic_step, 156.)
-        self.act(marker=(.5, .5), now=188., target=(120, 90, 20, 20))
+        self.act(marker=(.5, .5), now=188.)
         self.assertEqual(self.bot.last_periodic_step, 188.)
         self.assertEqual(self.bot.state, "PICKUP_RETURNED")
         self.assertEqual(self.bot.strategy_runtime_state["last_completed_at"], 188.)
+        self.assertIsNone(self.bot._pickup_held_key)
+
+    def test_route_hold_releases_on_each_interruption(self):
+        for interruption in ("monster", "visual", "marker", "buff", "potion", "yield"):
+            with self.subTest(interruption=interruption):
+                self.setUp()
+                self.act()
+                self.act(now=181.1)
+                key = self.bot.config["keys"]["pickup"]
+                self.assertEqual(self.bot._pickup_held_key, key)
+                self.bot.keyboard.reset_mock()
+                kwargs = {}
+                if interruption == "monster":
+                    kwargs["target"] = (200, 90, 20, 20)
+                elif interruption == "visual":
+                    kwargs["player"] = None
+                elif interruption == "marker":
+                    kwargs["marker"] = None
+                elif interruption in {"buff", "potion"}:
+                    getattr(self.bot, "_try_auto_" + interruption).return_value = True
+                else:
+                    self.bot.keyboard.hybrid.yield_if_due.return_value = True
+                self.act(now=181.2, **kwargs)
+                self.bot.keyboard.up.assert_any_call(key)
+                self.assertIsNone(self.bot._pickup_held_key)
+                self.bot.keyboard.hold.assert_not_called()
+
+    def test_hold_failure_attempts_release_and_pauses_hybrid(self):
+        self.act()
+        self.bot.notify = MagicMock()
+        self.bot.keyboard.hold.side_effect = OSError("拾取按下失败")
+        self.act(now=181.1)
+        self.bot.keyboard.up.assert_any_call(self.bot.config["keys"]["pickup"])
+        self.assertFalse(self.bot.armed)
+
+    def test_disarm_clears_pickup_ownership(self):
+        self.act()
+        self.act(now=181.1)
+        self.bot.notify = MagicMock()
+        self.bot.disarm("test")
+        self.bot.keyboard.release_all.assert_called_once()
+        self.assertIsNone(self.bot._pickup_held_key)
+
+    def test_return_combat_releases_movement_and_suspends_pickup(self):
+        self.bot.strategy_runtime_state = {"phase": "returning", "return_reason": "collected",
+                                          "navigation_active": True, "departed": True}
+        self.act(marker=(.65, .5))
+        self.act(marker=(.65, .5), now=181.1)
+        self.bot.keyboard.reset_mock()
+        self.act(marker=(.65, .5), now=181.2, target=(20, 90, 20, 20))
+        self.bot.keyboard.up.assert_any_call("left")
+        self.bot.keyboard.movement_down.assert_not_called()
+        self.bot.keyboard.tap.assert_not_called()
+        self.act(marker=(.65, .5), now=181.4, target=(20, 90, 20, 20))
+        self.bot.keyboard.tap.assert_called_once_with(self.bot.config["keys"]["attack"])
+        self.bot.keyboard.reset_mock()
+        self.act(marker=(.65, .5), now=181.5)
+        self.assertEqual(self.bot.state, "PICKUP_CLEAR_WAIT")
+        self.bot.keyboard.tap.assert_not_called()
+        self.bot.keyboard.movement_down.assert_not_called()
 
     def test_runtime_records_loss_across_full_visual_gate_and_resumes_short_loss(self):
         self.act()
@@ -498,7 +701,7 @@ class RouteRuntimeTests(unittest.TestCase):
     def test_busy_user_does_not_consume_route_or_move(self):
         self.bot.keyboard.prepare_movement.return_value = False
         self.act()
-        self.assertEqual(self.bot.state, "HYBRID_WAIT_IDLE")
+        self.assertEqual(self.bot.state, "HYBRID_WAIT_IDLE_FOREGROUND")
         self.bot.keyboard.tap.assert_not_called()
         self.bot.keyboard.movement_down.assert_not_called()
         self.assertEqual(self.bot.last_periodic_step, 156.)
@@ -543,7 +746,7 @@ class RouteRuntimeTests(unittest.TestCase):
     def test_conflicting_pickup_key_is_rejected(self):
         self.bot.config["keys"]["pickup"] = "left"
         with self.assertRaisesRegex(RuntimeError, "拾取键"):
-            self.bot._tap_route_pickup(181., .15)
+            self.bot._hold_route_pickup(181.)
         self.bot.keyboard.tap.assert_not_called()
         with self.assertRaisesRegex(RuntimeError, "拾取键"):
             self.act()

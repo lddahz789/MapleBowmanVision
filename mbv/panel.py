@@ -156,6 +156,7 @@ class ControlPanel:
         self.debug_boxes = tk.BooleanVar(value=self.bot.calibration_overlay_visible)
         self.auto_potion_enabled = tk.BooleanVar(value=False)
         self.standalone_potion = self.auto_potion_enabled
+        self.verification_alert_enabled = tk.BooleanVar(value=bool(config["verification_alert"]["enabled"]))
         self.buff_enabled: dict[str, tk.BooleanVar] = {
             slot: tk.BooleanVar(value=bool(config["buffs"][slot]["enabled"]))
             for slot in ("buff_1", "buff_2", "buff_3")
@@ -631,6 +632,21 @@ class ControlPanel:
             justify="left",
             anchor="w",
         ).pack(fill="x", padx=8, pady=(0, 5))
+        if self.profile_label == "NewMaple":
+            tk.Checkbutton(
+                settings, text="狩猎验证：仅检测并响铃（不暂停挂机）",
+                variable=self.verification_alert_enabled, command=self._toggle_verification_alert,
+                bg=PANEL, fg=FG, selectcolor=ENTRY_BG, activebackground=PANEL,
+                activeforeground=FG, font=FONT_SMALL, takefocus=False,
+            ).pack(fill="x", padx=8, pady=(6, 2))
+            tk.Button(
+                settings, text="试听验证提示音", command=self._test_verification_sound,
+                bg=BUTTON_BG, fg=FG, relief="flat", font=FONT_SMALL, takefocus=False,
+            ).pack(anchor="w", padx=8, pady=2)
+            tk.Label(
+                settings, text="仅监听聊天栏固定字样，不识题、不发命令。人工输入聊天前请自行暂停，防止挂机按键混入。",
+                bg=PANEL, fg=MUTED, font=FONT_SMALL, wraplength=360, justify="left",
+            ).pack(fill="x", padx=8, pady=(0, 5))
         tk.Label(
             settings,
             text="定时补 Buff（仅挂机运行时）",
@@ -1302,6 +1318,9 @@ class ControlPanel:
                 variable.set(bool(config["buffs"][slot].get("enabled", False)))
             self._refresh_buff_toggle_buttons()
             self._load_performance_monitor_settings(config)
+            alert_enabled = getattr(self, "verification_alert_enabled", None)
+            if alert_enabled is not None:
+                alert_enabled.set(bool(config["verification_alert"]["enabled"]))
         finally:
             self._loading_settings = previous_loading
 
@@ -2298,6 +2317,9 @@ class ControlPanel:
             text += f"｜自动喝药 {potion_state}"
         if notice:
             text += f"\n{notice}"
+        alert_status = getattr(self.bot, "verification_alert_status", "")
+        if alert_status:
+            text += f"\n{alert_status}"
         self.status.set(text)
         self.status_label.configure(fg=color)
         self.root.after(250, self._tick)
@@ -2503,6 +2525,21 @@ class ControlPanel:
             request = self.bot.request_standalone_potion
         request(bool(variable.get()))
 
+    def _toggle_verification_alert(self) -> None:
+        enabled = bool(self.verification_alert_enabled.get())
+        try:
+            self._preview_common_setting("verification_alert.enabled", enabled)
+        except Exception as exc:
+            self.verification_alert_enabled.set(not enabled)
+            messagebox.showerror("验证提醒", f"保存失败：{exc}")
+
+    def _test_verification_sound(self) -> None:
+        from mbv.verification_alert import play_alert_sound
+        try:
+            play_alert_sound()
+        except Exception as exc:
+            messagebox.showerror("验证提醒", f"提示音播放失败：{exc}")
+
     def _toggle_standalone_potion(self) -> None:
         """兼容旧调用；开关现在控制全部自动喝药。"""
         self._toggle_auto_potion()
@@ -2579,6 +2616,9 @@ class ControlPanel:
             performance_visible = getattr(self, "performance_visible", None)
             if performance_visible is not None:
                 performance_monitor["visible"] = bool(performance_visible.get())
+            alert_enabled = getattr(self, "verification_alert_enabled", None)
+            if alert_enabled is not None:
+                config["verification_alert"]["enabled"] = bool(alert_enabled.get())
             interval_ms = int(getattr(self, "_performance_interval_ms", 1000))
             performance_monitor["refresh_interval_seconds"] = max(500, min(5000, interval_ms)) / 1000.0
             minimap_assist = getattr(self, "minimap_assist", None)
@@ -2607,6 +2647,7 @@ class ControlPanel:
                     "vision.player_minimap_assist_enabled",
                     "vision.player_minimap_occlusion_seconds",
                     "vision.player_minimap_navigation_seconds",
+                    "verification_alert.enabled",
                 ):
                     self.bot.preview_config_setting(key, self._nested(config, key))
                 for slot in getattr(self, "buff_enabled", {}):

@@ -1,4 +1,4 @@
-"""混合后台的限时前台移动租约；结束后留在游戏前台，技能不经过本模块。"""
+"""混合后台的限时前台移动租约及自有扫描码登记。"""
 from __future__ import annotations
 
 import ctypes
@@ -17,11 +17,10 @@ def window_pid(hwnd: int) -> int:
     return int(pid.value)
 
 
-class _LastInput(ctypes.Structure):
-    _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
-
-
 class Desktop:
+    def __init__(self) -> None:
+        self._buttons_idle_since: float | None = None
+
     def foreground(self) -> int:
         return int(user32.GetForegroundWindow() or 0)
 
@@ -32,23 +31,21 @@ class Desktop:
     def pid(self, hwnd: int) -> int:
         return window_pid(hwnd)
 
-    def cursor(self) -> tuple[int, int]:
-        point = wintypes.POINT()
-        if not user32.GetCursorPos(ctypes.byref(point)):
-            raise OSError("无法检查鼠标位置，取消临时前台移动")
-        return point.x, point.y
-
     def keys_down(self, excluding: set[int]) -> bool:
         # 扫描码保持会反映到异步键状态中，排除本租约正在注入的键。
         return any(user32.GetAsyncKeyState(key) & 0x8000
                    for key in range(1, 256) if key not in excluding)
 
     def idle(self) -> bool:
-        info = _LastInput(ctypes.sizeof(_LastInput), 0)
-        if not user32.GetLastInputInfo(ctypes.byref(info)):
+        # GetLastInputInfo 会被纯鼠标位移刷新；用户明确要求位移不阻塞挂机。
+        # 只观察键盘/鼠标按钮是否保持，保留开始移动前的空闲观察期。
+        now = time.monotonic()
+        if self.keys_down(set()):
+            self._buttons_idle_since = None
             return False
-        elapsed = (int(ctypes.windll.kernel32.GetTickCount()) - info.dwTime) & 0xFFFFFFFF
-        return elapsed >= 700 and not self.keys_down(set())
+        if self._buttons_idle_since is None:
+            self._buttons_idle_since = now
+        return now - self._buttons_idle_since >= 0.7
 
     def focus(self, hwnd: int, pid: int, expected: int, cancelled: Callable[[], bool]) -> None:
         # AttachThreadInput/激活可能受目标窗口阻塞，必须放可终止子进程。
@@ -102,6 +99,7 @@ class HybridMovement:
     MAX_LEASE_SECONDS = 4.0
     HEARTBEAT_SECONDS = 0.8
     MAX_KEY_SECONDS = 0.5
+    KEYUP_SETTLE_SECONDS = 0.08
 
     def __init__(self, send: Callable[[int, bool], None], *, desktop=None,
                  clock=time.monotonic, start_watchdog: bool = True) -> None:
@@ -114,10 +112,11 @@ class HybridMovement:
         self.active = False
         self.user_intervened = False
         self.held: dict[int, float] = {}
+        self.skill_held: set[int] = set()
+        self.releasing: dict[int, float] = {}
         self.error: str | None = None
         self.started = self.heartbeat_at = 0.0
         self.resume_after = 0.0
-        self.cursor_at_start = (0, 0)
         self.stop = threading.Event()
         self.events: list[tuple[str, str]] = []
         self.cancelled: Callable[[], bool] = lambda: False
@@ -125,7 +124,7 @@ class HybridMovement:
     def bind(self, hwnd: int) -> None:
         self.finish()
         with self.lock:
-            if self.held:
+            if self.held or self.skill_held:
                 raise OSError(self.error or "混合后台移动键尚未释放，不能重新启动")
             self.hwnd, self.pid = hwnd, self.desktop.pid(hwnd)
             self.error = None
@@ -136,16 +135,26 @@ class HybridMovement:
             if self.error:
                 raise OSError(self.error)
 
-    def _intervened(self, allowed: set[int]) -> bool:
+    def _intervention_reason(self, allowed: set[int]) -> str | None:
+        now = self.clock()
+        self.releasing = {vk: deadline for vk, deadline in self.releasing.items() if now < deadline}
         excluded = set(self.held)
+        excluded.update(self.skill_held)
+        excluded.update(self.releasing)
         for generic, sides in ((0x10, (0xA0, 0xA1)), (0x11, (0xA2, 0xA3)), (0x12, (0xA4, 0xA5))):
             if generic in excluded:
                 excluded.update(sides)
-        return (self.desktop.foreground() not in allowed
-                or self.desktop.keys_down(excluded)
-                or self.desktop.cursor() != self.cursor_at_start)
+        foreground = self.desktop.foreground()
+        if foreground not in allowed:
+            return f"前台焦点变化（当前 HWND={foreground}）"
+        if self.desktop.keys_down(excluded):
+            return "检测到非助手保持的键盘/鼠标按键"
+        return None
 
-    def begin(self) -> bool:
+    def _intervened(self, allowed: set[int]) -> bool:
+        return self._intervention_reason(allowed) is not None
+
+    def begin(self, *, allow_focus: bool = True) -> bool:
         with self.lock:
             self.check()
             if self.cancelled():
@@ -163,10 +172,12 @@ class HybridMovement:
             if not self.desktop.idle():
                 return False
             self.original = self.desktop.foreground()
+            # 战斗转向只能借用已经在前台的游戏，不能在检查与申请之间抢回焦点。
+            if not allow_focus and self.original != self.hwnd:
+                return False
             self.original_pid = self.desktop.pid(self.original)
             if not self.desktop.valid(self.original, self.original_pid):
                 return False
-            self.cursor_at_start = self.desktop.cursor()
             self.user_intervened = False
             self.active = True
             self.started = self.heartbeat_at = self.clock()
@@ -217,6 +228,8 @@ class HybridMovement:
             # 每次真正 keydown 前检查焦点与身份；焦点切换与 SendInput 仍非原子操作。
             if self.desktop.foreground() != self.hwnd or not self.desktop.valid(self.hwnd, self.pid):
                 raise OSError("混合后台移动前焦点变化")
+            if vk in self.skill_held:
+                raise OSError("移动按键与正在保持的技能键冲突")
             if vk not in self.held:
                 self.held[vk] = self.clock() + self.MAX_KEY_SECONDS
                 try:
@@ -233,7 +246,35 @@ class HybridMovement:
             if vk in self.held:
                 # 必须先释放本模块注入的状态，再允许恢复其它窗口。
                 self.send(vk, True)
+                # SendInput 返回后异步键状态可能尚未反映 keyup；只给刚成功释放
+                # 的本助手按键一个有界同步窗口，不忽略其它按键、鼠标或焦点变化。
+                self.releasing[vk] = self.clock() + self.KEYUP_SETTLE_SECONDS
                 self.held.pop(vk, None)
+
+    def skill_input(self, vk: int, key_up: bool, *, repeat: bool = False) -> None:
+        """已在前台的普通按键，不激活窗口、不创建移动租约。"""
+        with self.lock:
+            if key_up:
+                if vk in self.skill_held:
+                    self.send(vk, True)
+                    self.skill_held.remove(vk)
+                    self.releasing[vk] = self.clock() + self.KEYUP_SETTLE_SECONDS
+                return
+            self.check()
+            if repeat and self.cancelled():
+                raise OSError("混合后台持续拾取已取消")
+            if self.active:
+                self.poll()
+                self.check()
+            if not self.desktop.valid(self.hwnd, self.pid) or self.desktop.foreground() != self.hwnd:
+                raise OSError("混合后台技能发送前焦点或窗口身份变化")
+            if vk in self.held:
+                raise OSError("技能按键与正在保持的移动键冲突")
+            if vk not in self.skill_held:
+                self.skill_held.add(vk)  # 发送前登记，失败时也必须尝试补偿抬键。
+                self.send(vk, False)
+            elif repeat:
+                self.send(vk, False)
 
     def poll(self) -> None:
         with self.lock:
@@ -246,9 +287,9 @@ class HybridMovement:
             elif not self.desktop.valid(self.hwnd, self.pid):
                 self.user_intervened = True
                 reason = "游戏窗口身份变化"
-            elif self._intervened({self.hwnd}):
+            elif (intervention := self._intervention_reason({self.hwnd})) is not None:
                 self.user_intervened = True
-                reason = "检测到用户操作或焦点变化"
+                reason = intervention
             elif now - self.started > self.MAX_LEASE_SECONDS:
                 reason = "临时前台移动超过 4 秒"
             elif now - self.heartbeat_at > self.HEARTBEAT_SECONDS:
@@ -289,6 +330,12 @@ class HybridMovement:
                 except OSError as exc:
                     released = False
                     self.error = f"混合后台抬键失败，请手动释放移动键：{exc}"
+            for vk in list(self.skill_held):
+                try:
+                    self.skill_input(vk, True)
+                except OSError as exc:
+                    released = False
+                    self.error = f"混合后台技能抬键失败：{exc}"
             if not self.active:
                 return
             self.active = False

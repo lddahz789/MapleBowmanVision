@@ -15,6 +15,7 @@ from mbv.paths import CLASSIC_PROFILE, LOG_DIR, profile_key_from_config
 from mbv.strategies import normalize_strategy_config
 from mbv.template_store import list_monster_categories, template_roots_from_config
 from mbv.vision import MINIMAP_REGION_SPACE, attack_box_from_config
+from mbv.verification_alert import normalize_alert_settings
 
 class SessionLog:
     def __init__(self) -> None:
@@ -111,6 +112,7 @@ def load_config(path: Path) -> dict[str, Any]:
         raise RuntimeError("不支持的配置文件版本")
     config.setdefault("profile", CLASSIC_PROFILE)
     config["profile"] = profile_key_from_config(config)
+    config["verification_alert"] = normalize_alert_settings(config.get("verification_alert"))
     config.setdefault("window", {})
     config["window"].setdefault("topmost_while_armed", True)
     performance_monitor = config.get("performance_monitor")

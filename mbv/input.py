@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+from dataclasses import dataclass
 import threading
 import time
 from typing import Any
@@ -157,6 +158,14 @@ def window_is_foreground(hwnd: int) -> bool:
     return foreground == root or bool(user32.IsChild(root, foreground))
 
 
+@dataclass(frozen=True)
+class _HybridPress:
+    channel: str
+    hwnd: int
+    root: int
+    pid: int
+
+
 class Keyboard:
     def __init__(self, delivery: str = "foreground") -> None:
         if delivery not in {"foreground", "background", "window_message", "hybrid"}:
@@ -166,11 +175,14 @@ class Keyboard:
         self.hwnd = 0
         self.held: set[int] = set()
         self._hardware_down: set[int] = set()
+        self._hybrid_presses: dict[int, _HybridPress] = {}
+        self.last_skill_channel: str | None = None
         self._lock = threading.RLock()
         self._repeat_stop = threading.Event()
         self._repeat_thread: threading.Thread | None = None
         self._movement_pulses: dict[int, tuple[bool, float]] = {}
         self._movement_deadlines: dict[int, float] = {}
+        self._hold_repeat_at: dict[int, float] = {}
         self._repeat_error: OSError | None = None
         self.hybrid = None
         if delivery == "hybrid":
@@ -179,7 +191,11 @@ class Keyboard:
 
     def bind_window(self, hwnd: int) -> None:
         if self.hybrid is not None:
+            self.release_all()
+            if self._hybrid_presses:
+                raise OSError("混合后台按键尚未释放，不能重新绑定窗口")
             self.hybrid.bind(int(hwnd))
+            self._repeat_error = None
         self.root_hwnd = int(hwnd)
         self.hwnd = resolve_input_hwnd(hwnd)
 
@@ -203,6 +219,10 @@ class Keyboard:
             with self._lock:
                 if stop.is_set():
                     return
+                try:
+                    self._poll_hybrid_presses()
+                except OSError as exc:
+                    self._repeat_error = exc
                 for vk in list(self.held):
                     try:
                         self._repeat_key(vk, time.monotonic())
@@ -215,6 +235,19 @@ class Keyboard:
         if vk in self._movement_deadlines and now >= self._movement_deadlines[vk]:
             self.up(VK_BY_CODE[vk])
             return
+        if vk in self._hold_repeat_at:
+            if self._repeat_error is not None:
+                self.up(VK_BY_CODE[vk])
+                return
+            if now >= self._hold_repeat_at[vk]:
+                try:
+                    self._repeat_hold(vk)
+                except OSError:
+                    self.up(VK_BY_CODE[vk])
+                    raise
+                if vk in self.held:
+                    self._hold_repeat_at[vk] = now + 0.1
+            return
         if self.delivery == "foreground":
             return
         pulse = self._movement_pulses.get(vk)
@@ -226,6 +259,36 @@ class Keyboard:
             return
         self._dispatch(vk, key_up=is_down, was_down=is_down)
         self._movement_pulses[vk] = (not is_down, now + (0.05 if is_down else 0.10))
+
+    def _repeat_hold(self, vk: int) -> None:
+        """仅持续拾取补自动重复 keydown，不松键、不改变普通攻击/移动的重复行为。"""
+        if self.hybrid is not None:
+            self._poll_hybrid_presses()
+            press = self._hybrid_presses.get(vk)
+            if press is None:
+                return
+            if self.hybrid.cancelled():
+                self.up(VK_BY_CODE[vk])
+                return
+            if press.channel == "hardware":
+                self.hybrid.skill_input(vk, False, repeat=True)
+            else:
+                self._hybrid_message(press, vk, False, True)
+        elif self.delivery == "window_message":
+            self._dispatch(vk, False, was_down=True)
+        elif self.delivery == "foreground":
+            if not window_is_foreground(self.root_hwnd or self.hwnd):
+                self.up(VK_BY_CODE[vk])
+                return
+            self._send_input(vk, False)
+        else:
+            # 兼容后台原本就允许全局扫描码，并在失焦时补窗口消息。
+            if not window_is_foreground(self.root_hwnd or self.hwnd):
+                try:
+                    self._post(vk, False, was_down=True)
+                except OSError:
+                    pass
+            self._send_input(vk, False)
 
     def check_health(self) -> None:
         with self._lock:
@@ -252,8 +315,8 @@ class Keyboard:
                 self._movement_deadlines[code] = time.monotonic() + max(0.03, min(0.5, seconds))
             self._ensure_repeat_thread()
 
-    def prepare_movement(self) -> bool:
-        return self.hybrid is None or self.hybrid.begin()
+    def prepare_movement(self, *, allow_focus: bool = True) -> bool:
+        return self.hybrid is None or self.hybrid.begin(allow_focus=allow_focus)
 
     def movement_tap(self, key: str, seconds: float = 0.035) -> None:
         if self.hybrid is None:
@@ -333,8 +396,83 @@ class Keyboard:
         if sent != 1:
             raise OSError("键盘输入发送失败")
 
+    def _hybrid_message(self, press: _HybridPress, vk: int, key_up: bool, was_down: bool) -> None:
+        if (self.hybrid.desktop.pid(press.root) != press.pid
+                or (not key_up and not self.hybrid.desktop.valid(press.root, press.pid))):
+            if key_up:
+                return  # 原进程已消失，不能向复用的 HWND 发消息。
+            raise OSError("混合后台按键目标身份已变化")
+        if (not press.hwnd or not user32.IsWindow(press.hwnd)
+                or self.hybrid.desktop.pid(press.hwnd) != press.pid):
+            if key_up:
+                return
+            raise OSError("混合后台按键窗口已失效")
+        if not user32.PostMessageW(press.hwnd, WM_KEYUP if key_up else WM_KEYDOWN,
+                                   vk, key_lparam(vk, key_up, was_down=was_down)):
+            raise OSError("混合后台窗口按键投递失败")
+
+    def _dispatch_hybrid(self, vk: int, key_up: bool, was_down: bool) -> None:
+        # 调用者持键盘锁；抬键必须沿按下时的通道，不能按新焦点重新路由。
+        press = self._hybrid_presses.get(vk)
+        if key_up:
+            if press is not None:
+                if press.channel == "hardware":
+                    self.hybrid.skill_input(vk, True)
+                else:
+                    self._hybrid_message(press, vk, True, True)
+                self._hybrid_presses.pop(vk, None)
+            return
+        self.check_health()
+        if press is not None:
+            if press.channel == "message":
+                self._hybrid_message(press, vk, False, True)
+            # 扫描码只保持，不反复全局 keydown；失焦由巡检和最终抬键清理。
+            return
+        guard = self.hybrid
+        if not guard.desktop.valid(guard.hwnd, guard.pid):
+            raise OSError("混合后台按键目标身份已变化")
+        press = _HybridPress("hardware" if guard.desktop.foreground() == guard.hwnd else "message",
+                             self.hwnd, guard.hwnd, guard.pid)
+        self._hybrid_presses[vk] = press
+        try:
+            if press.channel == "hardware":
+                guard.skill_input(vk, False)
+            else:
+                self._hybrid_message(press, vk, False, was_down)
+            if press.channel != self.last_skill_channel:
+                self.last_skill_channel = press.channel
+                with guard.lock:
+                    guard.events.append(("hybrid_skill_channel", press.channel))
+            self._ensure_repeat_thread()
+        except BaseException as exc:
+            self._repeat_error = exc if isinstance(exc, OSError) else OSError(f"混合后台按键中断：{exc}")
+            try:
+                self._dispatch_hybrid(vk, True, True)
+            except BaseException:
+                pass  # 保留记录，暂停/退出时继续抬键，禁止换通道重发。
+            raise
+
+    def _poll_hybrid_presses(self) -> None:
+        if self.hybrid is None:
+            return
+        guard = self.hybrid
+        for vk, press in list(self._hybrid_presses.items()):
+            if press.channel == "hardware" and (
+                guard.desktop.foreground() != press.root
+                or not guard.desktop.valid(press.root, press.pid)
+                or vk not in guard.skill_held
+            ):
+                self._dispatch_hybrid(vk, True, True)
+                self.held.discard(vk)
+                self._movement_deadlines.pop(vk, None)
+                self._hold_repeat_at.pop(vk, None)
+
     def _dispatch(self, vk: int, key_up: bool, *, was_down: bool = False) -> None:
-        if self.delivery in {"window_message", "hybrid"}:
+        if self.delivery == "hybrid":
+            with self._lock:
+                self._dispatch_hybrid(vk, key_up, was_down)
+            return
+        if self.delivery == "window_message":
             # 实验模式只向一个已绑定窗口排队，不重复 SendMessage、不发 WM_CHAR，
             # 也不伪造焦点事件或回退到全局扫描码。
             if not self.hwnd or not user32.IsWindow(self.hwnd):
@@ -375,6 +513,18 @@ class Keyboard:
             self.held.add(code)
             self._ensure_repeat_thread()
 
+    def hold(self, key: str, seconds: float = 0.8) -> None:
+        """跨帧续期的长按，显式模拟自动重复；仅结束/中断/超时才抬键。"""
+        code = vk_for(key)
+        with self._lock:
+            self._poll_hybrid_presses()
+            self.down(key)
+            now = time.monotonic()
+            self._movement_deadlines[code] = now + max(0.1, min(0.8, seconds))
+            self._hold_repeat_at.setdefault(code, now + 0.1)
+            # 前台 down 时还没有 deadline，不会启动线程；必须在登记后启动。
+            self._ensure_repeat_thread()
+
     def up(self, key: str) -> None:
         code = vk_for(key)
         if self.hybrid is not None:
@@ -386,9 +536,29 @@ class Keyboard:
             self.held.discard(code)
             self._movement_pulses.pop(code, None)
             self._movement_deadlines.pop(code, None)
+            self._hold_repeat_at.pop(code, None)
 
     def tap(self, key: str, seconds: float = 0.035) -> None:
         code = vk_for(key)
+        if self.hybrid is not None:
+            with self._lock:
+                if code in self._hybrid_presses:
+                    raise OSError("同一按键正在保持，不能叠加点按")
+                self._dispatch(code, False)
+                press = self._hybrid_presses[code]
+            try:
+                time.sleep(max(0.01, seconds))
+            finally:
+                with self._lock:
+                    # 暂停/失焦已释放旧点按后，不能抬掉新会话的同名按键。
+                    if self._hybrid_presses.get(code) is press:
+                        try:
+                            self._dispatch(code, True, was_down=True)
+                        except OSError as exc:
+                            self._repeat_error = exc
+                            raise
+            self.check_health()
+            return
         try:
             self._dispatch(code, False)
             time.sleep(max(0.01, seconds))
@@ -415,7 +585,14 @@ class Keyboard:
             self.held.clear()
             self._movement_pulses.clear()
             self._movement_deadlines.clear()
-            self._repeat_error = None
+            self._hold_repeat_at.clear()
+            for code in list(self._hybrid_presses):
+                try:
+                    self._dispatch(code, True, was_down=True)
+                except OSError as exc:
+                    self._repeat_error = exc
+            if self.hybrid is None:
+                self._repeat_error = None
             self._release_hardware()
             thread = self._repeat_thread
             self._repeat_thread = None

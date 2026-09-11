@@ -740,7 +740,7 @@ class AutoPotionTests(unittest.TestCase):
                 instance.keyboard.tap.assert_not_called()
 
     def test_keyboard_tap_releases_key_when_wait_is_interrupted(self):
-        keyboard = Keyboard.__new__(Keyboard)
+        keyboard = Keyboard()
         keyboard._dispatch = MagicMock()
         code = vk_for("home")
 
@@ -754,7 +754,7 @@ class AutoPotionTests(unittest.TestCase):
         )
 
     def test_keyboard_tap_attempts_keyup_when_keydown_partially_fails(self):
-        keyboard = Keyboard.__new__(Keyboard)
+        keyboard = Keyboard()
         keyboard._dispatch = MagicMock(side_effect=[RuntimeError("partial down"), None])
         code = vk_for("home")
 

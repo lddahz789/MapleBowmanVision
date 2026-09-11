@@ -124,6 +124,25 @@ class BuffPreparationTests(unittest.TestCase):
         self.assertIsNone(self.bot.buff_preparation)
         self.assertEqual(self.bot.auto_buff.last_cast_at, {})
 
+    def test_only_movement_bound_buff_invalidates_facing_when_sent(self):
+        for key, expected in (("a", "left"), ("right", None)):
+            with self.subTest(key=key):
+                self.bot.auto_buff = AutoBuffController()
+                self.bot.buff_preparation = None
+                self.bot.attack_turn_direction = "left"
+                self.bot.config["buffs"]["buff_1"]["key"] = key
+                self.bot._try_auto_buff(10.)
+                self.assertEqual(self.bot.attack_turn_direction, "left")
+                with patch("mbv.bot.user32.IsWindow", return_value=True), \
+                     patch("mbv.bot.user32.IsIconic", return_value=False), \
+                     patch("mbv.bot.user32.GetForegroundWindow", return_value=123), \
+                     patch("mbv.bot.time.monotonic", return_value=11.):
+                    self.bot._try_auto_buff(11.)
+                    self.assertEqual(self.bot.attack_turn_direction, expected)
+                    self.bot._try_auto_buff(11.1)  # 保护窗口不额外重置方向。
+                    self.assertEqual(self.bot.attack_turn_direction, expected)
+                self.bot.keyboard.tap.assert_called_with(key, .18)
+
     def test_changed_key_restarts_preparation(self):
         self.bot._try_auto_buff(10)
         self.bot.config["buffs"]["buff_1"]["key"] = "b"

@@ -2,6 +2,10 @@
   "version": 1,
   "profile": "classic",
   "calibrated": false,
+  "verification_alert": {
+    "enabled": false,
+    "chat_region": {"x": 0.0, "y": 0.65, "w": 0.5, "h": 0.27}
+  },
   "window": {
     "exact_titles": [
       "冒险岛怀旧服",

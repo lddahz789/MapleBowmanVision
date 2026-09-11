@@ -20,6 +20,7 @@ STATE_STOPPED = "stopped"
 
 STAGE_ORDER = (
     "capture",
+    "verification_alert",
     "preprocess",
     "monster",
     "player",
@@ -29,6 +30,7 @@ STAGE_ORDER = (
 )
 STAGE_LABELS = {
     "capture": "截图",
+    "verification_alert": "验证提醒",
     "preprocess": "预处理",
     "monster": "怪物",
     "player": "玩家",

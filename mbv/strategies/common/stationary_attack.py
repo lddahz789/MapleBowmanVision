@@ -13,7 +13,10 @@ from mbv.strategies.base import (
     TargetSelectionContext,
     valid_point,
 )
-from mbv.vision import choose_nearest_bidirectional_target
+from mbv.vision import (
+    attack_rect_from_player, choose_nearest_bidirectional_target,
+    player_anchor_center, point_in_attack_rect,
+)
 from mbv.strategies.melee import bounded_number, choose_melee_skill, normalize_melee_settings
 
 
@@ -26,7 +29,7 @@ class StationaryAttackStrategy:
         "仅在目标换边时转向后原地攻击；目标贴近时使用近身技能，远离后恢复普通攻击。"
         "近身距离按怪物宽度自动换算。平时偏离小地图安全点也优先回位；"
         "每隔 45 秒向右短走一步，确认位移并回位后再继续输出。"
-        "可开启同平台定时路线拾取：去程遇怪先攻击，返程优先回安全点。"
+        "可开启同平台定时路线拾取：去程与返程均先原地清怪，再继续行进。"
     )
     required_recognition_data = ("platform_center",)
     toggle_fields = (StrategyToggleField("route_pickup_enabled", "定时路线拾取（同平台）", live_preview=True),)
@@ -157,10 +160,54 @@ class StationaryAttackStrategy:
             attack_key=melee_key, attack_skill="melee" if melee_key else "single",
         )
 
+    def _route_combat(self, context: StrategyActionContext, player_x: float,
+                      state: dict[str, Any]) -> StrategyDecision | None:
+        """只清理当前有效目标；短暂无目标先等待，不追怪、不宣称确认死亡。"""
+        if context.action_interrupted:
+            state.pop("combat_side_missing_since", None)
+        if context.target_box is not None:
+            state["combat_pending"] = True
+            state.pop("combat_clear_since", None)
+            state.pop("dwell_tick_at", None)
+            # 最近目标每帧可能左右互换。路线清怪先清当前侧，不能把另一侧
+            # 稍近一点解释成必须立即转身；只使用本帧索敌区内的有效检测。
+            boxes = [d.box for d in context.eligible_detections]
+            if context.target_box not in boxes:
+                boxes.append(context.target_box)
+            px = player_x * max(1, context.combat_width)
+            side = state.get("combat_side")
+            same_side = [box for box in boxes if
+                         ("left" if box[0] + box[2] / 2 < px else "right") == side]
+            target = context.target_box
+            if same_side:
+                target = min(same_side, key=lambda box: abs(box[0] + box[2] / 2 - px))
+                state.pop("combat_side_missing_since", None)
+            elif side is not None:
+                missing = state.setdefault("combat_side_missing_since", context.now)
+                if context.now - missing < 0.4:
+                    return StrategyDecision("stop", "PICKUP_CLEAR_WAIT", runtime_state=state)
+                state.pop("combat_side_missing_since", None)
+            state["combat_side"] = "left" if target[0] + target[2] / 2 < px else "right"
+            return replace(self._attack(replace(context, target_box=target), player_x),
+                           runtime_state=state, face_tap_seconds=0.08)
+        if state.get("combat_pending"):
+            state.pop("dwell_tick_at", None)
+            clear_since = state.setdefault("combat_clear_since", context.now)
+            if context.now - clear_since < 0.4:
+                return StrategyDecision("stop", "PICKUP_CLEAR_WAIT", runtime_state=state)
+            state.pop("combat_pending", None)
+            state.pop("combat_clear_since", None)
+            state.pop("combat_side", None)
+            state.pop("combat_side_missing_since", None)
+        return None
+
     def _route(self, context: StrategyActionContext, player_x: float,
                home: bool, same_level: bool, tolerance: float
                ) -> tuple[StrategyDecision | None, dict[str, Any]]:
         state = dict(context.runtime_state)
+        if context.minimap_only or context.action_interrupted:
+            state.pop("combat_clear_since", None)
+            state.pop("combat_side_missing_since", None)
         phase = state.get("phase", "idle")
         enabled = bool(context.settings.get("route_pickup_enabled", False))
         point = context.recognition.get("stationary_pickup_point")
@@ -232,17 +279,33 @@ class StationaryAttackStrategy:
                     state.update(phase="returning", return_reason=reason)
                     phase = "returning"
         if phase == "returning":
+            # 返程清怪时短暂丢视觉也先停走；不能绕过去程已有的丢失宽限，
+            # 一帧小地图补位就插入反向回家键，随后又继续攻击。
+            if (context.minimap_only and enabled and valid and same_level
+                    and state.get("combat_pending")
+                    and state.get("return_reason") not in {
+                        "disabled", "point_invalid", "off_platform", "localization_timeout"}
+                    and context.localization_lost_seconds < bounded_number(
+                        context.settings.get("route_pickup_visual_grace_seconds"), 1., .2, 3.)):
+                return StrategyDecision("stop", "PICKUP_WAIT_LOCALIZATION", runtime_state=state), state
+            # 正常完成和计时到期的返程仍先清怪；取消/定位异常/掉层等安全返程不拦截。
+            if (enabled and valid and same_level and not context.minimap_only
+                    and state.get("return_reason") not in {
+                        "disabled", "point_invalid", "off_platform", "localization_timeout"}):
+                combat = self._route_combat(context, player_x, state)
+                if combat is not None:
+                    return combat, state
             if home:
                 return StrategyDecision(
                     "stop", "PICKUP_RETURNED", reset_periodic_step=bool(state.get("departed")),
                     runtime_state={"phase": "idle", "last_completed_at": context.now,
                                    "return_reason": state.get("return_reason", "collected")},
                 ), state
-            return None, state  # 复用平台回位（包括掉层），不选怪、不发攻击键。
+            return None, state  # 清怪完成或安全中止后，复用平台回位（包括掉层）。
         assert context.marker is not None
-        if context.target_box is not None:
-            state.pop("dwell_tick_at", None)  # 清怪只暂停有效拾取累计，不冒充拾取时间。
-            return replace(self._attack(context, player_x), runtime_state=state), state
+        combat = self._route_combat(context, player_x, state)
+        if combat is not None:
+            return combat, state
         delta = point["x"] - context.marker[0]
         if abs(delta) > tolerance:
             state["phase"] = "outbound"
@@ -277,7 +340,16 @@ class StationaryAttackStrategy:
             raw_box=context.player_raw_box,
             player_anchor=context.player_anchor,
         )
-        return TargetSelection(target=target, chase_target=None)
+        eligible = ()
+        if context.player_box is not None:
+            anchor = context.player_anchor or player_anchor_center(
+                context.player_box, context.player_raw_box)
+            rects = [attack_rect_from_player(anchor, context.scene_width, context.scene_height,
+                                            context.target_area, side) for side in ("left", "right")]
+            eligible = tuple(d for d in context.detections if any(
+                point_in_attack_rect(d.box[0] + d.box[2] / 2, d.box[1] + d.box[3] / 2, rect)
+                for rect in rects))
+        return TargetSelection(target=target, chase_target=None, eligible_detections=eligible)
 
     def decide(self, context: StrategyActionContext) -> StrategyDecision:
         if context.marker is None or (context.player_box is None and not context.minimap_only):
