@@ -7,6 +7,8 @@ from mbv.strategies.base import CombatStrategy, valid_point
 from mbv.strategies.bowman.dynamic import BowmanDynamicStrategy
 from mbv.strategies.common.stationary_attack import StationaryAttackStrategy
 from mbv.strategies.thief.throwing_star import ThrowingStarSafeStrategy
+from mbv.strategies.regions import normalize_target_regions
+from mbv.strategies.warrior import DragonRoarStrategy
 
 DEFAULT_STRATEGY = "bowman_dynamic"
 _REGISTRY: dict[str, CombatStrategy] = {}
@@ -51,7 +53,7 @@ def missing_recognition_data(config: dict[str, Any], strategy: CombatStrategy) -
             captured = settings.get(field.settings_path)
             has_enabled_item = bool(
                 isinstance(captured, list)
-                and any(isinstance(item, dict) and bool(item.get("enabled", True)) for item in captured)
+                and any(item["enabled"] for item in normalize_target_regions(captured))
             )
         else:
             has_enabled_item = bool(recognition.get(f"{field.recognition_key}_captured"))
@@ -60,8 +62,7 @@ def missing_recognition_data(config: dict[str, Any], strategy: CombatStrategy) -
                     and recognition.get(f"{field.recognition_key}_space") == field.coordinate_space
                     and valid_point(recognition.get(field.recognition_key)))
         if (
-            field.enable_setting
-            and bool(settings.get(field.enable_setting))
+            (field.required or (field.enable_setting and bool(settings.get(field.enable_setting))))
             and not has_enabled_item
             and field.recognition_key not in missing
         ):
@@ -101,6 +102,7 @@ def normalize_strategy_config(config: dict[str, Any]) -> None:
 register_strategy(BowmanDynamicStrategy())
 register_strategy(StationaryAttackStrategy())
 register_strategy(ThrowingStarSafeStrategy())
+register_strategy(DragonRoarStrategy())
 
 
 __all__ = [

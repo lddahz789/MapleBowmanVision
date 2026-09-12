@@ -75,6 +75,7 @@ class StrategyCaptureField:
     multiple: bool = False
     coordinate_space: str = "combat"
     capture_kind: Literal["rectangle", "point"] = "rectangle"
+    required: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,8 @@ class TargetSelectionContext:
     target_area: dict[str, float]
     settings: dict[str, Any]
     previous_attack_skill: str | None = None
+    # False 表示 detections 仅为视觉短暂保留值，不能用于精确数量触发。
+    detections_fresh: bool = True
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,7 @@ class StrategyDecision:
         "stop",
         "face",
         "attack",
+        "cast",
         "chase",
         "move",
         "jump",
@@ -162,6 +166,8 @@ class StrategyDecision:
     reset_periodic_step: bool = False
     pickup_interval_seconds: float | None = None
     cooperative_movement: bool = False
+    # 无方向施法的独立最短间隔，由公共执行器按实际发送时间限频。
+    attack_interval_seconds: float | None = None
 
 
 class CombatStrategy(Protocol):

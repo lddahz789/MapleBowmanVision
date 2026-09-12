@@ -594,10 +594,11 @@ class CoreTests(unittest.TestCase):
         strategies = list_strategies()
         self.assertEqual(
             [item.display_name for item in strategies],
-            ["弓箭手动态", "原地攻击", "标飞安全输出"],
+            ["弓箭手动态", "原地攻击", "标飞安全输出", "龙咆哮·定点"],
         )
         self.assertTrue(all(item.description for item in strategies))
-        bowman, stationary, throwing_star = strategies
+        bowman, stationary, throwing_star, dragon_roar = strategies
+        self.assertTrue(all(field.required for field in dragon_roar.capture_fields))
         self.assertIn("platform_center", bowman.required_recognition_data)
         self.assertIn("platform_center", stationary.required_recognition_data)
         self.assertEqual(throwing_star.required_recognition_data, ())
@@ -2859,42 +2860,62 @@ class CoreTests(unittest.TestCase):
         instance.bot.apply_config.assert_called_once()
 
     def test_running_panel_persists_common_and_strategy_settings_before_restart(self):
+        import tkinter as tk
         from mbv.panel import ControlPanel
 
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.json"
             path.write_text(json.dumps(self.config), encoding="utf-8")
-            with patch.object(ControlPanel, "_run_bot", lambda _self: None):
+            hidden_root = tk.Tk()
+            hidden_root.withdraw()
+            with (
+                patch("mbv.panel.tk.Tk", return_value=hidden_root),
+                patch("mbv.panel.configure_app_identity", return_value=True),
+                patch("mbv.panel.RuntimeOverlay"),
+                patch("mbv.panel._top_level_hwnd", return_value=0),
+                patch("mbv.panel._exclude_from_capture"),
+                patch("mbv.panel.prevent_window_activate"),
+                patch("mbv.panel.window_candidates", return_value=[]),
+                patch("mbv.bot.Keyboard"),
+                patch("mbv.bot.SessionLog"),
+                patch("mbv.bot.load_templates", return_value=[]),
+                patch.object(ControlPanel, "_run_bot", lambda _self: None),
+            ):
                 panel = ControlPanel(path, enable_input=False)
-            panel.bot.armed = True
-            changes = {
-                "behavior.attack_interval_seconds": "0.31",
-                "targeting.box.forward": "0.41",
-                "strategy.options.bowman_dynamic.platform_center_tolerance": "0.21",
-                "strategy.options.bowman_dynamic.aoe_skill_key": "A",
-                "strategy.options.bowman_dynamic.aoe_cluster_distance_multiplier": "1.25",
-            }
-            for key, value in changes.items():
-                entry = (
-                    panel._entries.get(key)
-                    or panel._targeting_entries.get(key)
-                    or panel._strategy_entries.get(key)
-                )
-                entry.delete(0, "end")
-                entry.insert(0, value)
-            panel.hp_threshold_percent.set(42)
-            panel.mp_threshold_percent.set(33)
-            panel.fallback_patrol.set(True)
-            panel.pickup_lost.set(True)
-            panel.minimap_assist.set(False)
+            try:
+                self.assertEqual(panel.root.state(), "withdrawn")
+                panel.bot.armed = True
+                changes = {
+                    "behavior.attack_interval_seconds": "0.31",
+                    "targeting.box.forward": "0.41",
+                    "strategy.options.bowman_dynamic.platform_center_tolerance": "0.21",
+                    "strategy.options.bowman_dynamic.aoe_skill_key": "A",
+                    "strategy.options.bowman_dynamic.aoe_cluster_distance_multiplier": "1.25",
+                }
+                for key, value in changes.items():
+                    entry = (
+                        panel._entries.get(key)
+                        or panel._targeting_entries.get(key)
+                        or panel._strategy_entries.get(key)
+                    )
+                    entry.delete(0, "end")
+                    entry.insert(0, value)
+                panel.hp_threshold_percent.set(42)
+                panel.mp_threshold_percent.set(33)
+                panel.fallback_patrol.set(True)
+                panel.pickup_lost.set(True)
+                panel.minimap_assist.set(False)
 
-            self.assertTrue(
-                panel._persist_settings(apply_runtime=False, notify=False, show_error=False)
-            )
-            self.assertTrue(panel.bot.armed)
-            reloaded = bot.load_config(path)
-            panel.overlay.close()
-            panel.root.destroy()
+                self.assertTrue(
+                    panel._persist_settings(apply_runtime=False, notify=False, show_error=False)
+                )
+                self.assertTrue(panel.bot.armed)
+                reloaded = bot.load_config(path)
+            finally:
+                panel.overlay.close()
+                for after_id in panel.root.tk.splitlist(panel.root.tk.call("after", "info")):
+                    panel.root.tk.call("after", "cancel", after_id)
+                panel.root.destroy()
 
         self.assertEqual(reloaded["behavior"]["attack_interval_seconds"], 0.31)
         self.assertEqual(reloaded["targeting"]["box"]["forward"], 0.41)

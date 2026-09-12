@@ -999,6 +999,7 @@ class PanelPotionTests(unittest.TestCase):
 
         panel = ControlPanel.__new__(ControlPanel)
         panel.busy = False
+        panel._target_ready = MagicMock(return_value=True)
         panel.bot = MagicMock()
         panel.auto_potion_enabled = MagicMock()
 

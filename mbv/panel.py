@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import nullcontext
 from pathlib import Path
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import font as tkfont, messagebox, simpledialog, ttk
 from typing import Any, Callable
 
 from PIL import Image, ImageTk
 
+from mbv.app_icon import configure_app_identity, install_app_icon
 from mbv.bot import STATE_LABELS, BowmanBot
 from mbv.calibrate import (
     calibrate,
@@ -32,6 +34,13 @@ from mbv.config import load_config, save_config, template_counts
 from mbv.input import input_delivery, vk_for
 from mbv.overlay import RuntimeOverlay, _exclude_from_capture, _top_level_hwnd, prevent_window_activate
 from mbv.performance import format_performance_summary
+from mbv.panel_theme import (
+    ACCENT, ACCENT_HOVER, ACCENT_SOFT, ARMED, BG, BORDER, BUTTON_ACTIVE, BUTTON_BG,
+    DANGER_HOVER,
+    ENTRY_BG, FG, FONT, FONT_SECTION, FONT_SMALL, FONT_TITLE, MUTED,
+    PANEL, SUCCESS, WARNING, install_theme, style_button,
+)
+from mbv.panel_widgets import RoundedButton, RoundedCard
 from mbv.strategies import active_strategy, get_strategy, list_strategies
 from mbv.strategies.base import StrategyCaptureField
 from mbv.template_store import (
@@ -43,22 +52,14 @@ from mbv.template_store import (
     trash_monster_category,
     trash_template,
 )
+from mbv.window import (
+    WindowTarget,
+    resolve_window_target,
+    selected_window,
+    validate_window_target,
+    window_candidates,
+)
 
-BG = "#080d12"
-PANEL = "#101820"
-ENTRY_BG = "#070b0f"
-FG = "#f2f2f2"
-MUTED = "#8b9aa8"
-ACCENT = "#18d1ff"
-SUCCESS = "#4cff79"
-WARNING = "#ffd84a"
-ARMED = "#ff4545"
-BUTTON_BG = "#17232d"
-BUTTON_ACTIVE = "#213542"
-FONT = ("Microsoft YaHei UI", 10)
-FONT_TITLE = ("Microsoft YaHei UI", 14, "bold")
-FONT_SECTION = ("Microsoft YaHei UI", 11, "bold")
-FONT_SMALL = ("Microsoft YaHei UI", 9)
 DELIVERY_LABELS = {
     "foreground": "前台按键",
     "background": "兼容后台（全局按键）",
@@ -117,14 +118,17 @@ class ControlPanel:
         self.config_path = config_path
         config = load_config(config_path)
         self.profile_label = "NewMaple" if config["profile"] == "newmaple" else "怀旧服"
+        configure_app_identity()
         self.root = tk.Tk()
+        install_app_icon(self.root)
+        install_theme(self.root)
         self.root.title(f"MapleBowmanVision — {self.profile_label}")
         self.root.configure(bg=BG)
         self.root.minsize(560, 720)
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        width = min(640, max(560, screen_w - 80))
-        height = min(980, max(720, screen_h - 100))
+        width = min(720, max(560, screen_w - 80))
+        height = min(900, max(720, screen_h - 100))
         left = max(20, screen_w - width - 20)
         self.root.geometry(f"{width}x{height}+{left}+20")
         self.root.wm_attributes("-topmost", False)
@@ -134,9 +138,17 @@ class ControlPanel:
         prevent_window_activate(panel_hwnd)
 
         self.bot = BowmanBot(config, input_authorized=enable_input)
+        self._input_authorized = enable_input
         self.overlay = RuntimeOverlay(self.root)
         self.overlay.set_exit_handler(self.quit)
         self.worker_errors: list[BaseException] = []
+        self.worker: threading.Thread | None = None
+        self._selected_target: WindowTarget | None = None
+        self._pending_target: WindowTarget | None = None
+        self._stopping_session = False
+        self._closing = False
+        self._window_lookup: dict[str, WindowTarget] = {}
+        self._connection_message = "先选择作用窗口，再点击连接；原配置已作为默认值。"
         self.busy = False
         self._loading_settings = True
         self._autosave_after_id: str | None = None
@@ -146,7 +158,12 @@ class ControlPanel:
         self._performance_interval_ms = int(
             round(float(performance_monitor["refresh_interval_seconds"]) * 1000)
         )
-        self.status = tk.StringVar(value="正在连接游戏窗口…")
+        self.status = tk.StringVar(value="等待选择窗口")
+        self.run_badge = tk.StringVar(value="未连接")
+        self.run_metrics = tk.StringVar(value="连接窗口后显示运行状态")
+        self.run_notice = tk.StringVar(value="")
+        self.window_choice = tk.StringVar(value="")
+        self.window_hint = tk.StringVar(value=self._connection_message)
         self.counts = tk.StringVar(value="")
         self.performance_visible = tk.BooleanVar(value=bool(performance_monitor["visible"]))
         self.performance_text = tk.StringVar(value="等待性能数据…")
@@ -200,8 +217,8 @@ class ControlPanel:
         self._loading_settings = False
         self.root.after_idle(lambda: self._capture_canvas.yview_moveto(0))
 
-        self.worker = threading.Thread(target=self._run_bot, name="MapleVisionWorker", daemon=False)
-        self.worker.start()
+        self._refresh_windows()
+        self.overlay.hide()
         self.overlay.start_polling()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self._schedule_performance_refresh(delay_ms=0)
@@ -209,92 +226,264 @@ class ControlPanel:
 
     def _run_bot(self) -> None:
         try:
-            self.bot.run(self.overlay)
+            self.bot.run(self.overlay, target=self._selected_target, close_overlay_on_exit=False)
         except BaseException as exc:
             self.worker_errors.append(exc)
-            self.overlay.close()
 
     def _worker_failed(self, exc: BaseException) -> None:
-        messagebox.showerror("冒险岛弓箭手", f"视觉线程异常：{exc}")
-        self.quit()
+        self._connection_message = f"连接已停止：{exc}。请重新选择窗口。"
+        self.window_hint.set(self._connection_message)
+        self.status.set("等待重新选择窗口")
+
+    def _build_window_selector(self, parent: tk.Misc) -> None:
+        card = RoundedCard(parent, padding=6)
+        card.pack(fill="x", padx=8, pady=(0, 8))
+        frame = card.body
+        heading = tk.Frame(frame, bg=PANEL)
+        heading.pack(fill="x", padx=6, pady=(3, 5))
+        tk.Label(heading, text="作用窗口", bg=PANEL, fg=FG, font=FONT_SECTION).pack(side="left")
+        row = tk.Frame(frame, bg=PANEL)
+        row.pack(fill="x", padx=12)
+        self.window_combo = ttk.Combobox(row, textvariable=self.window_choice, state="readonly", font=FONT)
+        self.window_combo.pack(side="left", fill="x", expand=True)
+        disable_combobox_mousewheel(self.window_combo)
+        self.window_refresh_button = self._compact_button(row, "刷新", self._refresh_windows)
+        self.window_refresh_button.pack(side="left", padx=(6, 0))
+        actions = tk.Frame(frame, bg=PANEL)
+        actions.pack(fill="x", padx=12, pady=(6, 0))
+        self.window_connect_button = self._compact_button(actions, "连接", self._connect_window, accent=True)
+        self.window_connect_button.pack(side="left", ipadx=14)
+        self.window_disconnect_button = self._compact_button(actions, "断开", self._disconnect_window)
+        self.window_disconnect_button.configure(state="disabled")
+        self.window_disconnect_button.pack(side="left", padx=(6, 0))
+        tk.Label(actions, text="连接后仍需手动启动挂机", bg=PANEL, fg=MUTED,
+                 font=FONT_SMALL).pack(side="left", padx=10)
+        hint = tk.Label(frame, textvariable=self.window_hint, bg=PANEL, fg=MUTED, font=FONT_SMALL,
+                        anchor="w", justify="left")
+        hint.pack(fill="x", padx=12, pady=(7, 9))
+        hint.bind("<Configure>", lambda event: hint.configure(wraplength=max(200, event.width)))
+
+    def _refresh_windows(self) -> None:
+        previous = self._window_lookup.get(self.window_choice.get())
+        try:
+            candidates = window_candidates(load_config(self.config_path))
+        except Exception as exc:
+            self.window_hint.set(f"读取窗口失败：{exc}。可以稍后点击刷新。")
+            return
+        self._window_lookup = {
+            f"{index}. {target.title} · {Path(target.process_path).name or '未知程序'}": target
+            for index, target in enumerate(candidates, 1)
+        }
+        self.window_combo.configure(values=list(self._window_lookup))
+        preferred = previous or self._selected_target
+        label = next((label for label, target in self._window_lookup.items()
+                      if preferred is not None and target.hwnd == preferred.hwnd
+                      and target.pid == preferred.pid), "")
+        if not label:
+            label = next((label for label, target in self._window_lookup.items()
+                          if target.score >= 100), "")
+        self.window_choice.set(label)
+        if not self._selected_target and not self._stopping_session:
+            self.window_hint.set(self._connection_message if candidates else
+                                 "尚未找到可选窗口。先打开目标程序，再点击刷新；可以先修改配置。")
+        self._refresh_window_controls()
+
+    def _refresh_window_controls(self) -> None:
+        waiting = self._stopping_session or self._closing
+        self.window_combo.configure(state="disabled" if waiting else "readonly")
+        self.window_refresh_button.configure(state="disabled" if waiting else "normal")
+        self.window_connect_button.configure(
+            state="disabled" if waiting or not self._window_lookup else "normal",
+            text="切换" if self._selected_target else "连接",
+        )
+        self.window_disconnect_button.configure(
+            state="normal" if self._selected_target and not waiting else "disabled"
+        )
+
+    def _connect_window(self) -> None:
+        if self.busy or self._closing or self._stopping_session:
+            return
+        target = self._window_lookup.get(self.window_choice.get())
+        if target is None:
+            self.window_hint.set("请先在下拉框中选择实际作用窗口。")
+            return
+        try:
+            resolve_window_target(target)
+        except Exception as exc:
+            self.window_hint.set(f"暂时无法连接：{exc}")
+            return
+        same_window = (
+            self._selected_target is not None
+            and self._selected_target.hwnd == target.hwnd and self._selected_target.pid == target.pid
+        )
+        if same_window and self.worker is not None and self.worker.is_alive():
+            self.window_hint.set("当前已经连接此窗口；点击启动挂机或按 F8 才会开始发键。")
+            return
+        if not self._persist_settings(apply_runtime=False, notify=False, show_error=True):
+            return
+        if self.worker is not None:
+            self._stop_session(target)
+        else:
+            self._start_session(target)
+
+    def _start_session(self, target: WindowTarget) -> None:
+        # 只能在旧 worker 完全结束后创建：身份、路线及输入请求均为新会话。
+        if self.worker is not None:
+            raise RuntimeError("旧视觉线程尚未结束，不能连接新窗口")
+        try:
+            resolve_window_target(target)
+            previous_bot = self.bot
+            # 旧会话即使已经结束，也不能丢弃尚未确认释放的输入通道。
+            previous_bot.keyboard.release_all()
+            config = load_config(self.config_path)
+            preference = config.setdefault("window", {})
+            preference["preferred_title"] = target.title
+            preference["preferred_executable"] = Path(target.process_path).name
+            save_config(self.config_path, config)
+            new_bot = BowmanBot(config, input_authorized=self._input_authorized)
+            new_bot.calibration_overlay_visible = previous_bot.calibration_overlay_visible
+            new_bot.calibration_overlay_hidden_items = previous_bot.calibration_overlay_hidden_items
+            self.bot = new_bot
+            self.overlay.reset_session()
+            self.overlay.show()
+            self.worker_errors.clear()
+            self._selected_target = target
+            self._pending_target = None
+            self._connection_message = f"已连接：{target.title}；保持原校准，启动挂机仍需点击按钮或按 F8。"
+            self.window_hint.set(self._connection_message)
+            self.worker = threading.Thread(target=self._run_bot, name="MapleVisionWorker", daemon=False)
+            self.worker.start()
+        except Exception as exc:
+            self.worker = None
+            self._selected_target = None
+            self.overlay.hide()
+            self._worker_failed(exc)
+        self._refresh_window_controls()
+
+    def _stop_session(self, next_target: WindowTarget | None = None) -> None:
+        self._pending_target = next_target
+        self._stopping_session = True
+        self.overlay.hide()
+        self.window_hint.set("正在停止旧窗口并释放按键…")
+        # 先发取消信号，再等动作锁，避免正在进行的混合输入等待 UI 抬键。
+        self.bot.f9_requested.set()
+        try:
+            with self.bot.action_lock:
+                self.bot.auto_potion.set_enabled(False)
+                self.bot.potion_enabled_requested = None
+                self.bot.suspend_vision()
+                self.bot.f7_requested.clear()
+                self.bot.f8_requested.clear()
+        except Exception as exc:
+            self._pending_target = None
+            self.worker_errors.append(exc)
+        finally:
+            self.bot.request_exit()
+        self._refresh_window_controls()
+
+    def _disconnect_window(self) -> None:
+        if self.busy or self._closing or self._stopping_session or self.worker is None:
+            return
+        self._stop_session()
+
+    def _consume_worker_completion(self) -> bool:
+        """由 Tk 消费退出；返回 False 表示正在关闭，不再安排下一轮。"""
+        if self.busy or self.worker is None or self.worker.is_alive():
+            return True
+        self.worker.join(timeout=0)
+        self.worker = None
+        self._selected_target = None
+        self.overlay.reset_session()
+        errors = self.worker_errors[:]
+        self.worker_errors.clear()
+        pending = self._pending_target
+        self._pending_target = None
+        stopped = self._stopping_session
+        self._stopping_session = False
+        if errors:
+            self._worker_failed(errors[0])
+        elif stopped:
+            self._connection_message = "已断开窗口；可以重新选择，原配置与采集图片已保留。"
+            self.window_hint.set(self._connection_message)
+            if pending is not None and not self._closing:
+                self._start_session(pending)
+        else:
+            # 活跃会话正常返回来自 F9；窗口丢失走异常恢复路径。
+            self.quit()
+            return not self._closing
+        self._refresh_window_controls()
+        return True
+
+    def _target_ready(self) -> bool:
+        target = self._selected_target
+        if (target is None or self.worker is None or not self.worker.is_alive()
+                or self._stopping_session or self._closing):
+            self.window_hint.set("请先连接实际作用窗口。")
+            return False
+        try:
+            validate_window_target(target)
+        except Exception as exc:
+            self._stop_session()
+            self.worker_errors.append(exc)
+            return False
+        return True
 
     def _build(self) -> None:
         self.root.grid_rowconfigure(1, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
 
-        topbar = tk.Frame(self.root, bg=BG, height=54, highlightbackground="#263642", highlightthickness=1)
+        topbar = tk.Frame(self.root, bg=BG)
         topbar.grid(row=0, column=0, sticky="ew")
-        topbar.grid_propagate(False)
-        tk.Label(
-            topbar,
-            text=f"◉  MapleBowmanVision · {self.profile_label}",
-            bg=BG,
-            fg=FG,
-            font=("Microsoft YaHei UI", 16, "bold"),
-        ).pack(side="left", padx=18)
-        tk.Label(
-            topbar,
-            textvariable=self.status,
-            bg=BG,
-            fg=ACCENT,
-            font=FONT,
-            anchor="e",
-        ).pack(side="right", padx=(10, 18))
+        topbar.grid_columnconfigure(0, weight=1)
+        brand = tk.Frame(topbar, bg=BG)
+        brand.grid(row=0, column=0, sticky="w", padx=14, pady=(9, 0))
+        tk.Label(brand, text="Maple Vision", bg=BG, fg=FG, font=FONT_TITLE).pack(side="left")
+        tk.Label(brand, text=" / " + self.profile_label, bg=BG, fg=MUTED, font=FONT_SMALL).pack(side="left", padx=(6, 0))
+        self._run_badge_label = tk.Label(topbar, textvariable=self.run_badge, bg=ACCENT_SOFT,
+                                        fg=ACCENT, font=FONT_SMALL, padx=10, pady=4)
+        self._run_badge_label.grid(row=0, column=1, sticky="e", padx=14, pady=(9, 0))
+        self.status_label = tk.Label(topbar, textvariable=self.run_metrics, bg=BG, fg=MUTED,
+                                     font=FONT_SMALL, anchor="w")
+        self.status_label.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14, pady=(2, 7))
+        self._wrap_to_width(self.status_label)
 
         main = tk.Frame(self.root, bg=BG)
-        main.grid(row=1, column=0, sticky="nsew")
+        main.grid(row=1, column=0, sticky="nsew", padx=10)
         main.grid_rowconfigure(0, weight=1)
         main.grid_columnconfigure(0, weight=1)
-
-        left_shell = tk.Frame(main, bg=BG, width=600, highlightbackground="#263642", highlightthickness=1)
-        left_shell.grid(row=0, column=0, sticky="nsew")
-        left_shell.pack_propagate(False)
-        tk.Label(
-            left_shell,
-            text="采集与校准",
-            bg=BG,
-            fg=FG,
-            font=("Microsoft YaHei UI", 18, "bold"),
-            anchor="w",
-        ).pack(fill="x", padx=14, pady=(12, 2))
-        tk.Label(
-            left_shell,
-            textvariable=self.counts,
-            bg=BG,
-            fg=MUTED,
-            font=FONT_SMALL,
-            anchor="w",
-            justify="left",
-            wraplength=400,
-        ).pack(fill="x", padx=14, pady=(0, 6))
-
-        self._build_performance_monitor(left_shell)
-
-        scroll_shell = tk.Frame(left_shell, bg=BG)
-        scroll_shell.pack(fill="both", expand=True)
-        canvas = tk.Canvas(scroll_shell, bg=BG, highlightthickness=0, bd=0)
-        scroll = tk.Scrollbar(scroll_shell, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scroll.set)
-        self._capture_canvas = canvas
-        scroll.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        self._content = tk.Frame(canvas, bg=BG)
-        content_id = canvas.create_window((0, 0), window=self._content, anchor="nw")
-
-        def _sync(_event: tk.Event | None = None) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfigure(content_id, width=canvas.winfo_width())
-
-        self._content.bind("<Configure>", _sync)
-        canvas.bind("<Configure>", _sync)
-
-        def _on_wheel(event: tk.Event) -> None:
-            canvas.yview_scroll(int(-event.delta / 120), "units")
-
-        canvas.bind("<Enter>", lambda _event: canvas.bind_all("<MouseWheel>", _on_wheel))
-        canvas.bind("<Leave>", lambda _event: canvas.unbind_all("<MouseWheel>"))
-
-        self.status_label = tk.Label(self._content, text="", bg=BG, fg=ACCENT)
+        style = ttk.Style(self.root)
+        style.configure("Compact.MBV.TNotebook", tabmargins=(0, 0, 0, 4))
+        style.configure("Compact.MBV.TNotebook.Tab", padding=(6, 7), font=FONT_SMALL)
+        self.notebook = ttk.Notebook(main, style="Compact.MBV.TNotebook")
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+        self._page_bodies: dict[str, tk.Frame] = {}
+        self._page_canvases: dict[str, tk.Canvas] = {}
+        self._page_titles: dict[str, str] = {}
+        for key, label in (
+            ("connection", "窗口连接"),
+            ("capture", "区域校准"), ("templates", "模板采集"),
+            ("strategy", "职业策略"), ("supply", "按键补给"),
+            ("runtime", "运行设置"), ("performance", "性能监控"),
+        ):
+            self._create_page(key, label)
+        tab_font = tkfont.Font(self.root, font=FONT_SMALL)
+        self._full_tabs_width = sum(tab_font.measure(title) + 18 for title in self._page_titles.values()) + 4
+        self._compact_tabs = False
+        self.notebook.bind("<Configure>", self._fit_page_tabs, add="+")
+        self._capture_canvas = self._page_canvases["capture"]
+        self._content = self._page_bodies["capture"]
+        self.root.bind("<MouseWheel>", self._scroll_page, add="+")
+        self.root.bind("<Button-4>", self._scroll_page, add="+")
+        self.root.bind("<Button-5>", self._scroll_page, add="+")
+        self._build_run_bar()
+        connection = self._page_bodies["connection"]
+        self._page_intro(connection, "连接游戏窗口", "原配置作为默认值；刷新列表后选择实际作用窗口。")
+        self._build_window_selector(connection)
+        self._page_intro(self._content, "从区域校准开始", "先采集基础区域，再添加怪物与人物模板。")
+        counts_label = tk.Label(self._content, textvariable=self.counts, bg=BG, fg=MUTED,
+                                font=FONT_SMALL, anchor="w", justify="left")
+        counts_label.pack(fill="x", padx=14, pady=(0, 5))
+        self._wrap_to_width(counts_label)
 
         self._section("基础区域")
         capture = self._last_body
@@ -345,15 +534,17 @@ class ControlPanel:
             self._capture_target_range,
         )
 
+        self._content = self._page_bodies["templates"]
+        self._page_intro(self._content, "采集与管理模板", "分类管理怪物、姓名板、头部与称号图片，删除后仍可恢复。")
         self._section("模板采集")
         templates = self._last_body
-        capture = tk.Frame(templates, bg="#0b1218", highlightbackground="#263642", highlightthickness=1)
+        capture = tk.Frame(templates, bg=PANEL)
         capture.pack(fill="x", padx=6, pady=(4, 7))
         tk.Label(
             capture,
             text="怪物模板",
-            bg="#0b1218",
-            fg=ACCENT,
+            bg=PANEL,
+            fg=FG,
             font=FONT_SECTION,
             anchor="w",
         ).pack(fill="x", padx=8, pady=(7, 2))
@@ -384,7 +575,7 @@ class ControlPanel:
             ("重命名", self._rename_monster_category),
             ("删除分类", self._delete_monster_category),
         ):
-            tk.Button(
+            RoundedButton(
                 category_buttons,
                 text=label,
                 command=command,
@@ -422,13 +613,15 @@ class ControlPanel:
             justify="left",
         ).pack(fill="x", padx=8, pady=(2, 5))
 
-        player_capture = tk.Frame(templates, bg="#0b1218", highlightbackground="#263642", highlightthickness=1)
+        divider = tk.Frame(templates, bg=BORDER, height=1)
+        divider.pack(fill="x", padx=12, pady=(0, 4))
+        player_capture = tk.Frame(templates, bg=PANEL)
         player_capture.pack(fill="x", padx=6, pady=(0, 5))
         tk.Label(
             player_capture,
             text="人物模板",
-            bg="#0b1218",
-            fg=ACCENT,
+            bg=PANEL,
+            fg=FG,
             font=FONT_SECTION,
             anchor="w",
         ).pack(fill="x", padx=8, pady=(7, 2))
@@ -438,7 +631,7 @@ class ControlPanel:
             "player",
             lambda: self._capture("player"),
         )
-        player_actions = tk.Frame(player_capture, bg="#0b1218")
+        player_actions = tk.Frame(player_capture, bg=PANEL)
         player_actions.pack(fill="x", padx=8, pady=2)
         self._compact_button(player_actions, "采集头部", lambda: self._capture("head")).pack(
             side="left", fill="x", expand=True, padx=(0, 2)
@@ -451,6 +644,8 @@ class ControlPanel:
             "管理人物模板",
             lambda: self._manage_templates("player"),
         ).pack(side="left", fill="x", expand=True, padx=(2, 0))
+        self._content = self._page_bodies["strategy"]
+        self._page_intro(self._content, "职业与战斗方式", "选择职业和策略，调整索敌范围与专属参数。")
         self._section("职业与策略")
         settings = self._last_body
         strategy_row = tk.Frame(settings, bg=PANEL)
@@ -507,9 +702,8 @@ class ControlPanel:
         self.strategy_settings_body = tk.Frame(settings, bg=PANEL)
         self.strategy_settings_body.pack(fill="x")
 
-        self._section("参数设置")
+        self._section("通用索敌范围")
         settings = self._last_body
-        tk.Label(settings, text="通用索敌区", bg=PANEL, fg=FG, font=FONT_SECTION, anchor="w").pack(fill="x", padx=8, pady=(3, 2))
         for path, label in (
             ("box.forward", "索敌区前方"),
             ("box.back", "索敌区后方"),
@@ -526,6 +720,13 @@ class ControlPanel:
                 maximum=1.0,
                 on_adjust=lambda text, field_path=path: self._preview_targeting_setting(field_path, text),
             )
+        self._content = self._page_bodies["performance"]
+        self._page_intro(self._content, "性能监控", "查看帧率、处理耗时与资源占用，不影响当前运行。")
+        self._build_performance_monitor(self._content)
+        self._content = self._page_bodies["supply"]
+        self._page_intro(self._content, "按键与自动补给", "配置游戏按键、喝药阈值与定时 Buff；会话开关仍需手动开启。")
+        self._section("游戏按键")
+        settings = self._last_body
         fields = [
             ("keys.attack", "攻击键", None, None, None),
             ("keys.jump", "跳跃键", None, None, None),
@@ -542,6 +743,11 @@ class ControlPanel:
             ("vision.player_name_identity_threshold", "玩家姓名确认阈值", 0.01, 0.0, 1.0),
         ]
         for key, label, step, minimum, maximum in fields:
+            if key == "behavior.attack_interval_seconds":
+                self._content = self._page_bodies["runtime"]
+                self._page_intro(self._content, "识别与运行设置", "调整行为、识别阈值和输入方式，修改后自动保存。")
+                self._section("识别与行为")
+                settings = self._last_body
             self._labeled_entry(
                 settings,
                 key,
@@ -586,7 +792,7 @@ class ControlPanel:
         ).pack(fill="x", padx=8, pady=(5, 2))
         tk.Label(
             settings,
-            text="本人身份确认后，遮挡时仍可按唯一实时小地图标记回安全点（默认最长 10 秒），到位等待视觉恢复。标记近乎静止且多处背景稳定时可补位最多 3 秒；背景不支持时只保留原 0.2 秒补位。不滚动续时，标记移动、丢失或歧义立即停用旧坐标。",
+            text="仅在本人身份确认且小地图标记唯一时辅助导航；到位等待视觉恢复。遮挡到期、位置异常立即停用旧坐标，不滚动续时。",
             bg=PANEL,
             fg=MUTED,
             font=FONT_SMALL,
@@ -603,28 +809,14 @@ class ControlPanel:
                 minimum=0.0, maximum=maximum, direct_numeric_input=True,
                 on_adjust=lambda _text: self._schedule_settings_save(),
             )
+        self._content = self._page_bodies["supply"]
+        self._section("自动补给")
+        settings = self._last_body
         self._threshold_control(settings, self.hp_threshold_percent, "HP 自动喝药阈值")
         self._threshold_control(settings, self.mp_threshold_percent, "MP 自动喝药阈值")
-        self.potion_button = tk.Checkbutton(
-            settings,
-            text="全局自动喝药：关闭",
-            variable=self.auto_potion_enabled,
-            command=self._toggle_auto_potion,
-            indicatoron=False,
-            bg=BUTTON_BG,
-            fg=FG,
-            selectcolor="#163844",
-            activebackground=BUTTON_ACTIVE,
-            activeforeground=FG,
-            relief="flat",
-            font=FONT,
-            cursor="hand2",
-            takefocus=False,
-        )
-        self.potion_button.pack(fill="x", padx=8, pady=(6, 2), ipady=5)
         tk.Label(
             settings,
-            text="会话开关；关闭后任何状态都不会发送 HP/MP 药键。开启后挂机运行时自动补药，暂停时仅在游戏位于前台时补药。",
+            text="底部开关控制本次会话：关闭不发药键；暂停时仅在游戏前台补药。",
             bg=PANEL,
             fg=MUTED,
             font=FONT_SMALL,
@@ -633,18 +825,12 @@ class ControlPanel:
             anchor="w",
         ).pack(fill="x", padx=8, pady=(0, 5))
         if self.profile_label == "NewMaple":
-            tk.Checkbutton(
-                settings, text="狩猎验证：仅检测并响铃（不暂停挂机）",
-                variable=self.verification_alert_enabled, command=self._toggle_verification_alert,
-                bg=PANEL, fg=FG, selectcolor=ENTRY_BG, activebackground=PANEL,
-                activeforeground=FG, font=FONT_SMALL, takefocus=False,
-            ).pack(fill="x", padx=8, pady=(6, 2))
-            tk.Button(
+            RoundedButton(
                 settings, text="试听验证提示音", command=self._test_verification_sound,
                 bg=BUTTON_BG, fg=FG, relief="flat", font=FONT_SMALL, takefocus=False,
             ).pack(anchor="w", padx=8, pady=2)
             tk.Label(
-                settings, text="仅监听聊天栏固定字样，不识题、不发命令。人工输入聊天前请自行暂停，防止挂机按键混入。",
+                settings, text="底部狩猎验证开关仅检测并响铃，不暂停、不答题。人工输入前请暂停挂机并关闭自动喝药。",
                 bg=PANEL, fg=MUTED, font=FONT_SMALL, wraplength=360, justify="left",
             ).pack(fill="x", padx=8, pady=(0, 5))
         tk.Label(
@@ -657,7 +843,7 @@ class ControlPanel:
         ).pack(fill="x", padx=8, pady=(8, 2))
         tk.Label(
             settings,
-            text="每项可独立开关；关闭会保留按键和间隔。程序首次启动挂机时立即施放；F8 暂停后会保留计时，重新启动只补已到期项目。",
+            text="各项独立开关，关闭保留配置。首次启动立即施放；F8 暂停保留计时，恢复只补到期项目。",
             bg=PANEL,
             fg=MUTED,
             font=FONT_SMALL,
@@ -676,7 +862,7 @@ class ControlPanel:
                 indicatoron=False,
                 bg=BUTTON_BG,
                 fg=FG,
-                selectcolor="#163844",
+                selectcolor=ACCENT_SOFT,
                 activebackground=BUTTON_ACTIVE,
                 activeforeground=FG,
                 relief="flat",
@@ -703,6 +889,9 @@ class ControlPanel:
                 on_adjust=lambda text, field_path=f"{prefix}.interval_seconds":
                     self._preview_common_setting(field_path, text),
             )
+        self._content = self._page_bodies["runtime"]
+        self._section("输入与窗口")
+        settings = self._last_body
         tk.Checkbutton(
             settings,
             text="没有目标时左右巡逻",
@@ -753,30 +942,9 @@ class ControlPanel:
             anchor="w",
         ).pack(fill="x", padx=12, pady=10)
 
-        footer_shell = tk.Frame(self.root, bg=BG, highlightbackground="#263642", highlightthickness=1)
-        footer_shell.grid(row=2, column=0, sticky="ew")
-        mode_row = tk.Frame(footer_shell, bg=BG)
-        mode_row.pack(fill="x")
-        footer = tk.Frame(footer_shell, bg=BG)
-        footer.pack(fill="x")
-        self.debug_button = tk.Checkbutton(
-            mode_row,
-            text="显示 Debug 框",
-            variable=self.debug_boxes,
-            command=self._toggle_debug_boxes,
-            indicatoron=False,
-            bg=BUTTON_BG,
-            fg=ACCENT,
-            selectcolor="#163844",
-            activebackground=BUTTON_ACTIVE,
-            activeforeground=FG,
-            relief="flat",
-            font=FONT,
-            cursor="hand2",
-        )
-        self.debug_button.pack(side="left", padx=(16, 6), pady=12, ipadx=12, ipady=7)
+        tk.Label(settings, text="按键投递方式", bg=PANEL, fg=MUTED, font=FONT_SMALL).pack(anchor="w", padx=8, pady=(3, 5))
         delivery_combo = ttk.Combobox(
-            mode_row,
+            settings,
             textvariable=self.delivery,
             values=tuple(DELIVERY_LABELS.values()),
             state="readonly",
@@ -787,47 +955,148 @@ class ControlPanel:
             "<<ComboboxSelected>>",
             lambda _event: self._schedule_settings_save(reconfigure=True),
         )
-        delivery_combo.pack(side="left", padx=8)
-        self.arm_button = self._compact_button(footer, "启动挂机", self._toggle_arm, accent=True)
-        self.arm_button.pack(side="right", padx=(6, 16), pady=12, ipadx=18, ipady=7)
-        self._compact_button(footer, "退出程序", self.quit).pack(side="right", padx=6, pady=12, ipadx=12, ipady=7)
-        self._compact_button(footer, "保存配置", self._save_settings).pack(side="right", padx=6, pady=12, ipadx=12, ipady=7)
+        delivery_combo.pack(fill="x", padx=8, pady=(0, 5))
+        self._content = self._page_bodies["capture"]
 
         self._refresh_strategy_choices()
+        self._wrap_descriptions(self.root)
+
+    @staticmethod
+    def _wrap_to_width(label: tk.Label) -> None:
+        label.bind("<Configure>", lambda event: label.configure(wraplength=max(120, event.width)), add="+")
+
+    def _wrap_descriptions(self, parent: tk.Misc) -> None:
+        for widget in parent.winfo_children():
+            if isinstance(widget, tk.Label) and int(widget.cget("wraplength")) > 0:
+                self._wrap_to_width(widget)
+            self._wrap_descriptions(widget)
+
+    def _page_intro(self, parent: tk.Misc, title: str, subtitle: str) -> None:
+        # 页签和卡片已有标题，仅保留一行用途，避免重复标题挤占内容区。
+        hint = tk.Label(parent, text=subtitle, bg=BG, fg=MUTED, font=FONT_SMALL, anchor="w", justify="left")
+        hint.pack(fill="x", padx=10, pady=(7, 5))
+        self._wrap_to_width(hint)
+
+    def _create_page(self, key: str, title: str) -> None:
+        shell = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(shell, text=title)
+        canvas = tk.Canvas(shell, bg=BG, width=1, height=1, highlightthickness=0, bd=0, yscrollincrement=24)
+        scrollbar = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y", pady=8)
+        canvas.pack(side="left", fill="both", expand=True)
+        body = tk.Frame(canvas, bg=BG)
+        content_id = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(content_id, width=event.width))
+        self._page_bodies[key] = body
+        self._page_canvases[key] = canvas
+        self._page_titles[key] = title
+
+    def _fit_page_tabs(self, event: tk.Event) -> None:
+        """窄窗口只缩短页签标题，不缩字体、不改变当前页面或其控件。"""
+        compact = int(event.width) < self._full_tabs_width
+        if compact == self._compact_tabs:
+            return
+        self._compact_tabs = compact
+        short_titles = {
+            "connection": "窗口连接", "capture": "校准", "templates": "模板",
+            "strategy": "策略", "supply": "补给", "runtime": "设置", "performance": "性能",
+        }
+        for key, canvas in self._page_canvases.items():
+            self.notebook.tab(canvas.master, text=short_titles[key] if compact else self._page_titles[key])
+
+    def _scroll_page(self, event: tk.Event) -> str | None:
+        widget = event.widget
+        if isinstance(widget, (ttk.Combobox, tk.Listbox, tk.Scale)):
+            return None
+        # 只路由属于本页的控件，不接管模板管理器或其它 Toplevel 的滚轮。
+        while widget is not None:
+            for canvas in self._page_canvases.values():
+                if widget is canvas:
+                    if canvas.yview() != (0.0, 1.0):
+                        delta = -1 if getattr(event, "num", None) == 4 else 1 if getattr(event, "num", None) == 5 else -int(event.delta / 120)
+                        canvas.yview_scroll(delta, "units")
+                    return "break"
+            widget = getattr(widget, "master", None)
+        return None
+
+    def _build_run_bar(self) -> None:
+        self._run_bar = RoundedCard(self.root, padding=6)
+        self._run_bar.grid(row=2, column=0, sticky="ew", padx=10, pady=(6, 8))
+        footer = self._run_bar.body
+        self._notice_label = tk.Label(footer, textvariable=self.run_notice, bg=PANEL, fg=MUTED,
+                                      font=FONT_SMALL, anchor="w", justify="left")
+        self._wrap_to_width(self._notice_label)
+        self._quick_controls = tk.Frame(footer, bg=PANEL)
+        self._quick_controls.pack(fill="x", padx=3, pady=(1, 4))
+        self.debug_button = tk.Checkbutton(
+            self._quick_controls, text="识别框：全部", variable=self.debug_boxes,
+            command=self._toggle_debug_boxes, indicatoron=False,
+            bg=BUTTON_BG, fg=MUTED, selectcolor=ACCENT_SOFT,
+            activebackground=BUTTON_ACTIVE, activeforeground=FG,
+            relief="flat", font=FONT_SMALL, cursor="hand2", takefocus=False,
+        )
+        self.debug_button.pack(side="left", padx=(0, 6), ipady=3, ipadx=3)
+        self.potion_button = tk.Checkbutton(
+            self._quick_controls, text="自动喝药：关闭", variable=self.auto_potion_enabled,
+            command=self._toggle_auto_potion, indicatoron=False,
+            bg=BUTTON_BG, fg=FG, selectcolor=ACCENT_SOFT,
+            activebackground=BUTTON_ACTIVE, activeforeground=FG,
+            relief="flat", font=FONT_SMALL, cursor="hand2", takefocus=False,
+        )
+        self.potion_button.pack(side="left", padx=(0, 6), ipady=3, ipadx=3)
+        self.verification_alert_button = None
+        if self.profile_label == "NewMaple":
+            self.verification_alert_button = tk.Checkbutton(
+                self._quick_controls, text="狩猎验证响铃", variable=self.verification_alert_enabled,
+                command=self._toggle_verification_alert,
+                bg=PANEL, fg=FG, selectcolor=ENTRY_BG, activebackground=PANEL,
+                activeforeground=FG, font=FONT_SMALL, takefocus=False,
+            )
+            self.verification_alert_button.pack(side="left", padx=(2, 0), ipady=3)
+        actions = tk.Frame(footer, bg=PANEL)
+        actions.pack(fill="x", padx=3, pady=(0, 1))
+        self.arm_button = self._compact_button(actions, "启动挂机", self._toggle_arm, accent=True)
+        self.arm_button.pack(side="right", ipadx=14)
+        self.save_button = self._compact_button(actions, "保存配置", self._save_settings)
+        self.save_button.pack(side="right", padx=6)
+        self.exit_button = self._compact_button(actions, "退出", self.quit)
+        self.exit_button.pack(side="left")
+        tk.Label(actions, text="F8 启停 · F9 退出", bg=PANEL, fg=MUTED, font=FONT_SMALL).pack(side="left", padx=8)
 
     def _build_performance_monitor(self, parent: tk.Misc) -> None:
         self._performance_shell = tk.Frame(parent, bg=BG)
         self._performance_shell.pack(fill="x", padx=14, pady=(0, 7))
 
-        self._performance_card = tk.Frame(
-            self._performance_shell,
-            bg="#0b1218",
-            highlightbackground="#263642",
-            highlightthickness=1,
-        )
+        self._performance_card = RoundedCard(self._performance_shell, padding=6)
+        heading = tk.Frame(self._performance_card.body, bg=PANEL)
+        heading.pack(fill="x", padx=6, pady=(3, 3))
         tk.Label(
-            self._performance_card,
+            heading,
             text="性能监控",
-            bg="#0b1218",
-            fg=ACCENT,
+            bg=PANEL,
+            fg=FG,
             font=FONT_SMALL,
             anchor="w",
-        ).pack(side="left", padx=(8, 6), pady=6)
-        tk.Label(
-            self._performance_card,
+        ).pack(side="left")
+        summary = tk.Label(
+            self._performance_card.body,
             textvariable=self.performance_text,
-            bg="#0b1218",
+            bg=PANEL,
             fg=FG,
             font=FONT_SMALL,
             anchor="w",
             justify="left",
-            wraplength=400,
-        ).pack(side="left", fill="x", expand=True, pady=6)
-        tk.Button(
-            self._performance_card,
+            wraplength=500,
+        )
+        summary.pack(fill="x", padx=12, pady=(0, 10))
+        self._wrap_to_width(summary)
+        RoundedButton(
+            heading,
             text="×",
             command=lambda: self._set_performance_monitor_visible(False),
-            bg="#0b1218",
+            bg=PANEL,
             fg=MUTED,
             activebackground=BUTTON_ACTIVE,
             activeforeground=FG,
@@ -836,9 +1105,9 @@ class ControlPanel:
             font=FONT,
             cursor="hand2",
             takefocus=False,
-        ).pack(side="right", padx=(4, 6), pady=2)
+        ).pack(side="right", padx=(4, 0))
 
-        self._performance_collapsed_button = tk.Button(
+        self._performance_collapsed_button = RoundedButton(
             self._performance_shell,
             text="显示性能监控",
             command=lambda: self._set_performance_monitor_visible(True),
@@ -932,19 +1201,21 @@ class ControlPanel:
         *,
         accent: bool = False,
     ) -> tk.Button:
-        return tk.Button(
+        button = RoundedButton(
             parent,
             text=text,
             command=command,
             bg=ACCENT if accent else BUTTON_BG,
-            fg="#041014" if accent else FG,
-            activebackground="#61e3ff" if accent else BUTTON_ACTIVE,
-            activeforeground="#041014" if accent else FG,
+            fg=PANEL if accent else FG,
+            activebackground=ACCENT_HOVER if accent else BUTTON_ACTIVE,
+            activeforeground=PANEL if accent else FG,
             relief="flat",
             bd=0,
             font=FONT,
             cursor="hand2",
         )
+        style_button(button, primary=accent)
+        return button
 
     def _capture_item_row(
         self,
@@ -955,13 +1226,13 @@ class ControlPanel:
         *,
         show: bool = True,
     ) -> tk.Button:
-        row = tk.Frame(parent, bg=PANEL, highlightbackground="#263642", highlightthickness=1)
+        row = tk.Frame(parent, bg=PANEL)
         row.pack(fill="x", padx=8, pady=2)
         tk.Label(row, text=label, bg=PANEL, fg=FG, font=FONT, anchor="w").pack(
-            side="left", fill="x", expand=True, padx=(9, 4), pady=5
+            side="left", fill="x", expand=True, padx=(5, 4), pady=3
         )
         variable = tk.StringVar(value="未采集")
-        status = tk.Label(row, textvariable=variable, bg=PANEL, fg=MUTED, font=FONT_SMALL, width=8, anchor="e")
+        status = tk.Label(row, textvariable=variable, bg=PANEL, fg=MUTED, font=FONT_SMALL, width=7, anchor="e")
         status.pack(side="left", padx=4)
         self._capture_status_vars[key] = variable
         self._capture_status_labels[key] = status
@@ -975,9 +1246,9 @@ class ControlPanel:
             "采集",
             lambda selected=label, action=command: self._select_capture_item(selected, action),
         )
-        button.pack(side="right", padx=5, pady=4, ipadx=5)
+        button.pack(side="right", padx=4, pady=2, ipadx=3)
         if show:
-            show_button.pack(side="right", padx=(2, 0), pady=4, ipadx=3)
+            show_button.pack(side="right", padx=(2, 0), pady=2, ipadx=2)
             self._debug_item_buttons[key] = (show_button, "框")
         self._capture_buttons[key] = button
         return button
@@ -998,9 +1269,9 @@ class ControlPanel:
                 visible = self.bot.calibration_overlay_item_visible(key)
                 button.configure(
                     text=f"{label}：{'开' if visible else '关'}",
-                    bg="#12313b" if visible else BUTTON_BG,
+                    bg=ACCENT_SOFT if visible else BUTTON_BG,
                     fg=ACCENT if visible else MUTED,
-                    activebackground="#194858" if visible else BUTTON_ACTIVE,
+                    activebackground=BUTTON_ACTIVE if visible else BUTTON_ACTIVE,
                     activeforeground=ACCENT if visible else FG,
                 )
             except tk.TclError:
@@ -1049,15 +1320,15 @@ class ControlPanel:
                 button.configure(text="重采" if color == SUCCESS else "采集")
 
     def _section(self, title: str) -> None:
-        wrap = tk.Frame(self._content, bg=PANEL, highlightbackground="#333333", highlightthickness=1)
-        wrap.pack(fill="x", padx=12, pady=(8, 0))
-        tk.Label(wrap, text=title, bg=PANEL, fg=FG, font=FONT_SECTION, anchor="w").pack(fill="x", padx=8, pady=(6, 2))
-        body = tk.Frame(wrap, bg=PANEL)
-        body.pack(fill="x", padx=4, pady=(0, 8))
+        wrap = RoundedCard(self._content, padding=6)
+        wrap.pack(fill="x", padx=8, pady=(4, 4))
+        tk.Label(wrap.body, text=title, bg=PANEL, fg=FG, font=FONT_SECTION, anchor="w").pack(fill="x", padx=6, pady=(1, 3))
+        body = tk.Frame(wrap.body, bg=PANEL)
+        body.pack(fill="x", pady=(0, 1))
         self._last_body = body
 
     def _row_button(self, parent: tk.Misc, text: str, command: Callable[[], None]) -> tk.Button:
-        button = tk.Button(
+        button = RoundedButton(
             parent,
             text=text,
             command=command,
@@ -1087,7 +1358,9 @@ class ControlPanel:
     ) -> None:
         row = tk.Frame(parent, bg=PANEL)
         row.pack(fill="x", padx=8, pady=2)
-        tk.Label(row, text=label, bg=PANEL, fg=MUTED, font=FONT_SMALL, width=18, anchor="w").pack(side="left")
+        label_widget = tk.Label(row, text=label, bg=PANEL, fg=FG, font=FONT_SMALL,
+                               width=18, wraplength=175, justify="left", anchor="w")
+        label_widget.pack(side="left", padx=(0, 8))
         entry = tk.Entry(
             row,
             bg=ENTRY_BG,
@@ -1097,7 +1370,7 @@ class ControlPanel:
             font=FONT,
         )
         if capture:
-            tk.Button(
+            RoundedButton(
                 row,
                 text="采集",
                 command=lambda: self._capture_key(key),
@@ -1108,10 +1381,11 @@ class ControlPanel:
                 relief="flat",
                 font=FONT_SMALL,
                 cursor="hand2",
-                width=6,
+                width=4,
+                padx=5,
             ).pack(side="right", padx=(4, 0))
         if direct_numeric_input:
-            tk.Button(
+            RoundedButton(
                 row,
                 text="输入",
                 command=lambda: self._prompt_numeric_entry(entry, label, minimum, maximum, on_adjust),
@@ -1123,7 +1397,8 @@ class ControlPanel:
                 font=FONT_SMALL,
                 cursor="hand2",
                 takefocus=False,
-                width=5,
+                width=4,
+                padx=5,
             ).pack(side="right", padx=(4, 0))
         if adjust_step is not None:
             def adjust(delta: float) -> None:
@@ -1142,7 +1417,7 @@ class ControlPanel:
                 entry.delete(0, "end")
                 entry.insert(0, text)
 
-            tk.Button(
+            RoundedButton(
                 row,
                 text="+",
                 command=lambda: adjust(float(adjust_step)),
@@ -1153,9 +1428,10 @@ class ControlPanel:
                 relief="flat",
                 font=FONT_SMALL,
                 takefocus=False,
-                width=3,
+                width=2,
+                padx=4,
             ).pack(side="right", padx=(2, 0))
-            tk.Button(
+            RoundedButton(
                 row,
                 text="−",
                 command=lambda: adjust(-float(adjust_step)),
@@ -1166,7 +1442,8 @@ class ControlPanel:
                 relief="flat",
                 font=FONT_SMALL,
                 takefocus=False,
-                width=3,
+                width=2,
+                padx=4,
             ).pack(side="right", padx=(4, 0))
         entry.pack(side="left", fill="x", expand=True, ipady=3)
         if capture:
@@ -1223,7 +1500,7 @@ class ControlPanel:
 
         controls = tk.Frame(wrap, bg=PANEL)
         controls.pack(fill="x", pady=(2, 0))
-        tk.Button(
+        RoundedButton(
             controls,
             text="−1%",
             command=lambda: adjust(-1),
@@ -1251,7 +1528,7 @@ class ControlPanel:
             bd=0,
             takefocus=False,
         ).pack(side="left", fill="x", expand=True, padx=6)
-        tk.Button(
+        RoundedButton(
             controls,
             text="+1%",
             command=lambda: adjust(1),
@@ -1342,27 +1619,6 @@ class ControlPanel:
         strategy = self._selected_strategy()
         self.strategy_description.set(strategy.description)
         prefix = f"strategy.options.{strategy.key}."
-        tk.Label(
-            self.strategy_settings_body,
-            text="策略多选",
-            bg=PANEL,
-            fg=FG,
-            font=FONT_SECTION,
-            anchor="w",
-        ).pack(fill="x", padx=8, pady=(4, 2))
-        base_enabled = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            self.strategy_settings_body,
-            text=f"基础输出 · {strategy.display_name}",
-            variable=base_enabled,
-            state="disabled",
-            disabledforeground=SUCCESS,
-            bg=PANEL,
-            fg=FG,
-            selectcolor=ENTRY_BG,
-            font=FONT,
-            anchor="w",
-        ).pack(fill="x", padx=8, pady=2)
         for field in strategy.toggle_fields:
             variable = tk.BooleanVar(value=bool(self._nested(config, prefix + field.path)))
             self._strategy_toggles[prefix + field.path] = variable
@@ -1447,6 +1703,7 @@ class ControlPanel:
             if field.multiple and field.settings_path:
                 self._render_strategy_regions(config, strategy.key, field)
         self._refresh_debug_item_buttons()
+        self._wrap_descriptions(self.strategy_settings_body)
 
     def _render_strategy_regions(
         self,
@@ -1478,8 +1735,8 @@ class ControlPanel:
             region_id = str(region.get("id", f"region_{index}"))
             card = tk.Frame(
                 self.strategy_settings_body,
-                bg="#0b1218",
-                highlightbackground="#263642",
+                bg=PANEL,
+                highlightbackground=BORDER,
                 highlightthickness=1,
             )
             card.pack(fill="x", padx=8, pady=2)
@@ -1495,10 +1752,10 @@ class ControlPanel:
                         selected_id,
                         enabled=bool(selected.get()),
                     ),
-                bg="#0b1218",
+                bg=PANEL,
                 fg=FG,
                 selectcolor=ENTRY_BG,
-                activebackground="#0b1218",
+                activebackground=PANEL,
                 activeforeground=FG,
                 font=FONT,
                 anchor="w",
@@ -1506,7 +1763,7 @@ class ControlPanel:
             tk.Label(
                 card,
                 text=f"优先级 {int(region.get('priority', index))}",
-                bg="#0b1218",
+                bg=PANEL,
                 fg=MUTED,
                 font=FONT_SMALL,
             ).pack(side="left", padx=3)
@@ -1593,7 +1850,7 @@ class ControlPanel:
     ) -> None:
         if not field.settings_path or not messagebox.askyesno(
             "删除索敌区",
-            "确定删除这个标飞索敌区吗？",
+            "确定删除这个策略索敌区吗？",
             parent=self.root,
         ):
             return
@@ -1709,9 +1966,9 @@ class ControlPanel:
             index = slot.rsplit("_", 1)[-1]
             button.configure(
                 text=f"Buff {index}：{'开启' if enabled else '关闭'}",
-                bg="#163844" if enabled else BUTTON_BG,
+                bg=ACCENT_SOFT if enabled else BUTTON_BG,
                 fg=ACCENT if enabled else FG,
-                activebackground="#194858" if enabled else BUTTON_ACTIVE,
+                activebackground=BUTTON_ACTIVE if enabled else BUTTON_ACTIVE,
                 activeforeground=ACCENT if enabled else FG,
             )
 
@@ -1833,7 +2090,7 @@ class ControlPanel:
                 )
             )
 
-        self._run_tool("新建怪物分类", action)
+        self._run_tool("新建怪物分类", action, requires_window=False)
         if created:
             self._activate_monster_category(created[0])
             self._refresh_monster_categories(created[0])
@@ -1870,7 +2127,7 @@ class ControlPanel:
                 )
             )
 
-        self._run_tool("分类重命名", action)
+        self._run_tool("分类重命名", action, requires_window=False)
         if renamed:
             self._activate_monster_category(renamed[0])
             self._refresh_monster_categories(renamed[0])
@@ -1913,7 +2170,7 @@ class ControlPanel:
                 trash_root=self.bot.template_trash_dir,
             )
 
-        self._run_tool("分类删除", action)
+        self._run_tool("分类删除", action, requires_window=False)
 
     def _manage_templates(self, family: str = "monster") -> None:
         if self.busy:
@@ -1969,7 +2226,9 @@ class ControlPanel:
                 self.bot.resume_vision()
             finally:
                 try:
-                    self.overlay.show()
+                    worker = getattr(self, "worker", None)
+                    if worker is not None and worker.is_alive() and not self._stopping_session:
+                        self.overlay.show()
                 except (tk.TclError, RuntimeError):
                     pass
                 finally:
@@ -1993,8 +2252,9 @@ class ControlPanel:
         preview_title = tk.StringVar(value="选择左侧图片以预览")
         preview_info = tk.StringVar(value="")
 
-        preview_frame = tk.Frame(dialog, bg=PANEL, highlightbackground="#333333", highlightthickness=1)
-        preview_frame.pack(side="right", fill="both", padx=(0, 8), pady=8)
+        preview_card = RoundedCard(dialog, padding=6)
+        preview_card.pack(side="right", fill="both", padx=(0, 8), pady=8)
+        preview_frame = preview_card.body
         tk.Label(
             preview_frame,
             textvariable=preview_title,
@@ -2197,14 +2457,14 @@ class ControlPanel:
             notebook.add(frame, text=title)
             list_wrap = tk.Frame(frame, bg=PANEL)
             list_wrap.pack(fill="both", expand=True, padx=8, pady=8)
-            scrollbar = tk.Scrollbar(list_wrap, orient="vertical")
+            scrollbar = ttk.Scrollbar(list_wrap, orient="vertical")
             scrollbar.pack(side="right", fill="y")
             listbox = tk.Listbox(
                 list_wrap,
                 bg=ENTRY_BG,
                 fg=FG,
-                selectbackground="#365b43",
-                selectforeground="white",
+                selectbackground=ACCENT_SOFT,
+                selectforeground=FG,
                 font=FONT_SMALL,
                 activestyle="none",
                 exportselection=False,
@@ -2223,26 +2483,26 @@ class ControlPanel:
             listbox.bind("<<ListboxSelect>>", lambda _event, selected_kind=kind: show_preview(selected_kind))
             buttons = tk.Frame(frame, bg=PANEL)
             buttons.pack(fill="x", padx=8, pady=(0, 8))
-            tk.Button(
+            RoundedButton(
                 buttons,
                 text="新增采集…",
                 command=lambda selected_kind=kind: capture_new(selected_kind),
-                bg="#235b32",
+                bg=ACCENT,
                 fg="white",
-                activebackground="#2d7540",
+                activebackground=ACCENT_HOVER,
                 activeforeground="white",
                 relief="flat",
                 font=FONT,
                 cursor="hand2",
             ).pack(side="left", fill="x", expand=True, padx=(0, 4), ipady=3)
-            tk.Button(
+            RoundedButton(
                 buttons,
                 text="删除选中项",
                 command=lambda selected_kind=kind: delete_selected(selected_kind),
-                bg="#7a2020",
-                fg="white",
-                activebackground="#a52828",
-                activeforeground="white",
+                bg=BUTTON_BG,
+                fg=ARMED,
+                activebackground=BUTTON_ACTIVE,
+                activeforeground=ARMED,
                 relief="flat",
                 font=FONT,
                 cursor="hand2",
@@ -2272,17 +2532,21 @@ class ControlPanel:
         reload_lists()
 
     def _tick(self) -> None:
-        if self.worker_errors:
-            self._worker_failed(self.worker_errors[0])
+        if self._closing or not self._consume_worker_completion():
             return
         now = time.monotonic()
         armed = self.bot.armed
         state = STATE_LABELS.get(self.bot.state, self.bot.state)
         hp = self.bot.ui_hp
         mp = self.bot.ui_mp
-        if armed:
+        connected = self._selected_target is not None and not self._stopping_session
+        if not connected:
+            mode = "正在断开" if self._stopping_session else "等待选择窗口"
+            color = MUTED
+            self.arm_button.configure(text="启动挂机")
+        elif armed:
             mode = "挂机中"
-            color = ARMED
+            color = FG
             self.arm_button.configure(text="暂停挂机")
         elif self.bot.input_authorized:
             mode = "输入待命"
@@ -2300,7 +2564,7 @@ class ControlPanel:
             else ("全部" if not hidden_items else "按需")
         )
         self.debug_button.configure(
-            text=f"显示 Debug 框：{debug_mode}",
+            text=f"识别框：{debug_mode}",
             fg=ACCENT if self.bot.calibration_overlay_visible else MUTED,
         )
         self._refresh_debug_item_buttons()
@@ -2308,9 +2572,11 @@ class ControlPanel:
         potion_state = self.bot.auto_potion.display_state(now)
         self.auto_potion_enabled.set(potion_enabled)
         self.potion_button.configure(
-            text=f"全局自动喝药：{potion_state}",
+            text=f"自动喝药：{potion_state}",
             fg=ACCENT if potion_enabled else FG,
         )
+        self.arm_button.configure(state="normal" if connected else "disabled")
+        self.potion_button.configure(state="normal" if connected else "disabled")
         notice = self.bot.notice if self.bot.notice and self.bot.notice_until >= now else ""
         text = f"{mode}｜{state}｜血 {hp:.0%} 蓝 {mp:.0%}"
         if potion_enabled:
@@ -2322,16 +2588,36 @@ class ControlPanel:
             text += f"\n{alert_status}"
         self.status.set(text)
         self.status_label.configure(fg=color)
+        self.run_badge.set(mode if connected else "未连接")
+        self._run_badge_label.configure(fg=SUCCESS if armed else ACCENT)
+        self.run_metrics.set(
+            f"{state}    ·    HP {hp:.0%}    /    MP {mp:.0%}" if connected
+            else "请在“窗口连接”页选择目标，连接后手动启动。"
+        )
+        self.run_notice.set("\n".join(value for value in (notice, alert_status) if value))
+        if self.run_notice.get():
+            self._notice_label.pack(fill="x", padx=9, pady=(6, 0), before=self._quick_controls)
+        else:
+            self._notice_label.pack_forget()
+        self.arm_button.configure(bg=ARMED if armed else ACCENT,
+                                  highlightbackground=ARMED if armed else ACCENT,
+                                  activebackground=DANGER_HOVER if armed else ACCENT_HOVER,
+                                  fg=PANEL, activeforeground=PANEL)
         self.root.after(250, self._tick)
 
-    def _run_tool(self, title: str, action: Callable[[], Any]) -> None:
-        if self.busy:
+    def _run_tool(
+        self, title: str, action: Callable[[], Any], *, requires_window: bool = True,
+    ) -> None:
+        if self.busy or (requires_window and not self._target_ready()):
             return
         self.busy = True
         self.overlay.hide()
-        self.bot.suspend_vision()
         try:
-            action()
+            self.bot.suspend_vision()
+            # 校准函数各自重新 load_config；作用窗口仅在本次调用链中精确传递。
+            scope = selected_window(self._selected_target) if requires_window else nullcontext()
+            with scope:
+                action()
             self.bot.reload_from_disk(self.config_path)
             self._refresh_counts()
             self._load_entries(load_config(self.config_path))
@@ -2345,7 +2631,8 @@ class ControlPanel:
                 self.bot.notify(message, 5.0)
         finally:
             self.bot.resume_vision()
-            self.overlay.show()
+            if self.worker is not None and self.worker.is_alive() and not self._stopping_session:
+                self.overlay.show()
             self.busy = False
 
     def _calibrate(self) -> None:
@@ -2494,6 +2781,8 @@ class ControlPanel:
         if self.bot.armed:
             self.bot.request_toggle()
             return
+        if not self._target_ready():
+            return
         if not self.bot.input_authorized:
             self.bot.notify("按键未授权，请从唯一入口 Start.bat 启动。", 5.0)
             return
@@ -2519,6 +2808,9 @@ class ControlPanel:
             variable = self.standalone_potion
         if self.busy:
             variable.set(self.bot.auto_potion.enabled)
+            return
+        if not self._target_ready():
+            variable.set(False)
             return
         request = getattr(self.bot, "request_auto_potion", None)
         if request is None:
@@ -2662,10 +2954,16 @@ class ControlPanel:
             return False
 
     def quit(self) -> None:
+        if getattr(self, "_closing", False):
+            return
         if not self._persist_settings(apply_runtime=False, notify=False, show_error=True):
             return
+        self._closing = True
         self._cancel_performance_refresh()
-        self.bot.request_exit()
+        if self.worker is not None:
+            self._stop_session()
+        else:
+            self.bot.request_exit()
         self.overlay.close()
         self.root.after(200, self._destroy)
 
@@ -2679,9 +2977,8 @@ class ControlPanel:
 
     def mainloop(self) -> None:
         self.root.mainloop()
-        self.worker.join(timeout=3.0)
-        if self.worker_errors:
-            raise self.worker_errors[0]
+        if self.worker is not None:
+            self.worker.join(timeout=3.0)
 
 
 def run_control_panel(config_path: Path, enable_input: bool) -> int:

@@ -76,6 +76,20 @@
 - `close_overlap_threshold`：水平重叠宽度除以角色与怪物较小宽度，默认阈值 `0.2`，等于阈值时触发。
 - `jump_attack_cooldown_seconds`：两次跳跃攻击之间的最短间隔。
 
+## 当前策略：龙咆哮·定点
+
+- 职业：战士·龙骑士；标识：`dragon_roar`。不追怪、不转向、不巡逻、不定时短步、不拾取。
+- 独立采集：在放大的小地图点击 `dragon_roar_point`（`recognition` 中的点位、`_space=minimap` 和 `_captured`）；框选 `attack_regions`（`strategy.options.dragon_roar` 下的 `player_anchor_v1` 列表）。两项均由 `capture_fields.required=true` 声明必需。
+- 攻击范围随稳定角色锚点平移，不随面向翻转，不额外套用公共索敌框或同层限制。多个区域按并集过滤怪物中心，重叠区域与重复框不重复计数；模板本身仍使用公共跨模板 NMS 和过滤项，不能保证遮挡怪物逐只可见。
+- 数量只用本帧真实检测，`detections_fresh=false` 的短暂保留框一律不参与计数。`monster_count_threshold=2` 表示严格大于 2（至少 3 只）才施放；范围 0–23，受公共单帧最多 24 个检测结果限制。
+- `skill_key` 必须独立采集，空值不施放、不回退普通攻击；`cast_interval_seconds=1.0`（0.1–10 秒）由公共 `cast` 执行器按实际成功发送按键的时间限频，不宣称游戏实际施法成功。
+- 优先级：公共输入/窗口安全 → 补药/Buff → 点位和范围有效性 → 定点回位 → 仅小地图时等待视觉恢复 → 范围计数 → 无方向施法/原地等待。
+- `return_tolerance_x=0.015`、`return_tolerance_y=0.06` 分别以小地图宽、高的比例表示允许偏离量；超过任一容差进入回位，回到两轴容差的六成以内才结束，避免边界来回抖动。
+- 横向回位走公共 `move` 位移验证；水平接近后按小地图上下层关系使用 `jump` / `down_jump`，`return_jump_interval_seconds=0.45`（0.1–2 秒）。只支持可直接走回/跳回的位置，不支持绕障碍、爬绳、自动换图。普通移动无进展仍按公共 2 秒重试/4 秒暂停保护。
+- `return_timeout_seconds=15`（3–60 秒）从本次开始回位计时，包含上游中断等待。超时锁存 `blocked` 并停止移动/施法，检查路径后需暂停再启动。小地图遮挡导航仍受公共更短期限约束，不因该参数延长。
+- 会话 `runtime_state` 保存 `phase`、实时 `monster_count`、回位起始时间；`navigation_active=true` 且元数据 `allow_player_lost_recovery=false`，包括首次策略决策前也禁止完全丢失定位时左右盲走。暂停重启清会话，注册实例无会话状态。
+- 重采小地图使定点失效；重采战斗区清空攻击范围但保留定点。两个客户端档案独立，不修改原已选策略或个人校准。
+
 ## 新增策略必须遵循
 
 1. 按职业在 `mbv/strategies/<profession>/` 建子包，再为每个策略新建独立模块；目录、文件名和 `key` 使用稳定的 ASCII `snake_case`，不要把职业分支写回 `mbv/bot.py`。
@@ -103,9 +117,11 @@
 - `StrategyActionContext` 包含归一化位置、已选目标、当前索敌区候选、上次攻击技能、公共行为配置和策略设置。策略返回动作意图与可选技能键，`BowmanBot` 统一执行按键并写运行状态。
 - `runtime_state` 是运行层隔离的会话字典，决策可返回替换值；`started_at` 为本次挂机启动时间。导航任务设置 `navigation_active=true` 时，公共层在定位丢失后只等待，不执行左右找人位移；仍保留其它安全门。`StrategyToggleField.live_preview` 允许声明经过策略状态机处理的热开关，其余开关继续按原流程刷新配置。
 - 导航期间公共层在药/Buff和定位门禁前记录连续定位缺失，`localization_lost_seconds` 同时覆盖丢失期间及恢复首个决策帧，避免上游提前返回而漏记；`action_interrupted` 表示上一行动帧未进入策略决策，策略不得将这段时间算作有效拾取。暂停/重新启动清除这些会话观测，不修改身份记录或延长小地图导航期限。
-- `StrategyActionContext.minimap_only=true` 表示运行层只有经过身份配对的唯一实时小地图位置，屏幕玩家与目标坐标均不可用。三种策略只允许原有安全点／安全区回位或等待；到位返回 `MINIMAP_WAITING_VISUAL`，不得攻击、追怪、拾取或启动新周期短步。公共层保留窗口、药/Buff、标记唯一性、导航时限与实际位移验证，并拒绝该模式下的攻击类决策。不得把小地图比例直接当作屏幕比例。
-- `StrategyDecision.action` 目前支持 `stop`、`face`、`attack`、`chase`、`move`、`step`、`jump`、`down_jump`、`jump_attack`、`pickup`。`face` 只短按方向键改变面向，不得保持方向键或进入移动；`step` 以限定时长短按移动键，并由公共执行器记录周期动作和待回位状态。需要新动作时先扩展公共动作执行器和测试，不要在策略里直接发键。
+- `StrategyActionContext.minimap_only=true` 表示运行层只有经过身份配对的唯一实时小地图位置，屏幕玩家与目标坐标均不可用。所有策略只允许原有安全点／安全区回位或等待；到位返回 `MINIMAP_WAITING_VISUAL`，不得攻击、追怪、拾取或启动新周期短步。公共层保留窗口、药/Buff、标记唯一性、导航时限与实际位移验证，并拒绝该模式下的攻击类决策。不得把小地图比例直接当作屏幕比例。
+- `StrategyDecision.action` 目前支持 `stop`、`face`、`attack`、`cast`、`chase`、`move`、`step`、`jump`、`down_jump`、`jump_attack`、`pickup`。`face` 只短按方向键改变面向，不得保持方向键或进入移动；`step` 以限定时长短按移动键，并由公共执行器记录周期动作和待回位状态。需要新动作时先扩展公共动作执行器和测试，不要在策略里直接发键。
 - `StrategyDecision.face_each_attack` 保留作接口兼容，不再改变输入行为：所有模式的普通 `attack` 共用独立转向，仅首次、换边或有效性被撤销后重发方向，不定时刷新、不在每次技能时按住方向。方向点按尊重 `behavior.face_tap_seconds`（下限 0.02 秒、混合上限 0.1 秒），真实换向仍须等待上一技能与后续视觉帧；发键不等于视觉确认。混合模式例外：游戏后台时延后转向，普通攻击/跳攻沿用游戏当前面向只发技能，不能伪造方向；仅游戏已在前台时执行独立转向，不为战斗激活窗口。仅 foreground 普通攻击在移动发键／拾取释放后的首次恢复增加 0.12 秒跨帧释放与目标方向确认、至少 0.08 秒点按和 0.12 秒抬键等待；其它输入模式原时序不变，策略无需新增按键逻辑。
+- `cast` 是不需要面向的技能意图，必须显式提供非空 `attack_key`；公共层先释放移动/拾取，不点方向键、不申请混合激活，使用 `attack_interval_seconds` 按实际发键时间限频。依然经过窗口/身份/暂停、药/Buff和小地图禁攻击门禁。
+- `TargetSelectionContext.detections_fresh` 标识本帧真实检测，默认 True 保持旧调用兼容；依赖数量触发的策略必须忽略 False 的旧框。`StrategyCaptureField.required` 允许声明无开关的必采区域/点。`allow_player_lost_recovery=false` 阻断首次策略决策前的无定位盲走和旧视觉框行动。
 - 面板“框选通用索敌范围”始终写入 `targeting.box`，与当前选中的职业策略无关。
 
 ## 配置示例

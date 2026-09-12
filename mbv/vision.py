@@ -943,7 +943,7 @@ def player_relative_region_rect(
 ) -> tuple[float, float, float, float]:
     """还原角色相对区域（左、上、右、下）；屏幕方向固定，不读取面向。"""
     if region.get("space") != PLAYER_RELATIVE_REGION_SPACE:
-        raise ValueError("标飞索敌区坐标格式无效，请重新框选")
+        raise ValueError("策略索敌区坐标格式无效，请重新框选")
     width = max(1.0, float(scene_width))
     height = max(1.0, float(scene_height))
     left = float(player_anchor[0]) + float(region["offset_x"]) * width

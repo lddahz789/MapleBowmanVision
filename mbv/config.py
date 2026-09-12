@@ -12,7 +12,8 @@ from typing import Any
 from mbv.buffs import BUFF_SLOT_KEYS
 from mbv.input import input_delivery
 from mbv.paths import CLASSIC_PROFILE, LOG_DIR, profile_key_from_config
-from mbv.strategies import normalize_strategy_config
+from mbv.strategies import list_strategies, normalize_strategy_config
+from mbv.strategies.base import valid_point
 from mbv.template_store import list_monster_categories, template_roots_from_config
 from mbv.vision import MINIMAP_REGION_SPACE, attack_box_from_config
 from mbv.verification_alert import normalize_alert_settings
@@ -235,21 +236,25 @@ def load_config(path: Path) -> dict[str, Any]:
         items["throwing_star_safe_output_area"] = {"complete": False}
         if previous_timestamp:
             items["throwing_star_safe_output_area"]["previous_timestamp"] = previous_timestamp
-    throwing_star_regions = config["strategy"]["options"]["throwing_star_safe"].get(
-        "target_regions",
-        [],
-    )
-    target_regions_complete = bool(
-        isinstance(throwing_star_regions, list)
-        and any(
-            isinstance(item, dict) and bool(item.get("enabled", True))
-            for item in throwing_star_regions
-        )
-    )
-    target_regions_item = items.setdefault("throwing_star_target_regions", {})
-    if not isinstance(target_regions_item, dict):
-        items["throwing_star_target_regions"] = target_regions_item = {}
-    target_regions_item["complete"] = target_regions_complete
+    # 依采集元数据刷新各策略状态，不把新职业分支写进公共配置层。
+    for strategy in list_strategies():
+        settings = config["strategy"]["options"][strategy.key]
+        for field in strategy.capture_fields:
+            if field.settings_path:
+                regions = settings.get(field.settings_path, [])
+                complete = bool(isinstance(regions, list) and any(
+                    isinstance(item, dict) and bool(item.get("enabled", True)) for item in regions))
+            elif field.capture_kind == "point":
+                complete = bool(recognition.get(f"{field.recognition_key}_captured")
+                    and recognition.get(f"{field.recognition_key}_space") == field.coordinate_space
+                    and valid_point(recognition.get(field.recognition_key)))
+                recognition[f"{field.recognition_key}_captured"] = complete
+            else:
+                continue
+            item = items.setdefault(field.recognition_key, {})
+            if not isinstance(item, dict):
+                items[field.recognition_key] = item = {}
+            item["complete"] = complete
     refresh_calibrated(config)
     config.setdefault("vision", {})
     monster_threshold = float(config["vision"].get("monster_template_threshold", 0.79))

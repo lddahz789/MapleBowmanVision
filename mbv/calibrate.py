@@ -696,7 +696,7 @@ def capture_strategy_region(
     if not key or not path or not item_key:
         raise ValueError("策略索敌区配置无效")
     if player_anchor is None and player_box is None:
-        raise RuntimeError("尚未识别到角色，请先让姓名板出现在画面上再框选标飞索敌区")
+        raise RuntimeError("尚未识别到角色，请先让姓名板出现在画面上再框选策略索敌区")
     config = load_config(config_path)
     window = find_game_window(config)
     _prepare_window_calibration(config, window)
@@ -714,11 +714,11 @@ def capture_strategy_region(
         frozen_frame=frozen_frame,
     )
     if result.cancelled or result.rectangle is None:
-        raise RuntimeError("已取消标飞索敌区框选")
+        raise RuntimeError("已取消策略索敌区框选")
     rx, ry, rw, rh = result.rectangle
     cx, cy, cw, ch = combat_rect
     if rx < cx or ry < cy or rx + rw > cx + cw or ry + rh > cy + ch:
-        raise RuntimeError("标飞索敌区必须完整位于战斗识别区域内")
+        raise RuntimeError("策略索敌区必须完整位于战斗识别区域内")
     if player_anchor is not None:
         anchor = player_anchor
     elif player_box is not None:
@@ -763,7 +763,7 @@ def capture_strategy_region(
     refresh_calibrated(config)
     save_config(config_path, config)
     print(
-        f"标飞索敌区已保存：{saved['name']}，"
+        f"策略索敌区已保存：{saved['name']}，"
         f"相对角色 x={saved['offset_x']:.3f}, y={saved['offset_y']:.3f}, "
         f"w={saved['w']:.3f}, h={saved['h']:.3f}"
     )

@@ -231,6 +231,19 @@ class RuntimeOverlay:
             except tk.TclError:
                 self._closed = True
 
+    def reset_session(self) -> None:
+        """主线程在旧 worker 结束后调用，避免重连时闪现上个窗口的 HUD。"""
+        self.hide()
+        while True:
+            try:
+                self._updates.get_nowait()
+            except queue.Empty:
+                break
+        self._last_state = None
+        self._last_drawn_state = None
+        self._window_geometry = None
+        self._canvas.delete("all")
+
     def start_polling(self) -> None:
         self._root.after(0, self._poll)
 

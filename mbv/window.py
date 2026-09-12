@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
-from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+import ntpath
 import os
 import time
-from typing import Any
+from typing import Any, Iterator
 
 import mss
 import numpy as np
@@ -29,6 +32,92 @@ class WindowInfo:
     top: int
     width: int
     height: int
+    pid: int = 0
+
+
+@dataclass(frozen=True)
+class WindowTarget:
+    hwnd: int
+    pid: int
+    title: str
+    process_path: str
+    score: int = 0
+
+
+_selected_window: ContextVar[WindowTarget | None] = ContextVar("selected_game_window", default=None)
+
+
+@contextmanager
+def selected_window(target: WindowTarget) -> Iterator[None]:
+    """让当前采集操作沿用面板的精确目标，结束后恢复原来的选择作用域。"""
+    token = _selected_window.set(target)
+    try:
+        yield
+    finally:
+        _selected_window.reset(token)
+
+
+def _validate_window_identity(hwnd: int, pid: int) -> None:
+    if not hwnd or pid <= 0 or not user32.IsWindow(hwnd):
+        raise RuntimeError("所选窗口已关闭或失效，请重新选择作用窗口。")
+    current_pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(current_pid))
+    if int(current_pid.value) != pid:
+        raise RuntimeError("所选窗口的进程已变化，请重新选择作用窗口。")
+
+
+def validate_window_target(target: WindowTarget) -> None:
+    """只验证窗口身份；同标题或复用的句柄都不能替代原目标。"""
+    _validate_window_identity(target.hwnd, target.pid)
+
+
+def resolve_window_target(target: WindowTarget) -> WindowInfo:
+    validate_window_target(target)
+    if user32.IsIconic(target.hwnd):
+        raise RuntimeError("所选窗口已最小化，请恢复窗口后重试。")
+    window = client_window(target.hwnd, target.title)
+    validate_window_target(target)
+    return replace(window, pid=target.pid)
+
+
+def _window_match_score(config: dict[str, Any], title: str, process_path: str) -> int:
+    window_config = config["window"]
+    folded = title.casefold()
+    process_folded = process_path.casefold()
+    score = 0
+    if folded in [str(value).casefold() for value in window_config.get("exact_titles", [])]:
+        score += 100
+    if any(str(value).casefold() in process_folded for value in window_config.get("executable_contains", [])):
+        score += 200
+    if any(str(value).casefold() in folded for value in window_config.get("title_contains", [])):
+        score += 10
+    preferred_title = str(window_config.get("preferred_title", "")).strip().casefold()
+    preferred_executable = str(window_config.get("preferred_executable", "")).strip().casefold()
+    if (
+        preferred_title
+        and preferred_executable
+        and folded == preferred_title
+        and ntpath.basename(process_path).casefold() == preferred_executable
+    ):
+        score += 1000
+    return score
+
+
+def window_candidates(config: dict[str, Any]) -> list[WindowTarget]:
+    """枚举可选窗口；旧匹配规则和上次首选只影响排序，不限制手动选择。"""
+    found: list[WindowTarget] = []
+    own_pid = os.getpid()
+    for hwnd, title in visible_windows():
+        try:
+            pid, process_path = window_process_path(hwnd)
+            if not pid or pid == own_pid:
+                continue
+            target = WindowTarget(hwnd, pid, title, process_path, _window_match_score(config, title, process_path))
+            resolve_window_target(target)
+        except (OSError, RuntimeError):
+            continue
+        found.append(target)
+    return sorted(found, key=lambda target: target.score, reverse=True)
 
 
 def visible_windows() -> list[tuple[int, str]]:
@@ -68,24 +157,16 @@ def client_window(hwnd: int, title: str) -> WindowInfo:
 
 
 def find_game_window(config: dict[str, Any]) -> WindowInfo:
+    selected = _selected_window.get()
+    if selected is not None:
+        return resolve_window_target(selected)
     window_config = config["window"]
-    needles = [str(x).casefold() for x in window_config.get("title_contains", [])]
-    exact_titles = [str(x).casefold() for x in window_config.get("exact_titles", [])]
-    executable_needles = [str(x).casefold() for x in window_config.get("executable_contains", [])]
     candidates: list[tuple[int, int, str, str]] = []
     for hwnd, title in visible_windows():
-        folded = title.casefold()
         pid, process_path = window_process_path(hwnd)
         if pid == os.getpid():
             continue
-        process_folded = process_path.casefold()
-        score = 0
-        if folded in exact_titles:
-            score += 100
-        if any(needle in process_folded for needle in executable_needles):
-            score += 200
-        if any(needle in folded for needle in needles):
-            score += 10
+        score = _window_match_score(config, title, process_path)
         if score:
             candidates.append((score, hwnd, title, process_path))
     if candidates:
@@ -111,6 +192,8 @@ def find_game_window(config: dict[str, Any]) -> WindowInfo:
 def focus_game_window(window: WindowInfo, settle_seconds: float = 0.8) -> None:
     # Calibration must capture the unobstructed game, not the console that
     # launched this script. This changes focus only; it sends no game keys.
+    if window.pid:
+        _validate_window_identity(window.hwnd, window.pid)
     if user32.IsIconic(window.hwnd):
         user32.ShowWindow(window.hwnd, SW_RESTORE)
     foreground = int(user32.GetForegroundWindow() or 0)
@@ -126,6 +209,8 @@ def focus_game_window(window: WindowInfo, settle_seconds: float = 0.8) -> None:
             attached_foreground = bool(user32.AttachThreadInput(current_thread, foreground_thread, True))
         if target_thread and target_thread != current_thread:
             attached_target = bool(user32.AttachThreadInput(current_thread, target_thread, True))
+        if window.pid:
+            _validate_window_identity(window.hwnd, window.pid)
         user32.BringWindowToTop(window.hwnd)
         user32.SetActiveWindow(window.hwnd)
         user32.SetForegroundWindow(window.hwnd)
@@ -140,8 +225,12 @@ def focus_game_window(window: WindowInfo, settle_seconds: float = 0.8) -> None:
             user32.AttachThreadInput(current_thread, foreground_thread, False)
     deadline = time.monotonic() + 1.5
     while time.monotonic() < deadline:
+        if window.pid:
+            _validate_window_identity(window.hwnd, window.pid)
         if int(user32.GetForegroundWindow()) == window.hwnd:
             time.sleep(settle_seconds)
+            if window.pid:
+                _validate_window_identity(window.hwnd, window.pid)
             return
         time.sleep(0.05)
     raise RuntimeError("无法将游戏切换到前台。请手动点一下游戏窗口后重试。")
@@ -149,6 +238,8 @@ def focus_game_window(window: WindowInfo, settle_seconds: float = 0.8) -> None:
 
 def set_window_topmost(window: WindowInfo, enabled: bool) -> None:
     """Keep the game visible while armed without moving, resizing, or focusing it."""
+    if window.pid:
+        _validate_window_identity(window.hwnd, window.pid)
     insert_after = HWND_TOPMOST if enabled else HWND_NOTOPMOST
     flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
     if not user32.SetWindowPos(window.hwnd, insert_after, 0, 0, 0, 0, flags):
@@ -159,6 +250,10 @@ def set_window_topmost(window: WindowInfo, enabled: bool) -> None:
 def capture_client(sct: Any, window: WindowInfo, attempts: int = 3) -> np.ndarray:
     last_error: BaseException | None = None
     for attempt in range(max(1, attempts)):
+        if window.pid:
+            _validate_window_identity(window.hwnd, window.pid)
+            if user32.IsIconic(window.hwnd):
+                raise RuntimeError("所选窗口已最小化，请恢复窗口后重试。")
         current = client_window(window.hwnd, window.title)
         monitor = {
             "left": current.left,
@@ -167,7 +262,11 @@ def capture_client(sct: Any, window: WindowInfo, attempts: int = 3) -> np.ndarra
             "height": current.height,
         }
         try:
+            if window.pid:
+                _validate_window_identity(window.hwnd, window.pid)
             shot = np.asarray(sct.grab(monitor), dtype=np.uint8)
+            if window.pid:
+                _validate_window_identity(window.hwnd, window.pid)
             return np.ascontiguousarray(shot[:, :, :3])
         except mss.exception.ScreenShotError as exc:
             last_error = exc

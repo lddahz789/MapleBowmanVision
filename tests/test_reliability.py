@@ -163,7 +163,7 @@ class BuffPreparationTests(unittest.TestCase):
 
 
 class PanelErrorTests(unittest.TestCase):
-    def test_worker_error_is_delivered_by_main_thread_tick(self):
+    def test_worker_error_is_delivered_by_main_thread_completion_poll(self):
         panel = ControlPanel.__new__(ControlPanel)
         panel.bot = MagicMock()
         error = ValueError("original error")
@@ -172,10 +172,20 @@ class PanelErrorTests(unittest.TestCase):
         panel.overlay = MagicMock()
         panel.root = MagicMock()
         panel._worker_failed = MagicMock()
+        panel._refresh_window_controls = MagicMock()
+        panel._selected_target = None
+        panel._pending_target = None
+        panel._stopping_session = False
+        panel._closing = False
+        panel.busy = False
+        panel.worker = MagicMock()
+        panel.worker.is_alive.return_value = False
         panel._run_bot()
         panel.root.after.assert_not_called()
-        panel._tick()
+        panel._worker_failed.assert_not_called()
+        panel._consume_worker_completion()
         panel._worker_failed.assert_called_once_with(error)
+        panel.overlay.close.assert_not_called()
 
 
 class SafeAreaTests(unittest.TestCase):

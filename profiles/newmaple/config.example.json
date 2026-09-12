@@ -163,6 +163,16 @@
         "platform_center_vertical_tolerance": 0.06,
         "platform_return_jump_interval_seconds": 0.45
       },
+      "dragon_roar": {
+        "skill_key": "",
+        "monster_count_threshold": 2,
+        "cast_interval_seconds": 1.0,
+        "return_tolerance_x": 0.015,
+        "return_tolerance_y": 0.06,
+        "return_jump_interval_seconds": 0.45,
+        "return_timeout_seconds": 15.0,
+        "attack_regions": []
+      },
       "throwing_star_safe": {
         "use_target_regions": true,
         "use_common_target_box": false,

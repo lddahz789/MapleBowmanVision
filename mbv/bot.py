@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 from ctypes import wintypes
 from pathlib import Path
 import threading
@@ -66,11 +67,15 @@ from mbv.win32 import (
     user32,
 )
 from mbv.window import (
+    WindowInfo,
+    WindowTarget,
     capture_client,
     client_window,
     find_game_window,
     focus_game_window,
+    resolve_window_target,
     set_window_topmost,
+    validate_window_target,
     window_process_path,
 )
 
@@ -140,6 +145,19 @@ STATE_LABELS = {
     "WAITING_NEAR_JUMP_ATTACK": "等待近目标跳跃攻击间隔",
     "JUMP_ATTACK_CLOSE": "近身跳跃攻击",
     "WAITING_JUMP_ATTACK": "等待近身跳跃攻击冷却",
+    "CAST_KEY_MISSING": "请先采集策略技能键",
+    "CAST_WAITING_INTERVAL": "等待技能施放间隔",
+    "DRAGON_RETURN_BLOCKED": "回位已超时，请检查路径后暂停重启",
+    "DRAGON_POINT_UNCALIBRATED": "请在小地图采集龙咆哮定点",
+    "DRAGON_RANGE_UNCALIBRATED": "请框选并启用龙咆哮攻击范围",
+    "DRAGON_RETURN_LEFT": "向左返回龙咆哮定点",
+    "DRAGON_RETURN_RIGHT": "向右返回龙咆哮定点",
+    "DRAGON_WAITING_RETURN_JUMP": "等待下一次定点回位跳跃",
+    "DRAGON_RETURN_JUMP": "向上跳回龙咆哮定点",
+    "DRAGON_RETURN_DOWN_JUMP": "下跳返回龙咆哮定点",
+    "DRAGON_SKILL_UNBOUND": "请先采集龙咆哮技能键",
+    "DRAGON_WAITING_MONSTERS": "范围内怪物数量不足，原地等待",
+    "DRAGON_ROAR": "定点施放龙咆哮",
 }
 
 PLAYER_LOST_RECOVERY_PAUSE_SECONDS = 0.08
@@ -287,6 +305,7 @@ class BowmanBot:
         self.integrity_ok = True
         self.vision_suspended = threading.Event()
         self.window: WindowInfo | None = None
+        self._window_target: WindowTarget | None = None
         self.window_topmost = False
         self.ui_hp = 0.0
         self.ui_mp = 0.0
@@ -422,8 +441,11 @@ class BowmanBot:
                 self.window_topmost = False
                 if window is not None and user32.IsWindow(window.hwnd):
                     try:
+                        target = getattr(self, "_window_target", None)
+                        if target is not None:
+                            validate_window_target(target)
                         set_window_topmost(window, False)
-                    except OSError as exc:
+                    except (OSError, RuntimeError) as exc:
                         self.log.write("window_topmost_error", enabled=False, error=str(exc))
         if was_armed:
             self.log.write("disarm", reason=reason)
@@ -433,6 +455,16 @@ class BowmanBot:
     def toggle(self, window: WindowInfo) -> None:
         with self.action_lock:
             self._toggle(window)
+
+    def _bind_input_window(self, hwnd: int) -> None:
+        target = getattr(self, "_window_target", None)
+        if target is None:
+            self.keyboard.bind_window(hwnd)
+        else:
+            validate_window_target(target)
+            if hwnd != target.hwnd:
+                raise OSError("输入窗口与当前选择不一致，请重新连接窗口。")
+            self.keyboard.bind_window(hwnd, expected_pid=target.pid)
 
     def _toggle(self, window: WindowInfo) -> None:
         if self.armed:
@@ -466,7 +498,8 @@ class BowmanBot:
             self.notify("启动失败：游戏窗口已最小化。后台截图需要窗口保持可见。", 6.0)
             return
         try:
-            window = client_window(window.hwnd, window.title)
+            target = getattr(self, "_window_target", None)
+            window = resolve_window_target(target) if target is not None else client_window(window.hwnd, window.title)
         except Exception as exc:
             self.notify(f"启动失败：无法读取当前游戏窗口（{exc}）", 6.0)
             return
@@ -483,7 +516,7 @@ class BowmanBot:
             )
             return
         try:
-            self.keyboard.bind_window(window.hwnd)
+            self._bind_input_window(window.hwnd)
             if self.delivery == "hybrid":
                 self.keyboard.check_health()
                 self._hybrid_input_fault = False
@@ -843,6 +876,10 @@ class BowmanBot:
                     self._reset_player_lost_recovery(release_key=True)
                 new_delivery = input_delivery(config)
                 hwnd = self.keyboard.root_hwnd or self.keyboard.hwnd
+                if getattr(self, "_window_target", None) is not None and self.window is None:
+                    # 会话结束后允许离线改设置，不能重新绑定已失效的旧窗口。
+                    # 旧键仍由下面的 release_all 确认释放，失败时不得丢弃旧 Keyboard。
+                    hwnd = 0
                 if new_delivery != self.delivery:
                     self.keyboard.release_all()
                     self.delivery = new_delivery
@@ -850,7 +887,7 @@ class BowmanBot:
                     self.keyboard = Keyboard(self.delivery)
                     self._configure_hybrid_cancellation()
                     if hwnd:
-                        self.keyboard.bind_window(hwnd)
+                        self._bind_input_window(hwnd)
                 self.config = config
                 self.template_roots = template_roots_from_config(config)
                 self.template_trash_dir = template_trash_from_config(config)
@@ -1279,6 +1316,45 @@ class BowmanBot:
                    if getattr(self, "delivery", "foreground") == "hybrid" else {}),
             )
 
+    def cast_skill(
+        self,
+        attack_key: str | None,
+        attack_skill: str | None,
+        interval_seconds: float | None,
+        now: float,
+        state: str,
+    ) -> None:
+        """不要求面向的原地技能；仍由公共行动门禁授权，不回退普通攻击。"""
+        self.stop_move()
+        selected_key = attack_key.strip().lower() if isinstance(attack_key, str) else ""
+        if not selected_key:
+            self.state = "CAST_KEY_MISSING"
+            return
+        try:
+            interval = float(interval_seconds) if not isinstance(interval_seconds, bool) else 1.0
+        except (TypeError, ValueError):
+            interval = 1.0
+        if not math.isfinite(interval):
+            interval = 1.0
+        interval = max(0.1, min(10.0, interval))
+        # now 来自截图前，不能把慢检测时间算进下一次技能冷却。
+        if time.monotonic() - self.last_attack < interval:
+            self.state = "CAST_WAITING_INTERVAL"
+            return
+        if not self.armed or not self.input_authorized or any(
+            event is not None and event.is_set()
+            for event in (getattr(self, "f8_requested", None), getattr(self, "f9_requested", None),
+                          getattr(self, "vision_suspended", None))
+        ):
+            self.state = "PAUSED"
+            return
+        self.keyboard.tap(selected_key)
+        self.last_attack = time.monotonic()
+        self._invalidate_facing_for_auxiliary_key(selected_key)
+        self.state = state
+        self.log.write("attack", skill=str(attack_skill or "cast"), key=selected_key,
+                       direction=None, interval_seconds=interval, result="key_sent_unverified")
+
     def face_target(
         self,
         direction: str,
@@ -1450,6 +1526,13 @@ class BowmanBot:
         eligible_detections: tuple[Detection, ...] = (),
     ) -> None:
         with self.action_lock:
+            # 主线程可能已在本帧识别期间暂停采集或请求切窗；旧帧不得再发键。
+            stop_events = (getattr(self, "vision_suspended", None), getattr(self, "f9_requested", None))
+            if any(event is not None and event.is_set() for event in stop_events):
+                return
+            target = getattr(self, "_window_target", None)
+            if target is not None:
+                resolve_window_target(target)
             try:
                 if not self.armed:
                     # 输入故障需用户显式重新启动；暂停喝药不能反复触发同一异常。
@@ -1609,7 +1692,8 @@ class BowmanBot:
                 self.state = "MINIMAP_VISUAL_TIMEOUT"
                 return
         if (not localized and not minimap_only
-                and getattr(self, "strategy_runtime_state", {}).get("navigation_active", False)):
+                and (getattr(self, "strategy_runtime_state", {}).get("navigation_active", False)
+                     or not getattr(self.strategy, "allow_player_lost_recovery", True))):
             # 导航中不能使用过期的屏幕框继续攻击，也不能离开既定路线盲走找人。
             self._reset_player_lost_recovery(release_key=True)
             self._interrupt_step()
@@ -1617,7 +1701,8 @@ class BowmanBot:
             self.state = "PLAYER_SCREEN_LOST"
             return
         if (not localized and not minimap_only
-                and bool(behavior.get("player_lost_recovery_enabled", True)) and nameplate_lost):
+                and bool(behavior.get("player_lost_recovery_enabled", True)) and nameplate_lost
+                and getattr(self.strategy, "allow_player_lost_recovery", True)):
             self._interrupt_step()
             self.recover_player_nameplate(now)
             return
@@ -1665,7 +1750,7 @@ class BowmanBot:
         self._strategy_decision_made = True
         # 无目标、原地等待或拾取本身不改变朝向。移动/转向动作仍立即作废缓存，
         # 视觉缺失由上方的独立短宽限处理，不能每个非攻击帧都再插入 0.6 秒停攻。
-        if decision.action not in {"attack", "stop", "pickup", "face", "jump_attack"}:
+        if decision.action not in {"attack", "cast", "stop", "pickup", "face", "jump_attack"}:
             self._reset_attack_facing()
         self._strategy_localization_gap = 0.0
         if minimap_only and decision.action not in {"stop", "move", "jump", "down_jump"}:
@@ -1726,6 +1811,9 @@ class BowmanBot:
                 attack_skill=decision.attack_skill,
                 face_tap_seconds=decision.face_tap_seconds,
             )
+        elif decision.action == "cast":
+            self.cast_skill(decision.attack_key, decision.attack_skill,
+                            decision.attack_interval_seconds, now, decision.state)
         elif decision.action == "chase":
             self.chase_target(float(decision.target_x), float(decision.player_x))
         elif decision.action == "move":
@@ -2347,15 +2435,45 @@ class BowmanBot:
             return finish(None)
         return finish(track.anchor_within_hold(now, player_hold))
 
-    def run(self, overlay: RuntimeOverlay) -> None:
-        window = find_game_window(self.config)
+    def run(
+        self,
+        overlay: RuntimeOverlay,
+        *,
+        target: WindowTarget | None = None,
+        close_overlay_on_exit: bool = True,
+    ) -> None:
+        """一次连接对应一个全新 Bot；面板可在会话结束后复用自己的 HUD。"""
+        self._window_target = target
+        try:
+            self._run_session(overlay)
+        except BaseException as exc:
+            self.performance.mark_error(exc)
+            raise
+        finally:
+            try:
+                self.auto_potion.set_enabled(False)
+                self.disarm("窗口会话结束")
+            finally:
+                self.performance.stop()
+                self.stop_hotkey_monitor()
+                if close_overlay_on_exit:
+                    overlay.close()
+                else:
+                    overlay.update({"background_hidden": True})
+                self.window = None
+            self.log.write("session_end")
+            print(f"运行日志：{self.log.path}")
+
+    def _run_session(self, overlay: RuntimeOverlay) -> None:
+        session_target = self._window_target
+        window = resolve_window_target(session_target) if session_target is not None else find_game_window(self.config)
         self.window = window
         game_pid, _game_path = window_process_path(window.hwnd)
         current_pid = int(ctypes.windll.kernel32.GetCurrentProcessId())
         current_integrity = process_integrity_level(current_pid)
         game_integrity = process_integrity_level(game_pid)
         self.integrity_ok = current_integrity < 0 or game_integrity < 0 or current_integrity >= game_integrity
-        self.keyboard.bind_window(window.hwnd)
+        self._bind_input_window(window.hwnd)
         fps = max(2.0, float(self.config["capture"]["fps"]))
         frame_period = 1.0 / fps
         self.performance.update_target_fps(fps)
@@ -2403,6 +2521,10 @@ class BowmanBot:
                     if self.f9_requested.is_set():
                         self.f9_requested.clear()
                         break
+                    if session_target is not None:
+                        # 关闭、最小化或 HWND 被复用均结束当前会话，不自动寻找同名窗口。
+                        window = resolve_window_target(session_target)
+                        self.window = window
                     with self.action_lock:
                         if self.f8_requested.is_set():
                             self.f8_requested.clear()
@@ -2592,6 +2714,7 @@ class BowmanBot:
                     target_selection = self.strategy.select_targets(
                         TargetSelectionContext(
                             detections=monsters,
+                            detections_fresh=bool(detected_monsters),
                             player_box=player_box,
                             player_raw_box=player_raw_box,
                             player_anchor=self.last_attack_anchor,
@@ -2854,16 +2977,9 @@ class BowmanBot:
                     elapsed = time.monotonic() - loop_start
                     if elapsed < frame_period:
                         time.sleep(frame_period - elapsed)
-        except BaseException as exc:
-            self.performance.mark_error(exc)
-            raise
         finally:
-            background_capture.close()
-            self.performance.stop()
-            self.stop_hotkey_monitor()
-            hotkey_thread.join(timeout=1.0)
-            self.auto_potion.set_enabled(False)
-            self.disarm("程序退出")
-            overlay.close()
-            self.log.write("session_end")
-            print(f"运行日志：{self.log.path}")
+            try:
+                background_capture.close()
+            finally:
+                self.stop_hotkey_monitor()
+                hotkey_thread.join(timeout=1.0)
