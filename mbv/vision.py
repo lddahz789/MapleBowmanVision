@@ -151,6 +151,9 @@ class Template:
         default_factory=dict, repr=False, compare=False
     )
     _edge_cache: dict[float, np.ndarray] = field(default_factory=dict, repr=False, compare=False)
+    _identity_cache: tuple[np.ndarray, int] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def scaled_features(self, scale: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """模板是静态的：按缩放比例缓存 (图像, 前景蒙版, 颜色对立通道)。"""
@@ -172,6 +175,14 @@ class Template:
             edges = cv2.Canny(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), 55, 140)
             self._edge_cache[scale] = edges
         return edges
+
+    def nameplate_identity_features(self) -> tuple[np.ndarray, int]:
+        """静态模板字形只提取一次；重载素材会创建新的 Template。"""
+        if self._identity_cache is None:
+            expected = nameplate_identity_mask(self.image, self.foreground_mask) > 0
+            expected.setflags(write=False)
+            self._identity_cache = expected, int(np.count_nonzero(expected))
+        return self._identity_cache
 
 
 @dataclass(frozen=True)
@@ -363,11 +374,23 @@ def nameplate_identity_similarity(
     """比较姓名字形的重合度；共享蓝板本身不会贡献身份分。"""
     if template.size == 0 or candidate.size == 0:
         return 0.0
-    if candidate.shape[:2] != template.shape[:2]:
-        candidate = cv2.resize(candidate, (template.shape[1], template.shape[0]), interpolation=cv2.INTER_AREA)
     expected = nameplate_identity_mask(template, foreground_mask) > 0
-    actual = nameplate_identity_mask(candidate, foreground_mask) > 0
     expected_count = int(np.count_nonzero(expected))
+    return _nameplate_identity_similarity(candidate, foreground_mask, expected, expected_count)
+
+
+def _nameplate_identity_similarity(
+    candidate: np.ndarray,
+    foreground_mask: np.ndarray | None,
+    expected: np.ndarray,
+    expected_count: int,
+) -> float:
+    """共用原字形评分，候选始终逐帧提取；缓存只提供模板一侧的特征。"""
+    if expected.size == 0 or candidate.size == 0:
+        return 0.0
+    if candidate.shape[:2] != expected.shape:
+        candidate = cv2.resize(candidate, (expected.shape[1], expected.shape[0]), interpolation=cv2.INTER_AREA)
+    actual = nameplate_identity_mask(candidate, foreground_mask) > 0
     if expected_count < 3 or int(np.count_nonzero(actual)) < 3:
         return 0.0
     best = 0.0
@@ -413,10 +436,12 @@ def verify_nameplate_identities(
         if right - left != template.image.shape[1] or bottom - top != template.image.shape[0]:
             score = 0.0
         else:
-            score = nameplate_identity_similarity(
-                template.image,
+            expected, expected_count = template.nameplate_identity_features()
+            score = _nameplate_identity_similarity(
                 scene[top:bottom, left:right],
                 template.foreground_mask,
+                expected,
+                expected_count,
             )
         verified.append(
             replace(

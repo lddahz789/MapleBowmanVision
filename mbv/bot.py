@@ -2418,6 +2418,12 @@ class BowmanBot:
                     if self.vision_suspended.is_set():
                         time.sleep(0.05)
                         continue
+                    # 帧率在下一帧生效；当前帧的节流预算和性能统计始终使用同一个值。
+                    configured_fps = max(2.0, float(self.config["capture"]["fps"]))
+                    if configured_fps != fps:
+                        fps = configured_fps
+                        frame_period = 1.0 / fps
+                        self.performance.update_target_fps(fps)
                     vision = self.config["vision"]
                     capture_started_ns = time.perf_counter_ns()
                     try:

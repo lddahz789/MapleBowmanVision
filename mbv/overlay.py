@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from copy import deepcopy
 from ctypes import wintypes
 from dataclasses import dataclass
 import queue
@@ -179,6 +180,9 @@ class RuntimeOverlay:
         self._closed = False
         self._visible = True
         self._last_state: dict[str, Any] | None = None
+        self._last_drawn_state: dict[str, Any] | None = None
+        self._window_geometry: tuple[int, int, int, int] | None = None
+        self._windows_shown = False
 
     def set_exit_handler(self, handler: Callable[[], None]) -> None:
         self._exit_handler = handler
@@ -215,6 +219,7 @@ class RuntimeOverlay:
         self._visible = False
         self._root.withdraw()
         self._exit_root.withdraw()
+        self._windows_shown = False
 
     def show(self) -> None:
         if self._closed:
@@ -254,15 +259,28 @@ class RuntimeOverlay:
 
     def _draw(self, root: tk.Tk, canvas: tk.Canvas, hwnd: int, state: dict[str, Any]) -> None:
         if state.get("background_hidden", False):
-            root.withdraw()
-            self._exit_root.withdraw()
+            if self._windows_shown:
+                root.withdraw()
+                self._exit_root.withdraw()
+                self._windows_shown = False
             return
         left = int(state["left"])
         top = int(state["top"])
         width = int(state["width"])
         height = int(state["height"])
-        root.geometry(f"{width}x{height}+{left}+{top}")
-        root.deiconify()
+        geometry = (left, top, width, height)
+        exit_width = 116
+        exit_height = 34
+        exit_left = left + max(0, width - exit_width)
+        if geometry != self._window_geometry or not self._windows_shown:
+            # 相同位置无需重复提交 Tk 几何布局，恢复显示时则重新同步两个窗口。
+            root.geometry(f"{width}x{height}{left:+d}{top:+d}")
+            root.deiconify()
+            self._exit_root.geometry(f"{exit_width}x{exit_height}{exit_left:+d}{top:+d}")
+            self._exit_root.deiconify()
+            self._window_geometry = geometry
+            self._windows_shown = True
+        # 游戏也可能是 topmost；仍逐次重申 HUD/退出按钮的层叠顺序，且不抢焦点。
         user32.SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -272,11 +290,6 @@ class RuntimeOverlay:
             height,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )
-        exit_width = 116
-        exit_height = 34
-        exit_left = left + max(0, width - exit_width)
-        self._exit_root.geometry(f"{exit_width}x{exit_height}+{exit_left}+{top}")
-        self._exit_root.deiconify()
         user32.SetWindowPos(
             self._exit_hwnd,
             HWND_TOPMOST,
@@ -286,7 +299,14 @@ class RuntimeOverlay:
             exit_height,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )
-        self._exit_button.configure(text="退出程序")
+        if state == self._last_drawn_state:
+            return
+        # 配置 ROI 和策略框包含可变容器，必须保留独立快照来识别后续原地修改。
+        snapshot = deepcopy(state)
+        self._paint_canvas(canvas, snapshot, width, height)
+        self._last_drawn_state = snapshot
+
+    def _paint_canvas(self, canvas: tk.Canvas, state: dict[str, Any], width: int, height: int) -> None:
         canvas.delete("all")
         font = ("Microsoft YaHei UI", max(12, int(height * 0.016)), "bold")
         small = ("Microsoft YaHei UI", max(11, int(height * 0.014)))

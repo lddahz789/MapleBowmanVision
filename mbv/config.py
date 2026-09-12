@@ -366,6 +366,9 @@ def save_config(path: Path, config: dict[str, Any]) -> None:
     payload = (json.dumps(config, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
     if path.exists():
         previous = path.read_bytes()
+        # 自动保存与退出会重复提交相同内容：保留真正的上一版备份，避免两次 fsync/替换。
+        if previous == payload:
+            return
         try:
             json.loads(previous)
         except (ValueError, UnicodeError):
