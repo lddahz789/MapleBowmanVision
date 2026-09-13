@@ -6,6 +6,7 @@ import math
 import numpy as np
 
 from mbv.vision import PlayerAnchor
+from mbv.minimap_localization import background_is_stable
 
 
 MINIMAP_STATIONARY_RADIUS_PIXELS = 2.0
@@ -48,6 +49,75 @@ def _valid_marker(marker: tuple[float, float] | None) -> bool:
 
 
 @dataclass
+class HeadRecoveryWindow:
+    """本人头部的有限漏帧确认；只返回当前真实命中，不输出旧框。"""
+
+    anchor: PlayerAnchor | None = None
+    marker: tuple[float, float] | None = None
+    size: tuple[int, ...] = ()
+    background: np.ndarray | None = field(default=None, repr=False, compare=False)
+    started_at: float = 0.0
+    last_frame: int = -1
+    hits: int = 0
+    gaps: int = 0
+    reason: str = "idle"
+
+    def clear(self, reason: str = "reset") -> None:
+        self.anchor = None
+        self.marker = None
+        self.background = None
+        self.size = ()
+        self.hits = self.gaps = 0
+        self.last_frame = -1
+        self.reason = reason
+
+    def observe(self, candidate: PlayerAnchor | None, *, now: float, frame: int,
+                marker: tuple[float, float] | None, size: tuple[int, int, int, int],
+                background: np.ndarray, eligible: bool, required_frames: int = 3) -> PlayerAnchor | None:
+        if not eligible or not _valid_marker(marker) or min(size) <= 0 or not math.isfinite(now):
+            self.clear("guard_rejected")
+            return None
+        if candidate is not None and candidate.source != "头部":
+            self.clear("not_head")
+            return None
+        if self.anchor is not None:
+            if frame == self.last_frame:
+                return None
+            distance = math.hypot((marker[0] - self.marker[0]) * size[2],
+                                  (marker[1] - self.marker[1]) * size[3])
+            if (size != self.size or frame != self.last_frame + 1
+                    or not 0 <= now - self.started_at <= 0.9 or distance > 0.5
+                    or not background_is_stable(self.background, background)):
+                self.clear("evidence_changed_or_expired")
+                return None
+            if candidate is not None:
+                delta = math.dist(_anchor_point(candidate), _anchor_point(self.anchor))
+                if not math.isfinite(delta) or delta > max(4.0, min(12.0, size[0] * 0.01)):
+                    self.clear("head_position_changed")
+                    return None
+        else:
+            if candidate is None or not background_is_stable(background, background):
+                return None
+            self.anchor, self.marker, self.size = candidate, marker, size
+            self.background = background.copy()
+            self.started_at = now
+        self.last_frame = frame
+        if candidate is None:
+            self.gaps += 1
+            if self.gaps > 1:
+                self.clear("gap_limit")
+            else:
+                self.reason = "one_gap_retained"
+            return None
+        self.hits += 1
+        self.reason = "confirming"
+        if self.hits >= max(3, int(required_frames)):
+            self.clear("confirmed_current_head")
+            return candidate
+        return None
+
+
+@dataclass
 class PlayerTrackState:
     """玩家定位的时序状态；只有真实检测才能刷新位置和存活时间。"""
 
@@ -70,6 +140,7 @@ class PlayerTrackState:
     minimap_stationary_blocked: bool = False
     # 与可靠视觉同帧配对过的唯一小地图标记；导航也不能无限沿用身份。
     minimap_navigation_seen_at: float = 0.0
+    head_recovery: HeadRecoveryWindow = field(default_factory=HeadRecoveryWindow)
 
     def anchor_within_hold(self, now: float, hold_seconds: float) -> PlayerAnchor | None:
         if self.anchor is not None and now - self.last_seen_at <= max(0.0, float(hold_seconds)):
@@ -269,7 +340,9 @@ class PlayerTrackState:
     def begin_frame(self) -> None:
         self.frame_index += 1
 
-    def cancel_reacquisition(self) -> None:
+    def cancel_reacquisition(self, *, preserve_head: bool = False) -> None:
+        if not preserve_head:
+            self.head_recovery.clear()
         self.pending_anchor = None
         self.pending_count = 0
         self.pending_kind = ""
@@ -321,13 +394,14 @@ class PlayerTrackState:
     def mark_miss(self) -> None:
         self.misses += 1
         if self.pending_frame_index != self.frame_index:
-            self.cancel_reacquisition()
+            self.cancel_reacquisition(preserve_head=True)
         if self.pending_count > 0:
             self.mode = "REACQUIRE"
         else:
             self.mode = "OCCLUDED" if self.anchor is not None else "SEARCH_SELF"
 
     def reset(self) -> None:
+        self.head_recovery.clear()
         self.anchor = None
         self.last_seen_at = 0.0
         self.last_auxiliary_at = 0.0

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import math
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
+import wave
 
 import cv2
 import numpy as np
@@ -31,6 +35,8 @@ SCAN_SECONDS = 0.5
 CONFIRM_SCANS = 3
 CLEAR_SECONDS = 10.0
 COOLDOWN_SECONDS = 60.0
+ALERT_SOUND_SECONDS = 10
+ALERT_SAMPLE_RATE = 22050
 
 
 def normalize_alert_settings(raw: Any) -> dict[str, Any]:
@@ -125,8 +131,40 @@ class VerificationAlert:
         return match
 
 
+@lru_cache(maxsize=1)
+def _alert_sound_file() -> tuple[TemporaryDirectory, Path]:
+    """一次生成有限长度双音 WAV；缓存保留临时目录，退出时清理。"""
+    samples = np.zeros(ALERT_SAMPLE_RATE * ALERT_SOUND_SECONDS, dtype=np.float32)
+    tone_length = int(ALERT_SAMPLE_RATE * 0.32)
+    phase = np.arange(tone_length, dtype=np.float32) / ALERT_SAMPLE_RATE
+    # 淡入淡出消除突然截断的爆音；不修改系统音量。
+    envelope = np.ones(tone_length, dtype=np.float32)
+    fade = int(ALERT_SAMPLE_RATE * 0.005)
+    envelope[:fade] = np.linspace(0, 1, fade)
+    envelope[-fade:] = np.linspace(1, 0, fade)
+    for second in range(ALERT_SOUND_SECONDS):
+        for offset, frequency in ((0.0, 880), (0.32, 1320)):
+            start = round((second + offset) * ALERT_SAMPLE_RATE)
+            samples[start:start + tone_length] = (
+                0.65 * envelope * np.sin(2 * np.pi * frequency * phase)
+            )
+    directory = TemporaryDirectory(prefix="mbv-verification-sound-", ignore_cleanup_errors=True)
+    path = Path(directory.name) / "verification-alert-10s.wav"
+    try:
+        with wave.open(str(path), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(ALERT_SAMPLE_RATE)
+            output.writeframes((samples * 32767).astype("<i2").tobytes())
+    except Exception:
+        directory.cleanup()
+        raise
+    return directory, path
+
+
 def play_alert_sound() -> None:
-    """异步系统提示音，不 sleep、不创建逐帧线程、不抢窗口焦点。"""
+    """异步播放约 10 秒双音提醒；重复调用替换当前声音，不叠加、不无限循环。"""
     import winsound
 
-    winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    _directory, path = _alert_sound_file()
+    winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)

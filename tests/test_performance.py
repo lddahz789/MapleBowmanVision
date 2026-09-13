@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import ast
+import inspect
 import json
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import threading
+import textwrap
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock
@@ -16,6 +19,8 @@ sys.path.insert(0, str(ROOT))
 
 from mbv.performance import (
     PerformanceMonitor,
+    STAGE_LABELS,
+    STAGE_ORDER,
     current_process_memory_bytes,
     format_performance_summary,
 )
@@ -34,6 +39,39 @@ class MutableClock:
 
 
 class PerformanceMonitorTests(unittest.TestCase):
+    def test_bot_frame_stage_names_are_registered_and_formattable(self) -> None:
+        from mbv.bot import BowmanBot
+
+        # 从真实主循环取阶段名，防止只测诊断器而漏掉耗时上报这条接线。
+        tree = ast.parse(textwrap.dedent(inspect.getsource(BowmanBot._run_session)))
+        names = {
+            node.slice.value for node in ast.walk(tree)
+            if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store)
+            and isinstance(node.value, ast.Name) and node.value.id == "stages_ns"
+            and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str)
+        }
+        self.assertIn("localization_diagnostics", names)
+        self.assertFalse(names - set(STAGE_ORDER), f"主循环提交了未注册的阶段：{names - set(STAGE_ORDER)}")
+        self.assertFalse(set(STAGE_ORDER) - set(STAGE_LABELS))
+        monitor = self.make_monitor()
+        for start in (0, 50_000_000):
+            monitor.record_frame(started_ns=start, finished_ns=start + 20_000_000,
+                                 stages_ns={name: 1_000_000 for name in names})
+        self.assertIn("定位诊断 1.0", format_performance_summary(monitor.snapshot()))
+
+    def test_localization_diagnostic_timing_preserves_sparse_stage_statistics(self) -> None:
+        for mode in ("full", "potion_only"):
+            with self.subTest(mode=mode):
+                monitor = self.make_monitor()
+                monitor.record_frame(started_ns=0, finished_ns=20_000_000,
+                                     stages_ns={"localization_diagnostics": 2_000_000}, mode=mode)
+                monitor.record_frame(started_ns=50_000_000, finished_ns=70_000_000,
+                                     stages_ns={"capture": 1_000_000}, mode=mode)
+                stage = next(s for s in monitor.snapshot().stages if s.name == "localization_diagnostics")
+                self.assertEqual(stage.sample_count, 1)
+                self.assertEqual(stage.average_ms, 2.0)
+                self.assertIn("定位诊断 2.0", format_performance_summary(monitor.snapshot()))
+
     def make_monitor(
         self,
         target_fps: float = 20.0,

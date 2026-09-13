@@ -37,6 +37,7 @@ class WindowSessionTests(unittest.TestCase):
         self.target = WindowTarget(123, 456, "测试游戏", "game.exe")
 
     def test_initial_binding_failure_keeps_panel_overlay_and_cleans_input(self):
+        self.bot.localization_diagnostics = MagicMock()
         with patch("mbv.bot.resolve_window_target", side_effect=RuntimeError("窗口已关闭")), \
              patch("mbv.bot.find_game_window") as find:
             with self.assertRaisesRegex(RuntimeError, "窗口已关闭"):
@@ -45,6 +46,7 @@ class WindowSessionTests(unittest.TestCase):
         self.bot.keyboard.release_all.assert_called_once()
         self.assertFalse(self.bot.auto_potion.enabled)
         self.assertIsNone(self.bot.window)
+        self.bot.localization_diagnostics.close.assert_called_once_with()
         self.overlay.close.assert_not_called()
         self.overlay.update.assert_called_once_with({"background_hidden": True})
 

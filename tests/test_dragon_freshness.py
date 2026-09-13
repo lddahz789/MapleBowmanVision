@@ -93,7 +93,7 @@ class DragonRoarFrameFreshnessTests(unittest.TestCase):
              patch("mbv.bot.find_game_window") as find_window, \
              patch("mbv.bot.find_detections", side_effect=detect), \
              patch("mbv.bot.player_marker_observation", return_value=(
-                 SimpleNamespace(point=(0.5, 0.5), unambiguous=True), None)), \
+                 SimpleNamespace(point=(0.5, 0.5), unambiguous=True, candidate_count=1), None)), \
              patch("mbv.bot.time.monotonic", return_value=100.0), \
              patch("mbv.bot.time.sleep"):
             self.bot.run(overlay, target=self.target, close_overlay_on_exit=False)

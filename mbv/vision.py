@@ -154,6 +154,12 @@ class Template:
     _identity_cache: tuple[np.ndarray, int] | None = field(
         default=None, init=False, repr=False, compare=False
     )
+    _gray_cache: dict[float, np.ndarray] = field(default_factory=dict, repr=False, compare=False)
+
+    def scaled_gray(self, scale: float) -> np.ndarray:
+        if scale not in self._gray_cache:
+            self._gray_cache[scale] = cv2.cvtColor(self.scaled_features(scale)[0], cv2.COLOR_BGR2GRAY)
+        return self._gray_cache[scale]
 
     def scaled_features(self, scale: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """模板是静态的：按缩放比例缓存 (图像, 前景蒙版, 颜色对立通道)。"""
@@ -511,8 +517,12 @@ class SceneFeatures:
 
     def __init__(self, scene: np.ndarray) -> None:
         self.scene = scene
+        # 仅定位诊断启用；复用现有匹配结果，不增加扫描或改变候选筛选。
+        self.match_diagnostics: list[dict] | None = None
+        self.match_diagnostic_kind = ""
         self._scaled: dict[tuple[float, tuple[int, int, int, int] | None], np.ndarray] = {}
         self._opponent: dict[tuple[float, tuple[int, int, int, int] | None], np.ndarray] = {}
+        self._gray: dict[tuple[float, tuple[int, int, int, int] | None], np.ndarray] = {}
         self._edges: dict[tuple[float, tuple[int, int, int, int] | None], np.ndarray] = {}
 
     def _scaled_bounds(
@@ -558,6 +568,18 @@ class SceneFeatures:
                 cached = self.scene
             self._scaled[key] = cached
         return cached
+
+    def gray(self, scale: float, search_roi: tuple[int, int, int, int] | None = None) -> np.ndarray:
+        clipped_roi = clipped_search_roi(search_roi, self.scene.shape)
+        key = (scale, clipped_roi)
+        if key not in self._gray:
+            full = self._gray.get((scale, None))
+            if clipped_roi is not None and full is not None:
+                left, top, right, bottom = self._scaled_bounds(scale, clipped_roi)
+                self._gray[key] = full[top:bottom, left:right]
+            else:
+                self._gray[key] = cv2.cvtColor(self.scaled(scale, clipped_roi), cv2.COLOR_BGR2GRAY)
+        return self._gray[key]
 
     def opponent(
         self,
@@ -691,6 +713,7 @@ def find_detections(
     structure_weight: float = 0.0,
     search_roi: tuple[int, int, int, int] | None = None,
     nms_across_templates: bool = True,
+    achromatic_fallback: bool = False,
 ) -> tuple[list[Detection], float, str | None]:
     """返回画面中的全部模板目标，并通过 NMS 合并同一目标的重复框。
 
@@ -712,14 +735,27 @@ def find_detections(
     best_score = -1.0
     best_name = None
     candidates: list[Detection] = []
+    diagnostic = None
+    if features.match_diagnostics is not None and len(features.match_diagnostics) < 12:
+        diagnostic = {
+            "kind": features.match_diagnostic_kind, "scale": scale,
+            "threshold": threshold, "roi": clipped_roi,
+            "structure_weight": structure_weight, "template_count": len(templates),
+            "best_matches": [], "skipped_size": 0,
+        }
+        features.match_diagnostics.append(diagnostic)
     for template in templates:
         image, mask, template_opponent = template.scaled_features(scale)
         th, tw = image.shape[:2]
         if th > source.shape[0] or tw > source.shape[1] or th < 4 or tw < 4:
+            if diagnostic is not None:
+                diagnostic["skipped_size"] += 1
             continue
+        # 黑白字形的颜色差值全零，CCORR_NORMED 分母为零；仅姓名板显式开启。
+        use_gray = achromatic_fallback and not np.any(template_opponent[mask > 0])
         color_result = cv2.matchTemplate(
-            source_opponent,
-            template_opponent,
+            features.gray(scale, clipped_roi) if use_gray else source_opponent,
+            template.scaled_gray(scale) if use_gray else template_opponent,
             cv2.TM_CCORR_NORMED,
             mask=mask,
         )
@@ -742,6 +778,17 @@ def find_detections(
             result = color_result
         result = np.nan_to_num(result, copy=False, nan=-1.0, posinf=-1.0, neginf=-1.0)
         _min_value, max_value, _min_pos, max_pos = cv2.minMaxLoc(result)
+        if diagnostic is not None:
+            diagnostic["best_matches"].append({
+                "template": template.name, "score": float(max_value),
+                "match_channel": "gray" if use_gray else "opponent",
+                "box": [int(round((scaled_origin_x + max_pos[0]) / scale)),
+                        int(round((scaled_origin_y + max_pos[1]) / scale)),
+                        template.image.shape[1], template.image.shape[0]],
+                "passed_threshold": float(max_value) >= threshold,
+            })
+            diagnostic["best_matches"].sort(key=lambda item: item["score"], reverse=True)
+            del diagnostic["best_matches"][16:]
         if float(max_value) > best_score:
             best_score = float(max_value)
             best_name = template.name
@@ -781,6 +828,12 @@ def find_detections(
             kept.append(candidate)
             if len(kept) >= max_detections:
                 break
+    if diagnostic is not None:
+        diagnostic["candidate_count_before_nms"] = len(candidates)
+        diagnostic["candidate_count_after_nms"] = len(kept)
+        diagnostic["candidates"] = [
+            {"template": d.name, "box": d.box, "score": d.score} for d in kept[:16]
+        ]
     return kept, best_score, best_name
 
 

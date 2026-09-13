@@ -23,6 +23,7 @@ from mbv.background_capture import BackgroundCapture, BackgroundCaptureError
 from mbv.overlay import RuntimeOverlay
 from mbv.performance import PerformanceMonitor
 from mbv.player_tracking import PlayerTrackState
+from mbv.localization_diagnostics import LocalizationDiagnostics, anchor_record, track_record
 from mbv.minimap_localization import background_is_stable, background_snapshot
 from mbv.potion import AutoPotionController, PotionAction
 from mbv.strategies import active_strategy, missing_recognition_data, strategy_settings
@@ -251,6 +252,10 @@ class BowmanBot:
         self.player_head_templates = load_templates(self.template_roots.head)
         self.player_title_templates = load_templates(self.template_roots.title)
         self.log = SessionLog()
+        self.localization_diagnostics = (
+            LocalizationDiagnostics(self.log.path)
+            if config.get("diagnostics", {}).get("player_localization", True) else None
+        )
         from mbv.verification_alert import VerificationAlert
         self.verification_alert = VerificationAlert()
         self.verification_alert_status = ""
@@ -1913,7 +1918,9 @@ class BowmanBot:
         # 已在候选门槛前被丢弃的名字。粗检无有效身份时，同 ROI 用原图复核。
         # 不放宽阈值、不扩大 ROI，后续身份消歧和连续帧确认仍由 tracker 决定。
         scales = (scale, 1.0) if scale < 1.0 and templates else (scale,)
+        scene.match_diagnostic_kind = "nameplate" if threshold is None else "nameplate_recovery"
         for index, detection_scale in enumerate(scales):
+            diagnostic_count = len(scene.match_diagnostics or ())
             detections, scan_score, scan_name = find_detections(
                 scene,
                 templates,
@@ -1925,10 +1932,19 @@ class BowmanBot:
                 structure_weight=0.55,
                 search_roi=search_roi,
                 nms_across_templates=False,
+                achromatic_fallback=True,
             )
             if scan_score > score:
                 score, template_name = scan_score, scan_name
-            verified.extend(verify_nameplate_identities(scene.scene, detections, templates))
+            pass_verified = verify_nameplate_identities(scene.scene, detections, templates)
+            verified.extend(pass_verified)
+            if scene.match_diagnostics is not None and len(scene.match_diagnostics) > diagnostic_count:
+                scene.match_diagnostics[-1]["identity_candidates"] = [
+                    {"template": d.name, "box": d.box, "score": d.score,
+                     "identity_score": d.identity_score,
+                     "passed_identity": d.identity_score is not None and d.identity_score >= identity_threshold}
+                    for d in pass_verified[:16]
+                ]
             if any(d.identity_score is not None and d.identity_score >= identity_threshold for d in verified):
                 break
         return deduplicate_nameplate_detections(verified, nms_iou=0.35, max_detections=8), score, template_name
@@ -1939,6 +1955,7 @@ class BowmanBot:
         vision: dict[str, Any],
         search_roi: tuple[int, int, int, int] | None,
     ) -> tuple[list[Detection], float, list[Detection], float]:
+        scene.match_diagnostic_kind = "head"
         head_detections, head_score, _head_template_name = find_detections(
             scene,
             self.player_head_templates,
@@ -1950,6 +1967,24 @@ class BowmanBot:
             structure_weight=0.35,
             search_roi=search_roi,
         )
+        track = getattr(self, "player_track", None)
+        if (not head_detections and self.player_head_templates
+                and float(vision.get("player_detection_scale", 0.5)) < 1.0
+                and track is not None and track.has_nameplate_identity() and track.anchor is not None):
+            # 半分辨率漏掉细节时只复核旧位置附近，不能全图低分换锁。
+            head_roi = search_roi or player_tracking_roi(
+                (track.anchor.box[0] + track.anchor.box[2] / 2, track.anchor.box[1]),
+                scene.scene.shape[1], scene.scene.shape[0],
+            )
+            scene.match_diagnostic_kind = "head_native_recheck"
+            head_detections, native_score, _ = find_detections(
+                scene, self.player_head_templates,
+                float(vision.get("player_head_threshold", 0.74)), 1.0,
+                max_per_template=8, nms_iou=0.35, max_detections=8,
+                structure_weight=0.35, search_roi=head_roi,
+            )
+            head_score = max(head_score, native_score)
+        scene.match_diagnostic_kind = "title"
         title_detections, title_score, _title_template_name = find_detections(
             scene,
             self.player_title_templates,
@@ -2034,6 +2069,22 @@ class BowmanBot:
         # 配置热更新会原子替换 tracker；本帧始终使用同一个实例，旧结果不会回写新状态。
         track = self.player_track
         track.begin_frame()
+        observer = getattr(self, "localization_diagnostics", None)
+        diagnostic = None
+        if observer is not None and observer.enabled:
+            scene.match_diagnostics = []
+            diagnostic = {"before": track_record(track, now),
+                          "vision": dict(vision), "marker": marker,
+                          "marker_unique": marker_unambiguous, "marker_size": marker_size,
+                          "template_counts": {
+                              "nameplate": len(self.player_templates),
+                              "head": len(getattr(self, "player_head_templates", [])),
+                              "title": len(getattr(self, "player_title_templates", [])),
+                          }}
+        self._localization_frame_diagnostic = None
+        branch = "no_candidate"
+        head_window_used = False
+        global_retry = False
         had_minimap_reference = track.minimap_stationary_reference is not None
         track.clear_minimap_evidence()
         scene_height, scene_width = scene.scene.shape[:2]
@@ -2051,6 +2102,36 @@ class BowmanBot:
         nameplate_detections: list[Detection] = []
 
         def finish(result: PlayerAnchor | None) -> PlayerAnchor | None:
+            if not head_window_used:
+                track.head_recovery.clear("outside_known_head_recovery")
+            if diagnostic is not None:
+                reason = "no_template_candidate"
+                if track.last_seen_at == now:
+                    reason = "visual_confirmed"
+                elif track.pending_count:
+                    reason = "awaiting_continuous_confirmation"
+                elif len(nameplate_detections) > 1:
+                    reason = "nameplate_ambiguous_or_fusion_rejected"
+                elif nameplate_detections:
+                    reason = "nameplate_fusion_rejected"
+                elif head_detections or title_detections:
+                    reason = "auxiliary_constraints_rejected"
+                elif any(p.get("identity_candidates") for p in scene.match_diagnostics):
+                    reason = "nameplate_identity_or_recovery_distance_rejected"
+                diagnostic.update({
+                    "reason": reason, "branch": branch,
+                    "after": track_record(track, now), "result": anchor_record(result),
+                    "visual_ok": track.last_seen_at == now,
+                    "global_scan": global_scan, "global_retry": global_retry,
+                    "search_roi": search_roi, "predicted_point": predicted_point,
+                    "previous_anchor": anchor_record(previous_anchor),
+                    "passes": scene.match_diagnostics,
+                    "scores": {"nameplate": nameplate_score, "head": head_score, "title": title_score},
+                    "accepted_nameplates": [{"box": d.box, "identity": d.identity_score}
+                                            for d in nameplate_detections],
+                })
+                self._localization_frame_diagnostic = diagnostic
+                scene.match_diagnostics = None
             identity_scores = [
                 float(detection.identity_score)
                 for detection in nameplate_detections
@@ -2064,7 +2145,7 @@ class BowmanBot:
                 best_identity_score=max(identity_scores, default=-1.0),
                 head_score=head_score,
                 title_score=title_score,
-                global_scan=global_scan,
+                global_scan=global_scan or global_retry,
                 minimap_guard_active=minimap_guard_active,
                 marker_unambiguous=marker_unambiguous,
             )
@@ -2080,10 +2161,19 @@ class BowmanBot:
             reference = track.minimap_stationary_reference
             age = now - reference.seen_at
             extended_limit = float(vision.get("player_minimap_occlusion_seconds", 3.0))
+            background_stable = None
             if (age > limit and age <= extended_limit
-                    and background_is_stable(reference.background, background_snapshot(scene))):
+                    and (background_stable := background_is_stable(reference.background, background_snapshot(scene)))):
                 limit = extended_limit
                 radius_pixels = 0.5
+            if diagnostic is not None:
+                diagnostic["minimap_check"] = {
+                    "background_stable": background_stable, "limit_seconds": limit,
+                    "radius_pixels": radius_pixels, "reference_age": age,
+                    "delta_pixels": None if marker is None else [
+                        (marker[0] - reference.marker[0]) * map_width,
+                        (marker[1] - reference.marker[1]) * map_height],
+                }
             stationary_anchor = track.minimap_stationary_anchor(
                 marker,
                 now,
@@ -2225,9 +2315,11 @@ class BowmanBot:
         anchor: PlayerAnchor | None = None
         identity_confirmed = False
         if nameplate_anchor is not None and previous_anchor is not None:
+            branch = "nameplate_continuation"
             anchor = nameplate_anchor
             identity_confirmed = True
         elif nameplate_detections:
+            branch = "nameplate_reacquisition"
             # 通过了名字验证但离旧位置很远：视为传送/换层，连续多帧确认后才能换锁。
             ordered = sorted(
                 nameplate_detections,
@@ -2260,6 +2352,7 @@ class BowmanBot:
             and not nameplate_detections
             and track.has_confirmed_identity()
         ):
+            branch = "auxiliary_continuation"
             # 姓名板原始候选可能只是遮挡物造成的误匹配；只有通过名字身份校验的候选
             # 才能阻止辅助模板补位。头部和称号不能建立身份，但在姓名板确认过本人后，
             # 可以围绕连续预测位置续跟踪；即使本帧是周期全图复核，也仍受小位移约束。
@@ -2288,6 +2381,7 @@ class BowmanBot:
                 float(vision.get("player_auxiliary_continuation_seconds", 15.0)),
             )
         ):
+            branch = "known_identity_auxiliary_reacquisition"
             # 已由本人姓名板建立身份后，攻击、Buff 或短步动画可能让姓名板/头部同时
             # 低分超过普通 hold。此时不能退回“首次认人”的 0.90 门槛：只允许普通
             # 辅助模板在最后可靠位置附近连续多帧确认，从而恢复同一人的空间续跟踪。
@@ -2313,7 +2407,34 @@ class BowmanBot:
                     * max(scene_width, scene_height),
                     kind="known_identity_aux",
                 )
+            # 仅在旧姓名身份有效的恢复分支启用漏帧窗口。称号不参与。
+            nearby_heads = [
+                item for detection in head_detections
+                if (item := choose_fused_player_anchor(
+                    [("头部", [detection])], track.anchor, *auxiliary_args,
+                    reference_point=predicted_point)) is not None
+            ]
+            head_candidate = max(nearby_heads, key=lambda item: item.score, default=None)
+            close_limit = max(4.0, min(12.0, scene_width * 0.01))
+            heads_agree = head_candidate is not None and all(
+                ((item.box[0] + item.box[2] / 2 - head_candidate.box[0] - head_candidate.box[2] / 2) ** 2
+                 + (item.box[1] - head_candidate.box[1]) ** 2) ** 0.5 <= close_limit
+                for item in nearby_heads
+            )
+            head_window_used = True
+            tolerant_anchor = track.head_recovery.observe(
+                head_candidate, now=now, frame=track.frame_index, marker=marker,
+                size=(scene_width, scene_height, map_width, map_height),
+                background=background_snapshot(scene),
+                eligible=minimap_assist_enabled and marker_unambiguous
+                and (heads_agree or not head_detections),
+                required_frames=int(vision.get("player_auxiliary_reacquire_confirm_frames", 3)),
+            )
+            if anchor is None and tolerant_anchor is not None:
+                anchor = tolerant_anchor
+                branch = "known_head_gap_reacquired"
         elif global_scan and not nameplate_detections:
+            branch = "startup_auxiliary_reacquisition"
             # 启动时姓名板可能已被遮挡。普通辅助命中仍不能认人；只有高置信头部/称号
             # 连续多帧落到同一位置，才允许建立受限的视觉身份。
             auxiliary_identity_threshold = float(
@@ -2345,6 +2466,8 @@ class BowmanBot:
                 identity_confirmed = anchor is not None
 
         if anchor is None and search_roi is not None and track.misses + 1 >= miss_limit:
+            global_retry = True
+            branch += "+global_nameplate_retry"
             # 连续局部丢失后只允许通过本人名字做全图重定位，辅助模板不得建立新身份。
             raw_nameplate_detections, nameplate_score, _template_name = self._detect_player_nameplate(
                 scene,
@@ -2454,6 +2577,9 @@ class BowmanBot:
                 self.auto_potion.set_enabled(False)
                 self.disarm("窗口会话结束")
             finally:
+                observer = getattr(self, "localization_diagnostics", None)
+                if observer is not None:
+                    observer.close()
                 self.performance.stop()
                 self.stop_hotkey_monitor()
                 if close_overlay_on_exit:
@@ -2463,6 +2589,38 @@ class BowmanBot:
                 self.window = None
             self.log.write("session_end")
             print(f"运行日志：{self.log.path}")
+
+    def _observe_localization_diagnostics(
+        self, scene, minimap, now, *, combat_rect, minimap_rect,
+        capture_foreground, marker_candidates,
+    ) -> None:
+        observer = getattr(self, "localization_diagnostics", None)
+        if observer is None:
+            return
+        try:
+            if not getattr(self, "_localization_diagnostic_announced", False):
+                self._localization_diagnostic_announced = True
+                self.log.write("player_localization_diagnostics_enabled", directory=str(observer.directory))
+            diagnostic = getattr(self, "_localization_frame_diagnostic", None)
+            if diagnostic is not None:
+                observer.observe(scene.scene, minimap, {
+                    **diagnostic, "state": self.state, "delivery": self.delivery,
+                    "capture_source": "PrintWindow" if self.delivery in {"window_message", "hybrid"} else "mss",
+                    "capture_foreground": capture_foreground,
+                    "combat_rect": combat_rect, "minimap_rect": minimap_rect,
+                    "marker_candidate_count": marker_candidates,
+                }, now, visual_ok=diagnostic["visual_ok"], armed=self.armed)
+            elif not self.armed:
+                # 轻量喝药跳过 tracker 时也必须结束诊断事件，不能把暂停算进遮挡时长。
+                observer.observe(scene.scene, minimap, {"state": self.state}, now,
+                                 visual_ok=False, armed=False)
+            notice = observer.take_notice()
+            if notice:
+                self.notify(notice, 10.0)
+                self.log.write("player_localization_diagnostics_error", error=notice)
+        except Exception:
+            # 诊断日志、磁盘或通知故障不能改变定位/输入状态。
+            pass
 
     def _run_session(self, overlay: RuntimeOverlay) -> None:
         session_target = self._window_target
@@ -2568,6 +2726,7 @@ class BowmanBot:
                         time.sleep(0.1)
                         continue
                     stages_ns["capture"] = time.perf_counter_ns() - capture_started_ns
+                    capture_foreground = int(user32.GetForegroundWindow()) == window.hwnd
                     alert_started_ns = time.perf_counter_ns()
                     self._observe_verification_alert(frame, time.monotonic())
                     stages_ns["verification_alert"] = time.perf_counter_ns() - alert_started_ns
@@ -2678,6 +2837,7 @@ class BowmanBot:
                     if not lightweight_potion_only:
                         stages_ns["monster"] = time.perf_counter_ns() - monster_started_ns
                     player_started_ns = time.perf_counter_ns()
+                    self._localization_frame_diagnostic = None
                     active_player_anchor = (
                         None
                         if lightweight_potion_only
@@ -2776,6 +2936,13 @@ class BowmanBot:
                         eligible_detections=tuple(target_selection.eligible_detections or ()),
                     )
                     stages_ns["action"] = time.perf_counter_ns() - action_started_ns
+                    diagnostic_started_ns = time.perf_counter_ns()
+                    self._observe_localization_diagnostics(
+                        scene, minimap_img, now, combat_rect=combat_rect, minimap_rect=minimap_rect,
+                        capture_foreground=capture_foreground,
+                        marker_candidates=marker_observation.candidate_count,
+                    )
+                    stages_ns["localization_diagnostics"] = time.perf_counter_ns() - diagnostic_started_ns
                     hud_started_ns = time.perf_counter_ns()
                     current_window = client_window(window.hwnd, window.title)
                     monster_box = None

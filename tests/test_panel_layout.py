@@ -130,14 +130,21 @@ class PanelLayoutTests(unittest.TestCase):
         self.root.update_idletasks()
         self.assertEqual((self.root.winfo_width(), self.root.winfo_height()), (560, 720))
         self.assertEqual(self.root.state(), "withdrawn")
+        # 字体/DPI 会改变完整页签的需求宽度，540 px 不一定需要短标题。
+        expected_titles = (["窗口连接", "校准", "模板", "策略", "补给", "设置", "性能"]
+                           if 540 < panel._full_tabs_width else
+                           ["窗口连接", "区域校准", "模板采集", "职业策略", "按键补给", "运行设置", "性能监控"])
         self.assertEqual([panel.notebook.tab(tab, "text") for tab in panel.notebook.tabs()],
-                         ["窗口连接", "校准", "模板", "策略", "补给", "设置", "性能"])
+                         expected_titles)
         self.assertLessEqual(panel.notebook.winfo_reqwidth(), 540)
         self.assertLessEqual(panel._run_bar.winfo_reqwidth(), 540)
         self.assertLessEqual(panel._run_bar.winfo_reqheight(), 115)
         self.assertGreaterEqual(panel.notebook.winfo_height(), 480)
         self.assertLessEqual(panel._quick_controls.winfo_reqwidth() + 20, 540)
         selected = panel.notebook.select()
+        panel._fit_page_tabs(SimpleNamespace(width=panel._full_tabs_width - 1))
+        self.assertEqual([panel.notebook.tab(tab, "text") for tab in panel.notebook.tabs()],
+                         ["窗口连接", "校准", "模板", "策略", "补给", "设置", "性能"])
         panel._fit_page_tabs(SimpleNamespace(width=700))
         self.assertEqual(panel.notebook.tab(panel._page_canvases["performance"].master, "text"), "性能监控")
         self.assertEqual(panel.notebook.select(), selected)

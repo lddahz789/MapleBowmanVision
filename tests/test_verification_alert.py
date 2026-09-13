@@ -4,6 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+import wave
 from unittest.mock import MagicMock, patch
 
 import cv2
@@ -15,6 +16,7 @@ from mbv.panel import ControlPanel
 from mbv.verification_alert import (
     DEFAULT_REGION, KEYWORD_MASK, KeywordMatch, VerificationAlert,
     keyword_match, normalize_alert_settings, play_alert_sound,
+    _alert_sound_file, ALERT_SOUND_SECONDS, ALERT_SAMPLE_RATE,
 )
 
 
@@ -203,12 +205,36 @@ class AlertIntegrationTests(unittest.TestCase):
         with patch("winsound.PlaySound") as play:
             play_alert_sound()
             self.assertTrue(play.call_args.args[1] & winsound.SND_ASYNC)
+            self.assertTrue(play.call_args.args[1] & winsound.SND_FILENAME)
+            self.assertFalse(play.call_args.args[1] & winsound.SND_LOOP)
+            self.assertTrue(Path(play.call_args.args[0]).is_file())
         panel = ControlPanel.__new__(ControlPanel)
         panel.bot = MagicMock()
         with patch("mbv.verification_alert.play_alert_sound") as sound:
             panel._test_verification_sound()
             sound.assert_called_once_with()
         self.assertEqual(panel.bot.mock_calls, [])
+
+    def test_sound_contains_ten_seconds_of_repeated_alternating_tones(self):
+        first = _alert_sound_file()
+        self.assertIs(_alert_sound_file(), first)
+        with wave.open(str(first[1]), "rb") as audio:
+            self.assertEqual(audio.getnchannels(), 1)
+            self.assertEqual(audio.getsampwidth(), 2)
+            self.assertEqual(audio.getframerate(), ALERT_SAMPLE_RATE)
+            self.assertEqual(audio.getnframes() / audio.getframerate(), 10)
+            samples = np.frombuffer(audio.readframes(audio.getnframes()), dtype="<i2")
+        self.assertLess(np.max(np.abs(samples.astype(np.int32))), 32767)
+        length = int(.32 * ALERT_SAMPLE_RATE)
+        for second in range(ALERT_SOUND_SECONDS):
+            for offset, expected in ((0., 880), (.32, 1320)):
+                start = round((second + offset) * ALERT_SAMPLE_RATE)
+                tone = samples[start:start + length]
+                self.assertGreater(np.max(np.abs(tone)), 20000)
+                frequency = np.fft.rfftfreq(length, 1 / ALERT_SAMPLE_RATE)[np.argmax(np.abs(np.fft.rfft(tone)))]
+                self.assertAlmostEqual(frequency, expected, delta=4)
+            gap_start = round((second + .7) * ALERT_SAMPLE_RATE)
+            self.assertFalse(np.any(samples[gap_start:(second + 1) * ALERT_SAMPLE_RATE]))
 
     def test_toggle_saves_only_alert_setting_without_apply_config_or_disarm(self):
         panel = ControlPanel.__new__(ControlPanel)

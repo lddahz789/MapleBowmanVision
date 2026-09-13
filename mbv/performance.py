@@ -26,6 +26,7 @@ STAGE_ORDER = (
     "player",
     "targeting",
     "action",
+    "localization_diagnostics",
     "hud",
 )
 STAGE_LABELS = {
@@ -36,6 +37,7 @@ STAGE_LABELS = {
     "player": "玩家",
     "targeting": "选敌",
     "action": "决策/输入",
+    "localization_diagnostics": "定位诊断",
     "hud": "HUD",
 }
 
