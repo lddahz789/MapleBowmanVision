@@ -387,7 +387,10 @@ class RuntimeOverlay:
             outline = "#00d9ff" if is_target_region else "#ff66d9"
             text_color = "#61e8ff" if is_target_region else "#ff8fe3"
             canvas.create_rectangle(x, y, x + w, y + h, outline=outline, width=2)
-            canvas.create_text(x + 3, y + 3, anchor="nw", text=label, fill=text_color, font=small)
+            bottom_label = bool(area.get("label_at_bottom"))
+            canvas.create_text(x + 3, y + h - 3 if bottom_label else y + 3,
+                               anchor="sw" if bottom_label else "nw", text=label,
+                               fill=text_color, font=small)
 
         overlap_ratio = state.get("close_overlap_ratio")
         overlap_threshold = state.get("close_overlap_threshold")

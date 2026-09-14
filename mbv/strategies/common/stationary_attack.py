@@ -375,6 +375,9 @@ class StationaryAttackStrategy:
             )
         return decision
 
+    def _periodic_step_enabled(self, context: StrategyActionContext) -> bool:
+        return True
+
     def _normal_decide(self, context: StrategyActionContext) -> StrategyDecision:
         if context.player_box is None and not context.minimap_only:
             return StrategyDecision("stop", "PLAYER_SCREEN_LOST")
@@ -455,7 +458,7 @@ class StationaryAttackStrategy:
                 float(context.settings.get("periodic_step_interval_seconds", 45.0)),
             ),
         )
-        if context.now - context.last_periodic_step >= step_interval:
+        if self._periodic_step_enabled(context) and context.now - context.last_periodic_step >= step_interval:
             step_seconds = max(
                 0.03,
                 min(0.5, float(context.settings.get("periodic_step_seconds", 0.12))),

@@ -92,6 +92,13 @@ class TargetSelectionContext:
     previous_attack_skill: str | None = None
     # False 表示 detections 仅为视觉短暂保留值，不能用于精确数量触发。
     detections_fresh: bool = True
+    # 可选连续施法证据；策略实例无状态，由 Bot 按会话传回。
+    now: float = 0.0
+    continuity_state: Any = None
+    allow_target_hold: bool = False
+    player_visual_fresh: bool = False
+    marker_pixels: tuple[float, float] | None = None
+    marker_size: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +108,13 @@ class TargetSelection:
     eligible_candidate_count: int | None = None
     eligible_detections: tuple[Detection, ...] | None = None
     uses_common_target_area: bool = True
+    # 策略按像素计算的攻击区可复用公共 HUD；不覆盖持久化通用索敌区。
+    attack_area_override: dict[str, float] | None = None
+    # 施法距离与索敌/追踪区域分开，避免像素射程冒充用户框选的索敌区。
+    skill_area_override: dict[str, float] | None = None
+    skill_area_label: str = "技能施放范围"
+    continuity_state: Any = None
+    diagnostic: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +146,8 @@ class StrategyActionContext:
     runtime_state: dict[str, Any] = field(default_factory=dict)
     localization_lost_seconds: float = 0.0
     action_interrupted: bool = False
+    # 公共攻击键供无方向策略显式构造 cast，不改变 cast 空键禁止发送的约定。
+    default_attack_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -168,6 +184,8 @@ class StrategyDecision:
     cooperative_movement: bool = False
     # 无方向施法的独立最短间隔，由公共执行器按实际发送时间限频。
     attack_interval_seconds: float | None = None
+    # 默认仍从上次抬键完成计时；连续施法策略可显式选择按下起点。
+    cast_interval_from_start: bool = False
 
 
 class CombatStrategy(Protocol):

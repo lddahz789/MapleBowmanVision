@@ -150,6 +150,10 @@
         "platform_center_vertical_tolerance": 0.06,
         "platform_return_jump_interval_seconds": 0.45
       },
+      "bowman_arrow_rain": {
+        "attack_range_px": 300.0,
+        "periodic_step_enabled": true
+      },
       "stationary_attack": {
         "route_pickup_enabled": false,
         "route_pickup_interval_seconds": 180.0,

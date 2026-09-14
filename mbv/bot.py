@@ -159,6 +159,12 @@ STATE_LABELS = {
     "DRAGON_SKILL_UNBOUND": "请先采集龙咆哮技能键",
     "DRAGON_WAITING_MONSTERS": "范围内怪物数量不足，原地等待",
     "DRAGON_ROAR": "定点施放龙咆哮",
+    "ARROW_RAIN": "原地施放箭雨（不转向）",
+    "ARROW_RAIN_MELEE": "施放近身技能（不转向）",
+    "ARROW_RAIN_CLEAR_WAIT": "确认区内无目标后再回位",
+    "ARROW_RAIN_APPROACH_LEFT": "向左靠近怪物，进入箭雨射程",
+    "ARROW_RAIN_APPROACH_RIGHT": "向右靠近怪物，进入箭雨射程",
+    "PLATFORM_CENTER_UNCALIBRATED": "请先采集小地图平台安全点",
 }
 
 PLAYER_LOST_RECOVERY_PAUSE_SECONDS = 0.08
@@ -1177,6 +1183,8 @@ class BowmanBot:
             self._foreground_turn_candidate = None
 
     def _reset_attack_facing(self) -> None:
+        self._target_continuity_state = None
+        self._last_strategy_action = None
         # 移动方向只是输入意图，不能作为下一次攻击转向已被游戏接受的证据。
         self.attack_facing_ready_at = 0.0
         self.attack_turn_direction: str | None = None
@@ -1328,6 +1336,8 @@ class BowmanBot:
         interval_seconds: float | None,
         now: float,
         state: str,
+        *,
+        interval_from_start: bool = False,
     ) -> None:
         """不要求面向的原地技能；仍由公共行动门禁授权，不回退普通攻击。"""
         self.stop_move()
@@ -1343,7 +1353,11 @@ class BowmanBot:
             interval = 1.0
         interval = max(0.1, min(10.0, interval))
         # now 来自截图前，不能把慢检测时间算进下一次技能冷却。
-        if time.monotonic() - self.last_attack < interval:
+        previous_timing = getattr(self, "_last_cast_timing", None)
+        same_cast = (previous_timing is not None and previous_timing[0] == selected_key
+                     and previous_timing[2] == self.last_attack)
+        interval_base = previous_timing[1] if interval_from_start and same_cast else self.last_attack
+        if time.monotonic() - interval_base < interval:
             self.state = "CAST_WAITING_INTERVAL"
             return
         if not self.armed or not self.input_authorized or any(
@@ -1353,12 +1367,17 @@ class BowmanBot:
         ):
             self.state = "PAUSED"
             return
+        started_at = time.monotonic()
         self.keyboard.tap(selected_key)
         self.last_attack = time.monotonic()
+        self._last_cast_timing = (selected_key, started_at, self.last_attack)
         self._invalidate_facing_for_auxiliary_key(selected_key)
         self.state = state
         self.log.write("attack", skill=str(attack_skill or "cast"), key=selected_key,
-                       direction=None, interval_seconds=interval, result="key_sent_unverified")
+                       direction=None, interval_seconds=interval, result="key_sent_unverified",
+                       interval_basis="keydown_start" if interval_from_start else "keyup_completion",
+                       tap_duration_seconds=round(self.last_attack - started_at, 4),
+                       start_gap_seconds=round(started_at - previous_timing[1], 4) if same_cast else None)
 
     def face_target(
         self,
@@ -1531,6 +1550,7 @@ class BowmanBot:
         eligible_detections: tuple[Detection, ...] = (),
     ) -> None:
         with self.action_lock:
+            self._last_strategy_action = None
             # 主线程可能已在本帧识别期间暂停采集或请求切窗；旧帧不得再发键。
             stop_events = (getattr(self, "vision_suspended", None), getattr(self, "f9_requested", None))
             if any(event is not None and event.is_set() for event in stop_events):
@@ -1553,6 +1573,8 @@ class BowmanBot:
                               combat_width, has_monster_candidates, now, combat_height, eligible_detections)
                 finally:
                     self._strategy_was_interrupted = not self._strategy_decision_made
+                    if self._last_strategy_action != "cast":
+                        self._target_continuity_state = None
                     try:
                         if not getattr(self, "_pickup_requested", False):
                             self._release_pickup()
@@ -1591,16 +1613,29 @@ class BowmanBot:
         if log is None:
             return
         state = str(getattr(self, "state", "UNKNOWN"))
+        diagnostic = getattr(self, "_frame_target_diagnostic", None)
+        counts = getattr(self, "_target_reason_counts", {})
+        if diagnostic is not None:
+            reason = f"{state}:{diagnostic.get('reason', 'unknown')}"
+            counts[reason] = counts.get(reason, 0) + 1
+            self._target_reason_counts = counts
         previous, last_at = getattr(self, "_action_state_log", (None, float("-inf")))
-        # 状态变化最多一秒一次，稳定状态五秒一次；不逐帧刷日志。
-        if now - last_at < (1.0 if state != previous else 5.0):
+        # 目标诊断及状态变化最多一秒一次，其余稳定状态五秒一次。
+        if now - last_at < (1.0 if state != previous or diagnostic is not None else 5.0):
             return
         self._action_state_log = (state, now)
-        log.write("action_state", state=state, delivery=getattr(self, "delivery", "foreground"),
-                  armed=bool(self.armed), player_candidate=player_box is not None,
-                  target_candidate=target_box is not None, marker_available=marker is not None,
-                  monster_candidates=bool(has_monster_candidates),
-                  since_attack_seconds=round(max(0., now - getattr(self, "last_attack", now)), 3))
+        self._target_reason_counts = {}
+        try:
+            log.write("action_state", state=state, delivery=getattr(self, "delivery", "foreground"),
+                      armed=bool(self.armed), player_candidate=player_box is not None,
+                      target_candidate=target_box is not None, marker_available=marker is not None,
+                      monster_candidates=bool(has_monster_candidates),
+                      since_attack_seconds=round(max(0., now - getattr(self, "last_attack", now)), 3),
+                      **({"target_diagnostic": diagnostic, "frame_reason_counts": counts}
+                         if diagnostic is not None else {}))
+        except Exception:
+            # 只读诊断写盘失败不得阻断动作或变成混合输入故障。
+            pass
 
     def _act(
         self,
@@ -1750,6 +1785,7 @@ class BowmanBot:
                 runtime_state=dict(getattr(self, "strategy_runtime_state", {})),
                 localization_lost_seconds=getattr(self, "_strategy_localization_gap", 0.0),
                 action_interrupted=getattr(self, "_strategy_was_interrupted", False),
+                default_attack_key=self.config["keys"]["attack"],
             )
         )
         self._strategy_decision_made = True
@@ -1818,7 +1854,13 @@ class BowmanBot:
             )
         elif decision.action == "cast":
             self.cast_skill(decision.attack_key, decision.attack_skill,
-                            decision.attack_interval_seconds, now, decision.state)
+                            decision.attack_interval_seconds, now, decision.state,
+                            interval_from_start=decision.cast_interval_from_start)
+            timing = getattr(self, "_last_cast_timing", None)
+            if (self.state in {decision.state, "CAST_WAITING_INTERVAL"} and timing is not None
+                    and timing[0] == str(decision.attack_key or "").strip().lower()
+                    and timing[2] == self.last_attack):
+                self._last_strategy_action = "cast"
         elif decision.action == "chase":
             self.chase_target(float(decision.target_x), float(decision.player_x))
         elif decision.action == "move":
@@ -2875,6 +2917,17 @@ class BowmanBot:
                         TargetSelectionContext(
                             detections=monsters,
                             detections_fresh=bool(detected_monsters),
+                            now=now,
+                            continuity_state=getattr(self, "_target_continuity_state", None),
+                            allow_target_hold=(self.armed and self.input_authorized
+                                               and raw_monster_count == 0
+                                               and getattr(self, "_last_strategy_action", None) == "cast"
+                                               and not getattr(self, "_strategy_was_interrupted", False)),
+                            player_visual_fresh=self.player_track.last_seen_at == now,
+                            marker_pixels=(marker[0] * minimap_img.shape[1],
+                                           marker[1] * minimap_img.shape[0])
+                            if marker is not None and marker_observation.unambiguous else None,
+                            marker_size=(minimap_img.shape[1], minimap_img.shape[0]),
                             player_box=player_box,
                             player_raw_box=player_raw_box,
                             player_anchor=self.last_attack_anchor,
@@ -2891,6 +2944,17 @@ class BowmanBot:
                         )
                     )
                     target = target_selection.target
+                    self._target_continuity_state = getattr(target_selection, "continuity_state", None)
+                    diagnostic = getattr(target_selection, "diagnostic", None)
+                    self._frame_target_diagnostic = ({
+                        **diagnostic, "raw_count": raw_monster_count,
+                        "reason": "filtered_all" if raw_monster_count > 0 and not detected_monsters
+                        else diagnostic.get("reason", "unknown"),
+                        "current_count": len(detected_monsters), "held_count": len(held_monsters),
+                        "player_visual_fresh": self.player_track.last_seen_at == now,
+                        "marker_unambiguous": marker_observation.unambiguous,
+                        "filtered_all": raw_monster_count > 0 and not detected_monsters,
+                    } if diagnostic is not None else None)
                     chase_target = target_selection.chase_target
                     has_strategy_candidates = (
                         bool(monsters)
@@ -2898,9 +2962,9 @@ class BowmanBot:
                         else target_selection.eligible_candidate_count > 0
                     )
                     attack_box = (
-                        self.config["targeting"]["box"]
-                        if target_selection.uses_common_target_area
-                        else None
+                        getattr(target_selection, "attack_area_override", None)
+                        or (self.config["targeting"]["box"]
+                            if target_selection.uses_common_target_area else None)
                     )
                     box = target.box if target is not None else None
                     chase_box = chase_target.box if chase_target is not None else None
@@ -2996,22 +3060,34 @@ class BowmanBot:
                             raw_player_box,
                         )
                         current_player_anchor = (center_x, center_y)
-                        if attack_box is not None:
+                        for range_area, range_label in (
+                            (attack_box, None),
+                            (getattr(target_selection, "skill_area_override", None),
+                             getattr(target_selection, "skill_area_label", "技能施放范围")),
+                        ):
+                            if range_area is None:
+                                continue
                             range_left, range_top, range_right, range_bottom = _ordered_rect(
                                 *attack_rect_from_player(
                                     (center_x, center_y),
                                     combat_img.shape[1],
                                     combat_img.shape[0],
-                                    attack_box,
+                                    range_area,
                                     facing,
                                 )
                             )
-                            attack_range_box = (
+                            screen_range = (
                                 combat_rect[0] + int(round(range_left)),
                                 combat_rect[1] + int(round(range_top)),
                                 int(round(range_right - range_left)),
                                 int(round(range_bottom - range_top)),
                             )
+                            if range_label is None:
+                                attack_range_box = screen_range
+                            else:
+                                strategy_area_boxes.append({"key": "targeting_range",
+                                                            "box": screen_range, "label": range_label,
+                                                            "label_at_bottom": True})
                     for field in self.strategy.capture_fields:
                         settings = strategy_settings(self.config)
                         if field.enable_setting and not bool(settings.get(field.enable_setting)):

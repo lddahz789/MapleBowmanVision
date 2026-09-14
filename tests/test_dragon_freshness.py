@@ -52,9 +52,10 @@ class DragonRoarFrameFreshnessTests(unittest.TestCase):
                          for i in range(3)]
         self.observed = []
 
-    def run_frames(self, frame_detections, frame_filters=None):
+    def run_frames(self, frame_detections, frame_filters=None, on_frame=None):
         frame = np.zeros((300, 400, 3), dtype=np.uint8)
         overlay = MagicMock()
+        self.hud_states = []
         original_selection = self.bot.strategy.select_targets
 
         def select(context):
@@ -80,6 +81,10 @@ class DragonRoarFrameFreshnessTests(unittest.TestCase):
             )
 
         def update(state):
+            if "width" in state:
+                self.hud_states.append(state)
+                if on_frame is not None:
+                    on_frame(len(self.hud_states))
             if "width" in state and len(self.observed) == len(frame_detections):
                 self.bot.f9_requested.set()
 
@@ -105,6 +110,52 @@ class DragonRoarFrameFreshnessTests(unittest.TestCase):
         self.bot.keyboard.movement_down.assert_not_called()
         return detections_calls
 
+    def test_arrow_rain_live_search_edits_and_skill_range_reach_distinct_hud_boxes(self):
+        from mbv.strategies.bowman import ArrowRainStrategy
+
+        self.bot.config["strategy"]["active"] = "bowman_arrow_rain"
+        self.bot.strategy = ArrowRainStrategy()
+        self.bot.config["targeting"]["box"] = {"forward": .25, "back": .1, "up": .2, "down": .2}
+        self.bot.config["strategy"]["options"]["bowman_arrow_rain"]["attack_range_px"] = 50.
+        monster = Detection((280, 140, 20, 20), .95, "slime/monster.png")
+
+        def edit(index):
+            if index == 1:
+                self.bot.preview_targeting_setting("box.forward", .4)
+            elif index == 2:
+                self.bot.preview_strategy_setting("attack_range_px", 100.)
+            elif index == 3:
+                self.bot.preview_targeting_setting("box.back", .25)
+
+        self.run_frames([[monster]] * 4, on_frame=edit)
+        search_widths = [state["attack_range_box"][2] for state in self.hud_states]
+        skill_widths = [next(area["box"][2] for area in state["strategy_area_boxes"]
+                             if area["label"] == "箭雨施法范围") for state in self.hud_states]
+        self.assertEqual(search_widths, [140, 200, 200, 260])
+        self.assertEqual(skill_widths, [100, 100, 200, 200])
+        self.assertTrue(all(state["attack_range_label"] == "有效索敌区" for state in self.hud_states))
+        self.assertIsNotNone(self.observed[0][1].chase_target)
+        self.assertIsNotNone(self.observed[2][1].target)
+
+    def test_search_and_skill_boxes_have_distinct_labels_and_share_debug_toggle(self):
+        from mbv.overlay import RuntimeOverlay
+
+        overlay = RuntimeOverlay.__new__(RuntimeOverlay)
+        canvas = MagicMock()
+        state = {"show_calibration": True, "attack_range_box": (10, 20, 100, 80),
+                 "strategy_area_boxes": [{"key": "targeting_range", "box": (10, 20, 100, 80),
+                                          "label": "箭雨施法范围", "label_at_bottom": True}]}
+        overlay._paint_canvas(canvas, state, 400, 300)
+        labels = {call.kwargs.get("text"): call for call in canvas.create_text.call_args_list}
+        self.assertEqual(labels["有效索敌区"].kwargs["anchor"], "nw")
+        self.assertEqual(labels["箭雨施法范围"].kwargs["anchor"], "sw")
+        self.assertNotEqual(labels["有效索敌区"].args, labels["箭雨施法范围"].args)
+        canvas.reset_mock()
+        overlay._paint_canvas(canvas, {**state, "debug_hidden_items": ("targeting_range",)}, 400, 300)
+        texts = [call.kwargs.get("text") for call in canvas.create_text.call_args_list]
+        self.assertNotIn("有效索敌区", texts)
+        self.assertNotIn("箭雨施法范围", texts)
+
     def test_actual_loop_distinguishes_held_empty_frame_from_new_detections(self):
         new_monster = Detection((280, 140, 20, 20), 0.96, "slime/monster.png")
         self.run_frames([self.monsters, [], [new_monster]])
@@ -120,6 +171,35 @@ class DragonRoarFrameFreshnessTests(unittest.TestCase):
         action_calls = self.bot.act.call_args_list
         self.assertEqual(action_calls[1].kwargs["eligible_detections"], ())
         self.assertFalse(action_calls[1].args[8])  # has_strategy_candidates
+
+    def test_arrow_rain_loop_only_holds_after_cast_and_never_after_explicit_filter(self):
+        from mbv.strategies.bowman import ArrowRainStrategy
+
+        self.bot.config["strategy"]["active"] = "bowman_arrow_rain"
+        self.bot.strategy = ArrowRainStrategy()
+        self.bot.config["targeting"]["box"] = {"forward": .5, "back": .5, "up": .3, "down": .3}
+        monster = self.monsters[1]
+        anchor = self.bot._track_player.return_value
+        def track(*args, **kwargs):
+            self.bot.player_track.last_seen_at = 100.
+            return anchor
+        self.bot._track_player.side_effect = track
+        def after_frame(index):
+            self.bot.armed = True
+            self.bot.input_authorized = True
+            self.bot._last_strategy_action = "cast"
+        filters = [Detection(monster.box, .97, "slime/filter.png")]
+        self.run_frames([[monster], [], [monster], []], [[], [], filters, []], on_frame=after_frame)
+        contexts = [context for context, result in self.observed]
+        results = [result for context, result in self.observed]
+        self.assertEqual([context.allow_target_hold for context in contexts], [False, True, False, True])
+        self.assertTrue(contexts[1].player_visual_fresh)
+        self.assertIsNotNone(contexts[1].marker_pixels)
+        self.assertIsNotNone(results[1].target)
+        self.assertIsNone(results[1].chase_target)
+        self.assertEqual(results[1].diagnostic["reason"], "bounded_target_hold")
+        self.assertIsNone(results[2].target)
+        self.assertIsNone(results[3].target)
 
     def test_all_filtered_current_detections_are_not_fresh_or_eligible(self):
         filters = [Detection(item.box, 0.97, "slime/filter.png") for item in self.monsters]

@@ -5,6 +5,7 @@ from typing import Any
 
 from mbv.strategies.base import CombatStrategy, valid_point
 from mbv.strategies.bowman.dynamic import BowmanDynamicStrategy
+from mbv.strategies.bowman.arrow_rain import ArrowRainStrategy
 from mbv.strategies.common.stationary_attack import StationaryAttackStrategy
 from mbv.strategies.thief.throwing_star import ThrowingStarSafeStrategy
 from mbv.strategies.regions import normalize_target_regions
@@ -103,6 +104,7 @@ register_strategy(BowmanDynamicStrategy())
 register_strategy(StationaryAttackStrategy())
 register_strategy(ThrowingStarSafeStrategy())
 register_strategy(DragonRoarStrategy())
+register_strategy(ArrowRainStrategy())
 
 
 __all__ = [

@@ -97,6 +97,43 @@ class DragonRuntimeTests(unittest.TestCase):
         self.assertEqual(self.bot.direction, "left")
         self.assert_no_direction_or_fallback()
 
+    def test_arrow_rain_real_strategy_uses_common_key_without_turn_in_all_modes(self) -> None:
+        for delivery in ("foreground", "background", "window_message", "hybrid"):
+            with self.subTest(delivery=delivery):
+                self.bot.config["strategy"]["active"] = "bowman_arrow_rain"
+                self.bot.strategy = get_strategy("bowman_arrow_rain")
+                self.bot.config["recognition"]["platform_center"] = {"x": .5, "y": .5}
+                self.bot.delivery = delivery
+                self.bot.background_input = delivery != "foreground"
+                self.user32.GetForegroundWindow.return_value = 10 if delivery == "foreground" else 99
+                self.bot.keyboard.hybrid.desktop.foreground.return_value = self.user32.GetForegroundWindow.return_value
+                self.bot.last_attack = 0.
+                self.bot.last_periodic_step = 100.
+                self.bot.keyboard.reset_mock()
+                self.act(marker=(.6, .5))
+                self.bot.keyboard.tap.assert_called_once_with("a")
+                self.assertEqual(self.bot.state, "ARROW_RAIN")
+                self.assert_no_direction_or_fallback()
+                self.user32.SetForegroundWindow.assert_not_called()
+
+    def test_arrow_rain_chase_uses_feedback_then_cast_releases_movement(self) -> None:
+        self.bot.config["strategy"]["active"] = "bowman_arrow_rain"
+        self.bot.strategy = get_strategy("bowman_arrow_rain")
+        self.bot.config["recognition"]["platform_center"] = {"x": .5, "y": .5}
+        self.bot.last_periodic_step = 100.
+        with patch.object(self.bot, "_move_with_feedback") as movement:
+            self.bot.act(self.window, 1., 1., (.5, .5), (90, 100, 20, 1), None,
+                         (360, 90, 20, 20), 400, True, 100., 200)
+            movement.assert_called_once_with("right", (.5, .5), 100., "ARROW_RAIN_APPROACH_RIGHT")
+        self.bot.keyboard.tap.assert_not_called()
+        self.assertTrue(self.bot.strategy_runtime_state["navigation_active"])
+        self.act(now=100.1, marker=(.6, .5))
+        calls = self.bot.keyboard.method_calls
+        attack = calls.index(call.tap("a"))
+        self.assertLess(calls.index(call.up("left")), attack)
+        self.assertLess(calls.index(call.up("right")), attack)
+        self.assert_no_direction_or_fallback()
+
     def test_cast_trims_skill_key_without_using_common_attack(self) -> None:
         self.cast(key=" R ")
         self.bot.keyboard.tap.assert_called_once_with("r")
@@ -166,6 +203,73 @@ class DragonRuntimeTests(unittest.TestCase):
                 self.bot.keyboard.tap.assert_not_called()
                 self.cast(interval=interval, now=101.0)
                 self.bot.keyboard.tap.assert_called_once_with("r")
+
+    def test_opt_in_cast_uses_actual_keydown_start_not_frame_or_release(self) -> None:
+        def tap(_key):
+            self.clock.return_value += .035
+        self.bot.keyboard.tap.side_effect = tap
+        self.bot.cast_skill("a", "arrow_rain", .2, 80., "ARROW_RAIN", interval_from_start=True)
+        self.assertAlmostEqual(self.bot.last_attack, 100.035)
+        self.clock.return_value = 100.199
+        self.bot.cast_skill("a", "arrow_rain", .2, 80., "ARROW_RAIN", interval_from_start=True)
+        self.assertEqual(self.bot.keyboard.tap.call_count, 1)
+        self.clock.return_value = 100.201
+        self.bot.cast_skill("a", "arrow_rain", .2, 80., "ARROW_RAIN", interval_from_start=True)
+        self.assertEqual(self.bot.keyboard.tap.call_count, 2)
+        self.assertAlmostEqual(self.bot.last_attack, 100.236)
+        fields = self.bot.log.write.call_args.kwargs
+        self.assertEqual(fields["interval_basis"], "keydown_start")
+        self.assertAlmostEqual(fields["start_gap_seconds"], .201)
+
+    def test_cast_start_timing_does_not_shorten_other_skill_or_unrelated_attack(self) -> None:
+        for key, unrelated in (("r", False), ("a", True)):
+            self.bot.last_attack = 100.035
+            self.bot._last_cast_timing = ("a", 100., 100.034 if unrelated else 100.035)
+            self.bot.keyboard.tap.reset_mock()
+            self.clock.return_value = 100.201
+            self.bot.cast_skill(key, "arrow_rain", .2, 100., "CAST", interval_from_start=True)
+            self.bot.keyboard.tap.assert_not_called()
+
+    def test_failed_opt_in_cast_does_not_change_timing(self) -> None:
+        self.bot._last_cast_timing = ("a", 98., 98.035)
+        self.bot.last_attack = 98.035
+        self.bot.keyboard.tap.side_effect = OSError("发送失败")
+        with self.assertRaises(OSError):
+            self.bot.cast_skill("a", "arrow_rain", .2, 100., "CAST", interval_from_start=True)
+        self.assertEqual(self.bot.last_attack, 98.035)
+        self.assertEqual(self.bot._last_cast_timing, ("a", 98., 98.035))
+
+    def test_target_continuity_cleared_by_action_interruption_or_move(self) -> None:
+        self.act()
+        self.assertEqual(self.bot._last_strategy_action, "cast")
+        self.bot._target_continuity_state = object()
+        with patch.object(self.bot, "_act", return_value=None):
+            self.act(now=100.1)
+        self.assertIsNone(self.bot._last_strategy_action)
+        self.assertIsNone(self.bot._target_continuity_state)
+        self.bot._target_continuity_state = object()
+        self.bot._reset_attack_facing()
+        self.assertIsNone(self.bot._target_continuity_state)
+
+    def test_waiting_first_cast_cannot_enable_stale_target_continuity(self) -> None:
+        self.bot.last_attack = 99.9
+        self.bot._target_continuity_state = object()
+        self.act()
+        self.assertEqual(self.bot.state, "CAST_WAITING_INTERVAL")
+        self.bot.keyboard.tap.assert_not_called()
+        self.assertIsNone(self.bot._last_strategy_action)
+        self.assertIsNone(self.bot._target_continuity_state)
+
+    def test_target_diagnostics_aggregate_short_gaps_and_ignore_log_errors(self) -> None:
+        self.bot._frame_target_diagnostic = {"reason": "no_current_detection", "raw_count": 0}
+        self.bot.state = "SCANNING"
+        for now in (100., 100.1, 100.2, 101.01):
+            self.bot._record_action_state(now, None, None, (.5, .5), False)
+        self.assertEqual(self.bot.log.write.call_count, 2)
+        self.assertEqual(self.bot.log.write.call_args.kwargs["frame_reason_counts"],
+                         {"SCANNING:no_current_detection": 3})
+        self.bot.log.write.side_effect = OSError("disk full")
+        self.bot._record_action_state(102.1, None, None, (.5, .5), False)
 
     def test_cast_interval_is_bounded_to_point_one_through_ten_seconds(self) -> None:
         for interval in (-5.0, 0.0, .01):

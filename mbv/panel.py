@@ -1355,6 +1355,7 @@ class ControlPanel:
         maximum: float | None = None,
         on_adjust: Callable[[str], None] | None = None,
         direct_numeric_input: bool = False,
+        on_clear: Callable[[], None] | None = None,
     ) -> None:
         row = tk.Frame(parent, bg=PANEL)
         row.pack(fill="x", padx=8, pady=2)
@@ -1383,6 +1384,13 @@ class ControlPanel:
                 cursor="hand2",
                 width=4,
                 padx=5,
+            ).pack(side="right", padx=(4, 0))
+        if on_clear is not None:
+            RoundedButton(
+                row, text="清空", command=on_clear,
+                bg=BUTTON_BG, fg=FG, activebackground=BUTTON_ACTIVE,
+                activeforeground=FG, relief="flat", font=FONT_SMALL,
+                cursor="hand2", takefocus=False, width=4, padx=5,
             ).pack(side="right", padx=(4, 0))
         if direct_numeric_input:
             RoundedButton(
@@ -1645,6 +1653,8 @@ class ControlPanel:
                 minimum=field.minimum,
                 maximum=field.maximum,
                 capture=field.capture_key,
+                on_clear=(lambda dotted=prefix + field.path: self._clear_strategy_key(dotted))
+                if field.capture_key and strategy.default_settings.get(field.path) == "" else None,
                 direct_numeric_input=field.direct_numeric_input,
                 on_adjust=lambda text, path=field.path: self._preview_strategy_setting(path, text),
             )
@@ -2697,6 +2707,25 @@ class ControlPanel:
             save_config(self.config_path, config)
 
         self._run_tool("按键采集", action)
+
+    def _clear_strategy_key(self, dotted: str) -> None:
+        # 只清空允许空值的策略技能；普通攻击/移动等必需键仍须有效。
+        allowed = {
+            f"strategy.options.{strategy.key}.{field.path}"
+            for strategy in list_strategies()
+            for field in strategy.setting_fields
+            if field.capture_key and strategy.default_settings.get(field.path) == ""
+        }
+        if dotted not in allowed:
+            return
+
+        def action() -> None:
+            config = load_config(self.config_path)
+            self._nested(config, dotted, "")
+            save_config(self.config_path, config)
+
+        # 无需采集或激活游戏，复用配置重载和输入释放流程。
+        self._run_tool("技能按键清空", action, requires_window=False)
 
     def _capture_target_range(self) -> None:
         player_box = None

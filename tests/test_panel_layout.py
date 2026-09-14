@@ -94,6 +94,92 @@ class PanelLayoutTests(unittest.TestCase):
         self.assertIsNone(self.panel._selected_target)
         self.run.assert_not_called()
 
+    def test_optional_skill_clear_button_saves_reloads_and_survives_exit_save(self) -> None:
+        panel = self.panel
+        for strategy_key in ("stationary_attack", "bowman_dynamic", "dragon_roar"):
+            with self.subTest(strategy=strategy_key):
+                config = load_config(self.config_path)
+                field = "skill_key" if strategy_key == "dragon_roar" else "melee_skill_key"
+                config["strategy"]["active"] = strategy_key
+                config["strategy"]["options"][strategy_key][field] = "f"
+                save_config(self.config_path, config)
+                panel._load_entries(config)
+                panel.bot.apply_config(config)
+                dotted = f"strategy.options.{strategy_key}.{field}"
+                entry = panel._strategy_entries[dotted]
+                clear = next(child for child in entry.master.winfo_children()
+                             if isinstance(child, tk.Button) and child.cget("text") == "清空")
+                with patch("mbv.panel.capture_key_name") as capture, \
+                        patch.object(panel, "_target_ready", return_value=False) as target:
+                    clear.invoke()
+                    capture.assert_not_called()
+                    target.assert_not_called()
+                self.assertEqual(load_config(self.config_path)["strategy"]["options"][strategy_key][field], "")
+                self.assertEqual(panel.bot.config["strategy"]["options"][strategy_key][field], "")
+                self.assertEqual(panel._strategy_entries[dotted].get(), "")
+                self.assertTrue(panel._persist_settings(apply_runtime=False, notify=False, show_error=True))
+                loaded = load_config(self.config_path)
+                self.assertEqual(loaded["strategy"]["options"][strategy_key][field], "")
+                self.assertEqual(loaded["keys"], config["keys"])
+                self.assertEqual(loaded["buffs"], config["buffs"])
+        self.errors.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_required_keys_cannot_be_cleared_by_strategy_action(self) -> None:
+        with patch.object(self.panel, "_run_tool") as run_tool:
+            self.panel._clear_strategy_key("keys.attack")
+            run_tool.assert_not_called()
+
+    def test_arrow_rain_is_selectable_with_independent_stationary_options(self) -> None:
+        panel = self.panel
+        config = load_config(self.config_path)
+        config["strategy"]["active"] = "bowman_arrow_rain"
+        config["strategy"]["options"]["stationary_attack"]["melee_skill_key"] = "q"
+        save_config(self.config_path, config)
+        panel._load_entries(config)
+        self.assertEqual(panel.profession_name.get(), "弓箭手")
+        self.assertEqual(panel.strategy_name.get(), "箭雨")
+        self.assertIn("箭雨", panel.strategy_combo.cget("values"))
+        self.assertIn("弓箭手动态", panel.strategy_combo.cget("values"))
+        path = "strategy.options.bowman_arrow_rain.melee_skill_key"
+        panel._strategy_entries[path].insert(0, "f")
+        range_entry = panel._strategy_entries["strategy.options.bowman_arrow_rain.attack_range_px"]
+        self.assertEqual(float(range_entry.get()), 300.)
+        range_entry.delete(0, "end")
+        range_entry.insert(0, "280")
+        self.assertTrue(panel._persist_settings(apply_runtime=False, notify=False, show_error=True))
+        saved = load_config(self.config_path)
+        self.assertEqual(saved["strategy"]["active"], "bowman_arrow_rain")
+        self.assertEqual(saved["strategy"]["options"]["bowman_arrow_rain"]["melee_skill_key"], "f")
+        self.assertEqual(saved["strategy"]["options"]["bowman_arrow_rain"]["attack_range_px"], 280.)
+        self.assertEqual(saved["strategy"]["options"]["stationary_attack"]["melee_skill_key"], "q")
+        self.errors.assert_not_called()
+
+    def test_arrow_rain_periodic_step_toggle_hot_saves_without_pausing(self) -> None:
+        panel = self.panel
+        config = load_config(self.config_path)
+        config["strategy"]["active"] = "bowman_arrow_rain"
+        save_config(self.config_path, config)
+        panel.bot.apply_config(config)
+        panel._load_entries(config)
+        path = "strategy.options.bowman_arrow_rain.periodic_step_enabled"
+        variable = panel._strategy_toggles[path]
+        self.assertTrue(variable.get())
+        button = next(child for child in panel.strategy_settings_body.winfo_children()
+                      if isinstance(child, tk.Checkbutton) and child.cget("text") == "定时向右小步")
+        with patch.object(panel.bot, "apply_config") as apply, patch.object(panel.bot, "disarm") as disarm:
+            button.invoke()
+            self.assertFalse(variable.get())
+            self.assertFalse(panel.bot.config["strategy"]["options"]["bowman_arrow_rain"]["periodic_step_enabled"])
+            self.assertTrue(panel._persist_settings(apply_runtime=False, notify=False, show_error=True))
+            saved = load_config(self.config_path)
+            self.assertFalse(saved["strategy"]["options"]["bowman_arrow_rain"]["periodic_step_enabled"])
+            panel._load_entries(saved)
+            self.assertFalse(panel._strategy_toggles[path].get())
+            apply.assert_not_called()
+            disarm.assert_not_called()
+        self.errors.assert_not_called()
+
     def test_function_pages_have_separate_scroll_bodies_and_correct_controls(self) -> None:
         panel = self.panel
         panel._fit_page_tabs(SimpleNamespace(width=700))

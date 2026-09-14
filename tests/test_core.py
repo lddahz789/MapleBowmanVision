@@ -594,10 +594,11 @@ class CoreTests(unittest.TestCase):
         strategies = list_strategies()
         self.assertEqual(
             [item.display_name for item in strategies],
-            ["弓箭手动态", "原地攻击", "标飞安全输出", "龙咆哮·定点"],
+            ["弓箭手动态", "原地攻击", "标飞安全输出", "龙咆哮·定点", "箭雨"],
         )
         self.assertTrue(all(item.description for item in strategies))
-        bowman, stationary, throwing_star, dragon_roar = strategies
+        bowman, stationary, throwing_star, dragon_roar, arrow_rain = strategies
+        self.assertEqual(arrow_rain.profession, "弓箭手")
         self.assertTrue(all(field.required for field in dragon_roar.capture_fields))
         self.assertIn("platform_center", bowman.required_recognition_data)
         self.assertIn("platform_center", stationary.required_recognition_data)
