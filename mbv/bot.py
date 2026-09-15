@@ -330,7 +330,7 @@ class BowmanBot:
         print(message)
 
     def _observe_verification_alert(self, frame: np.ndarray, now: float) -> None:
-        # 与行动决策隔离：命中/报错都不得发键、停机、切窗或更改策略状态。
+        # 检测器保持只读；仅用户显式启用 pause_on_detect 时由运行层暂停。
         from mbv.verification_alert import KEYWORD, play_alert_sound
         monitor = self.verification_alert
         settings = self.config.get("verification_alert", {})
@@ -342,18 +342,28 @@ class BowmanBot:
                 self.verification_alert_status = ""
             if match is None:
                 return
-            self.verification_alert_status = time.strftime("最近提醒 %H:%M:%S：") + "检测到狩猎验证，请人工处理（挂机未暂停）"
+            pause_on_detect = settings.get("pause_on_detect") is True
+            if pause_on_detect:
+                # 在声音和日志之前停止，同帧后续决策不能继续战斗或暂停喝药。
+                with self.action_lock:
+                    self.auto_potion.set_enabled(False)
+                    self.potion_enabled_requested = None
+                    self.f8_requested.clear()
+                    self.disarm("检测到狩猎验证，请人工处理后手动启动")
+            result = "已暂停挂机并关闭自动喝药，请手动恢复" if pause_on_detect else "挂机未暂停"
+            self.verification_alert_status = time.strftime("最近提醒 %H:%M:%S：") + f"检测到狩猎验证，请人工处理（{result}）"
             play_alert_sound()
             try:
                 self.log.write("verification_alert", keyword=KEYWORD, method="chat_glyph_template",
-                               score=round(match.score, 4), box=match.box, action="sound_only",
+                               score=round(match.score, 4), box=match.box,
+                               action="pause_and_sound" if pause_on_detect else "sound_only",
                                armed=self.armed)
             except Exception:
                 self.verification_alert_status += "；提醒日志不可用"
         except Exception as exc:
-            # 仅本提醒器停用到配置变化，不能将识别/声音/日志异常变成挂机异常。
+            # 故障不触发新的暂停或恢复；显式暂停若已执行，声音失败也不能恢复挂机。
             monitor.failed = True
-            self.verification_alert_status = f"验证提醒不可用：{exc}（挂机不受影响）"
+            self.verification_alert_status = f"验证提醒不可用：{exc}（{'已暂停' if not self.armed else '挂机不受影响'}）"
             try:
                 self.log.write("verification_alert_error", error=str(exc))
             except Exception:

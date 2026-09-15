@@ -30,7 +30,8 @@ _ROWS = (
     "000000011000011100011001000010001101111111000011111111000000",
 )
 KEYWORD_MASK = np.array([[int(c) for c in row] for row in _ROWS], dtype=np.uint8)
-DEFAULT_REGION = {"x": 0.0, "y": 0.65, "w": 0.5, "h": 0.27}
+LEGACY_REGION = {"x": 0.0, "y": 0.65, "w": 0.5, "h": 0.27}
+DEFAULT_REGION = {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
 SCAN_SECONDS = 0.5
 CONFIRM_SCANS = 3
 CLEAR_SECONDS = 10.0
@@ -52,7 +53,11 @@ def normalize_alert_settings(raw: Any) -> dict[str, Any]:
             raise ValueError
     except (KeyError, TypeError, ValueError):
         region = dict(DEFAULT_REGION)
-    return {"enabled": raw.get("enabled") is True, "chat_region": region}
+    if region == LEGACY_REGION:
+        # 旧示例区域自动升级；其他用户自定义比例区域仍保留。
+        region = dict(DEFAULT_REGION)
+    return {"enabled": raw.get("enabled") is True, "chat_region": region,
+            "pause_on_detect": raw.get("pause_on_detect") is True}
 
 
 @dataclass(frozen=True)
@@ -61,8 +66,20 @@ class KeywordMatch:
     box: tuple[int, int, int, int]
 
 
+@lru_cache(maxsize=16)
+def _keyword_templates(width: int, height: int) -> tuple[np.ndarray, ...]:
+    # 分辨率改变不一定缩放字体：始终保留原生及常见 DPI 字形，追加当前画面的等比倍率。
+    scale = min(width / 1280.0, height / 720.0)
+    scales = (1.0, 0.8, 1.25, 1.5, 2.0, max(0.5, min(4.0, scale)))
+    templates = {}
+    for factor in scales:
+        template = cv2.resize(KEYWORD_MASK, None, fx=factor, fy=factor, interpolation=cv2.INTER_NEAREST)
+        templates.setdefault(template.shape, template)
+    return tuple(templates.values())
+
+
 def keyword_match(frame: np.ndarray, region: dict[str, float]) -> KeywordMatch | None:
-    """限聊天 ROI 的彩色字形匹配；不是 OCR，也不识别角色附近验证框。"""
+    """在当前游戏客户区（或自定义比例区域）查找字形，不读题目、不截桌面。"""
     height, width = frame.shape[:2]
     x, y = int(width * region["x"]), int(height * region["y"])
     right = min(width, int(width * (region["x"] + region["w"])))
@@ -76,8 +93,7 @@ def keyword_match(frame: np.ndarray, region: dict[str, float]) -> KeywordMatch |
         return None
     best = None
     # 同时兼容原生字体及常见缩放；模板很小，避免引入 OCR 模型和下载依赖。
-    for scale in (1.0, 0.8, 1.25, 1.5, 2.0):
-        template = cv2.resize(KEYWORD_MASK, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+    for template in _keyword_templates(width, height):
         th, tw = template.shape
         if mask.shape[0] < th or mask.shape[1] < tw:
             continue
@@ -100,6 +116,7 @@ class VerificationAlert:
         self.last_alert = -math.inf
         self.settings: dict[str, Any] | None = None
         self.failed = False
+        self.frame_size: tuple[int, int] | None = None
 
     def observe(self, frame: np.ndarray, raw: Any, now: float) -> KeywordMatch | None:
         settings = normalize_alert_settings(raw)
@@ -108,6 +125,12 @@ class VerificationAlert:
             self.settings = settings
         if not settings["enabled"] or self.failed or now < self.next_scan:
             return None
+        frame_size = frame.shape[:2]
+        if frame_size != self.frame_size:
+            self.hits = 0
+            self.missing_since = None
+            self.frame_size = frame_size
+            # 不清除旧消息锁存和提醒冷却，避免调整窗口就重复响铃。
         # 截图停更、挂起、重新连接不能被当作连续命中或连续无提示。
         if self.last_scan is not None and now - self.last_scan > SCAN_SECONDS * 3:
             self.hits = 0

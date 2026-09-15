@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 import wave
+import threading
 from unittest.mock import MagicMock, patch
 
 import cv2
@@ -37,9 +38,22 @@ class KeywordDetectionTests(unittest.TestCase):
                     self.assertEqual(result.box[:2], (8, y))
                     self.assertGreater(result.score, .99)
 
-    def test_ignores_keyword_outside_chat_and_math_panel(self):
-        self.assertIsNone(keyword_match(sample_frame(850, 350), DEFAULT_REGION))
-        self.assertIsNone(keyword_match(sample_frame(800, 600), DEFAULT_REGION))
+    def test_default_finds_keyword_outside_old_chat_region(self):
+        self.assertIsNotNone(keyword_match(sample_frame(850, 350), DEFAULT_REGION))
+        self.assertIsNotNone(keyword_match(sample_frame(800, 600), DEFAULT_REGION))
+
+    def test_resolution_changes_support_native_and_scaled_fonts_at_edges(self):
+        for width, height in ((800, 600), (1280, 720), (1920, 1080), (2880, 1620), (3840, 2160)):
+            for scale in (1., min(width / 1280, height / 720)):
+                with self.subTest(size=(width, height), scale=scale):
+                    template = cv2.resize(KEYWORD_MASK, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+                    th, tw = template.shape
+                    frame = np.zeros((height, width, 3), np.uint8)
+                    x, y = width - tw, height - th
+                    frame[y:, x:][template != 0] = (170, 170, 255)
+                    result = keyword_match(frame, DEFAULT_REGION)
+                    self.assertIsNotNone(result)
+                    self.assertEqual(result.box, (x, y, tw, th))
 
     def test_empty_tiny_and_solid_color_are_not_keyword(self):
         for frame in (np.zeros((0, 0, 3), np.uint8), np.zeros((20, 20, 3), np.uint8),
@@ -61,6 +75,7 @@ class KeywordDetectionTests(unittest.TestCase):
     def test_custom_region_is_respected(self):
         region = {"x": .5, "y": .6, "w": .5, "h": .3}
         self.assertIsNotNone(keyword_match(sample_frame(800, 600), region))
+        self.assertIsNone(keyword_match(sample_frame(8, 600), region))
 
 
 class AlertDebounceTests(unittest.TestCase):
@@ -141,6 +156,19 @@ class AlertDebounceTests(unittest.TestCase):
         self.assertFalse(self.monitor.failed)
         self.assertEqual(self.matcher.call_count, 2)
 
+    def test_resize_resets_confirmation_but_preserves_old_message_latch(self):
+        self.scan(0.)
+        self.scan(.5)
+        self.frame = np.zeros((2, 2, 3), np.uint8)
+        self.assertIsNone(self.scan(1.))
+        self.assertIsNone(self.scan(1.5))
+        self.assertEqual(self.scan(2.), self.hit)
+        self.frame = np.zeros((3, 3, 3), np.uint8)
+        for now in (2.5, 3., 3.5, 100.):
+            self.assertIsNone(self.scan(now))
+        self.assertTrue(self.monitor.latched)
+        self.assertEqual(self.monitor.last_alert, 2.)
+
 
 class AlertIntegrationTests(unittest.TestCase):
     def make_bot(self, armed=True):
@@ -157,6 +185,57 @@ class AlertIntegrationTests(unittest.TestCase):
         bot.last_attack = 100.
         bot.strategy_runtime_state = {"phase": "returning"}
         return bot
+
+    def test_opt_in_pauses_and_releases_before_sound_even_if_sound_fails(self):
+        for sound_failure in (False, True):
+            with self.subTest(sound_failure=sound_failure):
+                bot = self.make_bot()
+                bot.config['verification_alert']['pause_on_detect'] = True
+                bot.action_lock = threading.RLock()
+                bot.auto_potion = MagicMock(enabled=True)
+                bot.potion_enabled_requested = True
+                bot.f8_requested = threading.Event()
+                bot.f8_requested.set()
+                bot._reset_attack_facing = MagicMock()
+                bot._reset_player_lost_recovery = MagicMock()
+                bot.notify = MagicMock()
+                bot.disarm = BowmanBot.disarm.__get__(bot)
+
+                def sound():
+                    self.assertFalse(bot.armed)
+                    self.assertEqual(bot.state, 'PAUSED')
+                    bot.keyboard.release_all.assert_called_once_with()
+                    bot.auto_potion.set_enabled.assert_called_once_with(False)
+                    self.assertFalse(bot.f8_requested.is_set())
+                    self.assertIsNone(bot.potion_enabled_requested)
+                    if sound_failure:
+                        raise RuntimeError('sound unavailable')
+
+                with patch('mbv.verification_alert.play_alert_sound', side_effect=sound) as play, \
+                     patch('mbv.bot.user32.MessageBeep'):
+                    for now in (0., .5):
+                        bot._observe_verification_alert(sample_frame(), now)
+                        self.assertTrue(bot.armed)
+                        bot.keyboard.release_all.assert_not_called()
+                    bot._observe_verification_alert(sample_frame(), 1.)
+                    play.assert_called_once()
+                    for now in (1.5, 2., 2.5):
+                        bot._observe_verification_alert(sample_frame(), now)
+                self.assertFalse(bot.armed)
+                self.assertEqual(bot.strategy_runtime_state, {})
+                self.assertIsNone(bot.buff_preparation)
+                self.assertIn('已暂停', bot.verification_alert_status)
+                bot.keyboard.tap.assert_not_called()
+
+    def test_pause_option_alone_does_not_enable_detection(self):
+        bot = self.make_bot()
+        bot.config['verification_alert'].update(enabled=False, pause_on_detect=True)
+        with patch('mbv.verification_alert.play_alert_sound') as sound:
+            for now in (0., .5, 1.):
+                bot._observe_verification_alert(sample_frame(), now)
+            sound.assert_not_called()
+        bot.disarm.assert_not_called()
+        self.assertTrue(bot.armed)
 
     def test_alert_does_not_change_armed_state_strategy_attack_or_keys(self):
         for armed in (True, False):
@@ -248,6 +327,18 @@ class AlertIntegrationTests(unittest.TestCase):
 
 
 class AlertConfigTests(unittest.TestCase):
+    def test_pause_defaults_off_and_requires_explicit_boolean(self):
+        for value in (None, 'true', 1, False):
+            self.assertFalse(normalize_alert_settings({'pause_on_detect': value})['pause_on_detect'])
+        self.assertTrue(normalize_alert_settings({'pause_on_detect': True})['pause_on_detect'])
+    def test_legacy_region_migrates_but_custom_region_is_preserved(self):
+        from mbv.verification_alert import LEGACY_REGION
+        raw = {"enabled": True, "chat_region": dict(LEGACY_REGION)}
+        self.assertEqual(normalize_alert_settings(raw)["chat_region"], DEFAULT_REGION)
+        self.assertEqual(raw["chat_region"], LEGACY_REGION)
+        custom = {"x": .1, "y": .2, "w": .8, "h": .5}
+        self.assertEqual(normalize_alert_settings({"chat_region": custom})["chat_region"], custom)
+
     def test_old_configs_default_off_and_changes_roundtrip(self):
         root = Path(__file__).resolve().parents[1]
         for example in (root / "config.example.json", root / "profiles/newmaple/config.example.json"):

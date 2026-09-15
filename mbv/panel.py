@@ -179,6 +179,7 @@ class ControlPanel:
         self.auto_potion_enabled = tk.BooleanVar(value=False)
         self.standalone_potion = self.auto_potion_enabled
         self.verification_alert_enabled = tk.BooleanVar(value=bool(config["verification_alert"]["enabled"]))
+        self.verification_pause_on_detect = tk.BooleanVar(value=bool(config["verification_alert"]["pause_on_detect"]))
         self.buff_enabled: dict[str, tk.BooleanVar] = {
             slot: tk.BooleanVar(value=bool(config["buffs"][slot]["enabled"]))
             for slot in ("buff_1", "buff_2", "buff_3")
@@ -875,12 +876,16 @@ class ControlPanel:
             anchor="w",
         ).pack(fill="x", padx=8, pady=(0, 5))
         if self.profile_label == "NewMaple":
+            tk.Checkbutton(
+                settings, text="检测到验证后立即停止挂机", variable=self.verification_pause_on_detect,
+                command=self._toggle_verification_pause, bg=PANEL, fg=FG, font=FONT_SMALL,
+            ).pack(anchor="w", padx=8, pady=2)
             RoundedButton(
                 settings, text="试听验证提示音", command=self._test_verification_sound,
                 bg=BUTTON_BG, fg=FG, relief="flat", font=FONT_SMALL, takefocus=False,
             ).pack(anchor="w", padx=8, pady=2)
             tk.Label(
-                settings, text="底部狩猎验证开关仅检测并响铃，不暂停、不答题。人工输入前请暂停挂机并关闭自动喝药。",
+                settings, text="需开启底部狩猎验证响铃。勾选后连续确认命中即暂停、抬键并关闭自动喝药，不自动恢复；未勾选仅响铃。不会答题。",
                 bg=PANEL, fg=MUTED, font=FONT_SMALL, wraplength=360, justify="left",
             ).pack(fill="x", padx=8, pady=(0, 5))
         tk.Label(
@@ -1655,6 +1660,9 @@ class ControlPanel:
             alert_enabled = getattr(self, "verification_alert_enabled", None)
             if alert_enabled is not None:
                 alert_enabled.set(bool(config["verification_alert"]["enabled"]))
+            pause_on_detect = getattr(self, "verification_pause_on_detect", None)
+            if pause_on_detect is not None:
+                pause_on_detect.set(bool(config["verification_alert"]["pause_on_detect"]))
         finally:
             self._loading_settings = previous_loading
 
@@ -2936,6 +2944,14 @@ class ControlPanel:
             self.verification_alert_enabled.set(not enabled)
             messagebox.showerror("验证提醒", f"保存失败：{exc}")
 
+    def _toggle_verification_pause(self) -> None:
+        enabled = bool(self.verification_pause_on_detect.get())
+        try:
+            self._preview_common_setting("verification_alert.pause_on_detect", enabled)
+        except Exception as exc:
+            self.verification_pause_on_detect.set(not enabled)
+            messagebox.showerror("验证提醒", f"保存失败：{exc}")
+
     def _test_verification_sound(self) -> None:
         from mbv.verification_alert import play_alert_sound
         try:
@@ -3028,6 +3044,9 @@ class ControlPanel:
             alert_enabled = getattr(self, "verification_alert_enabled", None)
             if alert_enabled is not None:
                 config["verification_alert"]["enabled"] = bool(alert_enabled.get())
+            pause_on_detect = getattr(self, "verification_pause_on_detect", None)
+            if pause_on_detect is not None:
+                config["verification_alert"]["pause_on_detect"] = bool(pause_on_detect.get())
             interval_ms = int(getattr(self, "_performance_interval_ms", 1000))
             performance_monitor["refresh_interval_seconds"] = max(500, min(5000, interval_ms)) / 1000.0
             minimap_assist = getattr(self, "minimap_assist", None)
@@ -3057,6 +3076,7 @@ class ControlPanel:
                     "vision.player_minimap_occlusion_seconds",
                     "vision.player_minimap_navigation_seconds",
                     "verification_alert.enabled",
+                    "verification_alert.pause_on_detect",
                 ):
                     self.bot.preview_config_setting(key, self._nested(config, key))
                 for slot in getattr(self, "buff_enabled", {}):

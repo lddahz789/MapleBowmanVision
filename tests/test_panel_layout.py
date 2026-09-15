@@ -434,6 +434,25 @@ class PanelLayoutTests(unittest.TestCase):
             apply.assert_not_called()
         self.run.assert_not_called()
 
+    def test_verification_pause_option_is_saved_and_hot_updated_without_pausing(self) -> None:
+        panel = self.panel
+        self.assertFalse(panel.verification_pause_on_detect.get())
+        controls = [widget for widget in self.descendants(self.root)
+                    if isinstance(widget, tk.Checkbutton)
+                    and str(widget.cget('variable')) == str(panel.verification_pause_on_detect)]
+        self.assertEqual(len(controls), 1)
+        self.assertTrue(self.belongs_to(controls[0], panel._page_bodies['supply']))
+        with patch.object(panel.bot, 'disarm') as disarm, patch.object(panel.bot, 'apply_config') as apply:
+            controls[0].invoke()
+            self.assertTrue(load_config(self.config_path)['verification_alert']['pause_on_detect'])
+            self.assertTrue(panel.bot.config['verification_alert']['pause_on_detect'])
+            self.assertTrue(panel._persist_settings(apply_runtime=False, notify=False, show_error=True))
+            panel._load_entries(load_config(self.config_path))
+            self.assertTrue(panel.verification_pause_on_detect.get())
+            disarm.assert_not_called()
+            apply.assert_not_called()
+        self.run.assert_not_called()
+
     def test_cast_interval_milliseconds_load_save_reload_and_strategy_switch(self) -> None:
         panel = self.panel
         config = load_config(self.config_path)
