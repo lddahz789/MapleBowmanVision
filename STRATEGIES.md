@@ -93,16 +93,16 @@
 ## 当前策略：龙咆哮·定点
 
 - 职业：战士·龙骑士；标识：`dragon_roar`。不追怪、不转向、不巡逻、不定时短步、不拾取。
-- 独立采集：在放大的小地图点击 `dragon_roar_point`（`recognition` 中的点位、`_space=minimap` 和 `_captured`）；框选 `attack_regions`（`strategy.options.dragon_roar` 下的 `player_anchor_v1` 列表）。两项均由 `capture_fields.required=true` 声明必需。
-- 攻击范围随稳定角色锚点平移，不随面向翻转，不额外套用公共索敌框或同层限制。多个区域按并集过滤怪物中心，重叠区域与重复框不重复计数；模板本身仍使用公共跨模板 NMS 和过滤项，不能保证遮挡怪物逐只可见。
+- 定点沿用公共 `platform_center`（`_space=minimap`、`_captured=true`），由 `required_recognition_data` 声明必需；没有专属定点按钮，旧 `dragon_roar_point` 不使用或回退。沿用公共小地图、玩家标记、战斗区校准和怪物模板，不需要姓名牌/头部模板。
+- `localization_mode="minimap"` 声明独立小地图定位：不建立屏幕身份、不运行玩家模板匹配、不伪造屏幕锚点。怪物中心位于固定 `regions.combat` 即参与计数，不套用公共索敌框、同层或旧 `attack_regions`；旧区域配置保留但不使用。模板仍使用公共跨模板 NMS 和过滤项，不能保证遮挡怪物逐只可见。
 - 数量只用本帧真实检测，`detections_fresh=false` 的短暂保留框一律不参与计数。`monster_count_threshold=2` 表示严格大于 2（至少 3 只）才施放；范围 0–23，受公共单帧最多 24 个检测结果限制。
-- `skill_key` 必须独立采集，空值不施放、不回退普通攻击；`cast_interval_seconds=1.0`（0.1–10 秒）由公共 `cast` 执行器按实际成功发送按键的时间限频，不宣称游戏实际施法成功。
-- 优先级：公共输入/窗口安全 → 补药/Buff → 点位和范围有效性 → 定点回位 → 仅小地图时等待视觉恢复 → 范围计数 → 无方向施法/原地等待。
+- `skill_key` 必须独立采集，空值不施放、不回退普通攻击；面板施放间隔用毫秒（默认 1000，范围 100–10000），配置仍保存 `cast_interval_seconds=1.0`（0.1–10 秒），由公共 `cast` 执行器按实际成功发送按键的时间限频，不宣称游戏实际施法成功。
+- 优先级：公共输入/窗口安全 → 补药/Buff → 唯一实时标记、点位和战斗区有效性 → 定点回位 → 本帧范围计数 → 无方向施法/原地等待。标记缺失或歧义立即停止战斗/移动，不等待姓名牌恢复。
 - `return_tolerance_x=0.015`、`return_tolerance_y=0.06` 分别以小地图宽、高的比例表示允许偏离量；超过任一容差进入回位，回到两轴容差的六成以内才结束，避免边界来回抖动。
 - 横向回位走公共 `move` 位移验证；水平接近后按小地图上下层关系使用 `jump` / `down_jump`，`return_jump_interval_seconds=0.45`（0.1–2 秒）。只支持可直接走回/跳回的位置，不支持绕障碍、爬绳、自动换图。普通移动无进展仍按公共 2 秒重试/4 秒暂停保护。
-- `return_timeout_seconds=15`（3–60 秒）从本次开始回位计时，包含上游中断等待。超时锁存 `blocked` 并停止移动/施法，检查路径后需暂停再启动。小地图遮挡导航仍受公共更短期限约束，不因该参数延长。
+- `return_timeout_seconds=15`（3–60 秒）从本次开始回位计时，包含上游中断等待。超时锁存 `blocked` 并停止移动/施法，检查路径后需暂停再启动。独立地图定位不适用其他策略的视觉配对过期期限，仍要求每帧唯一实时标记及公共移动进展保护。
 - 会话 `runtime_state` 保存 `phase`、实时 `monster_count`、回位起始时间；`navigation_active=true` 且元数据 `allow_player_lost_recovery=false`，包括首次策略决策前也禁止完全丢失定位时左右盲走。暂停重启清会话，注册实例无会话状态。
-- 重采小地图使定点失效；重采战斗区清空攻击范围但保留定点。两个客户端档案独立，不修改原已选策略或个人校准。
+- 重采小地图使定点失效；重采战斗区直接更新固定计数范围并保留定点。两个客户端档案独立，不修改原已选策略或个人校准。
 
 ## 新增策略必须遵循
 
@@ -113,7 +113,7 @@
    - `profession`：职业分类。
    - `description`：一到三句话说明执行逻辑；用户切换下拉选项时会直接看到。
    - `required_recognition_data`：依赖的公共采集数据键。
-   - `default_settings` 和 `setting_fields`：策略专属默认值及面板字段；数字字段同时声明鼠标微调步长和上下限，技能键字段声明 `capture_key=true`。
+   - `default_settings` 和 `setting_fields`：策略专属默认值及面板字段；数字字段同时声明鼠标微调步长和上下限，技能键字段声明 `capture_key=true`。`display_multiplier` 只换算面板单位（默认 1）；例如龙咆哮施放间隔用 1000 显示为毫秒，配置/运行值、步长与边界仍以秒声明，面板负责读写和微调换算。
    - `select_targets(context)`：使用公共 `context.target_area` 做目标筛选，只返回攻击目标和追踪目标。
    - `decide(context)`：只做策略决策，返回 `StrategyDecision`，不得直接调用键盘或 Win32。
 3. 在职业子包导出实现，再在 `mbv/strategies/__init__.py` 调用 `register_strategy(...)` 注册。面板会自动增加下拉项、说明和参数输入框。
@@ -125,6 +125,8 @@
 8. 更新本文件，增加策略的职业、用途、采集依赖、决策优先级和专属参数说明；提交时还需按 `AGENTS.md` 更新版本号和 `CHANGELOG.md`。
 
 ## 接口边界
+
+- 龙咆哮显式声明 `localization_mode="minimap"`，是以下视觉锚点和 `minimap_only` 禁止施法规则的唯一现有例外：仅放行无方向 `cast`，仍禁止 attack/chase/pickup/step/face/jump_attack。其他策略默认 `visual`，继续要求身份配对、视觉时限及到位等待；不得将小地图坐标换算为屏幕坐标。
 
 - `TargetSelectionContext` 输入的是同一帧已经完成的检测结果以及公共 `target_area`。策略不得重新执行模板匹配；标飞多索敌区从自身 `settings` 读取并相对稳定角色锚点换算，屏幕方向固定且不随面向翻转。
 - `player_anchor` 是公共视觉层提供的稳定战斗锚点；策略选敌和行动判断必须使用它，不得重新采用姓名板、头部或称号原始框的纵向中心。

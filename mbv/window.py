@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 import ntpath
 import os
+import re
 import time
 from typing import Any, Iterator
 
@@ -47,6 +48,35 @@ class WindowTarget:
 _selected_window: ContextVar[WindowTarget | None] = ContextVar("selected_game_window", default=None)
 
 
+def window_choice_labels(targets: list[WindowTarget]) -> dict[str, WindowTarget]:
+    """同一批窗口在不同面板中编号一致，不受枚举顺序或首选排序影响。"""
+    groups: dict[str, list[WindowTarget]] = {}
+    for target in targets:
+        groups.setdefault(target.title or "无标题窗口", []).append(target)
+    names = set(groups)
+    labels: dict[tuple[int, int], str] = {}
+    for name, group in groups.items():
+        for index, target in enumerate(sorted(group, key=lambda item: (item.pid, item.hwnd)), 1):
+            label = name if len(group) == 1 else f"{name}（窗口 {index}）"
+            while label in labels.values() or (label in names and label != name):
+                label += "（同名）"
+            labels[target.hwnd, target.pid] = label
+    return {labels[target.hwnd, target.pid]: target for target in targets}
+
+
+def identify_window(target: WindowTarget) -> None:
+    """有限次闪烁标题栏和任务栏，不切前台、不发键、不修改窗口标题。"""
+    class FlashInfo(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.UINT), ("hwnd", wintypes.HWND),
+                    ("dwFlags", wintypes.DWORD), ("uCount", wintypes.UINT),
+                    ("dwTimeout", wintypes.DWORD)]
+
+    validate_window_target(target)
+    info = FlashInfo(ctypes.sizeof(FlashInfo), target.hwnd, 3, 6, 250)
+    # 返回值表示调用前的活动状态，不是成功标志。
+    user32.FlashWindowEx(ctypes.byref(info))
+
+
 @contextmanager
 def selected_window(target: WindowTarget) -> Iterator[None]:
     """让当前采集操作沿用面板的精确目标，结束后恢复原来的选择作用域。"""
@@ -78,6 +108,29 @@ def resolve_window_target(target: WindowTarget) -> WindowInfo:
     window = client_window(target.hwnd, target.title)
     validate_window_target(target)
     return replace(window, pid=target.pid)
+
+
+def window_target_from_handle(value: str) -> WindowTarget:
+    """按明确的 HWND 建立当前会话身份；标题仅用于显示，不参与查找。"""
+    text = value.strip()
+    if len(text) > 20 or not re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", text):
+        raise ValueError("请输入十进制句柄，或以 0x 开头的十六进制句柄。")
+    hwnd = int(text, 16 if text.lower().startswith("0x") else 10)
+    if not 0 < hwnd < 1 << (ctypes.sizeof(ctypes.c_void_p) * 8):
+        raise ValueError("窗口句柄必须是有效的正整数。")
+    if not user32.IsWindow(hwnd):
+        raise RuntimeError("该句柄不存在或窗口已关闭，请重新获取句柄。")
+    pid, process_path = window_process_path(hwnd)
+    if pid == os.getpid():
+        raise RuntimeError("不能将助手自身窗口作为作用窗口。")
+    _validate_window_identity(hwnd, pid)
+    native_hwnd = wintypes.HWND(hwnd)
+    length = user32.GetWindowTextLengthW(native_hwnd)
+    buffer = ctypes.create_unicode_buffer(max(1, length + 1))
+    user32.GetWindowTextW(native_hwnd, buffer, len(buffer))
+    target = WindowTarget(hwnd, pid, buffer.value.strip(), process_path)
+    resolve_window_target(target)
+    return target
 
 
 def _window_match_score(config: dict[str, Any], title: str, process_path: str) -> int:

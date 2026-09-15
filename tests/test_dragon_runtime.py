@@ -9,9 +9,10 @@ from unittest.mock import MagicMock, call, patch
 
 from mbv.bot import BowmanBot
 from mbv.buffs import BUFF_KEY_HOLD_SECONDS
-from mbv.config import load_config
+from mbv.config import load_config, refresh_calibrated
 from mbv.strategies import get_strategy
 from mbv.strategies.base import StrategyDecision
+from mbv.vision import Detection
 from mbv.window import WindowInfo, WindowTarget
 
 
@@ -366,21 +367,97 @@ class DragonRuntimeTests(unittest.TestCase):
         self.bot.keyboard.tap.assert_not_called()
         self.assert_no_direction_or_fallback()
 
-    def test_first_dragon_frame_rejects_nonempty_but_stale_player_box(self) -> None:
+    def test_first_dragon_frame_ignores_stale_player_box_and_uses_minimap(self) -> None:
         self.bot.strategy = get_strategy("dragon_roar")
         self.bot.last_nameplate_seen_at = 1.0
         self.bot.player_track.last_seen_at = 99.9
         self.assertEqual(self.bot.strategy_runtime_state, {})
         self.assertFalse(self.bot.player_track.has_nameplate_identity())
         with patch.object(self.bot, "recover_player_nameplate") as recovery, \
-             patch.object(self.bot.strategy, "decide") as decide:
+             patch.object(self.bot.strategy, "decide", return_value=StrategyDecision(
+                 action="stop", state="DRAGON_WAITING_MONSTERS")) as decide:
             # 辅助定位的旧 hold 框仍非空，但本帧无真实定位或可信地图补位。
             self.bot.act(self.window, 1.0, 1.0, (.5, .5), (90, 100, 20, 1),
                          (130, 90, 20, 20), None, 400, True, 100.0, 200)
         recovery.assert_not_called()
-        decide.assert_not_called()
+        decide.assert_called_once()
+        context = decide.call_args.args[0]
+        self.assertIsNone(context.player_box)
+        self.assertIsNone(context.player_anchor)
+        self.assertTrue(context.minimap_only)
         self.bot.keyboard.tap.assert_not_called()
-        self.assertEqual(self.bot.state, "PLAYER_SCREEN_LOST")
+        self.assertEqual(self.bot.state, "DRAGON_WAITING_MONSTERS")
+
+    def test_real_dragon_casts_without_any_visual_identity(self) -> None:
+        self.bot.strategy = get_strategy("dragon_roar")
+        self.bot.config["strategy"]["active"] = "dragon_roar"
+        self.bot.config["strategy"]["options"]["dragon_roar"]["skill_key"] = "r"
+        self.bot.config["recognition"].update(
+            platform_center={"x": .5, "y": .5},
+            platform_center_space="minimap", platform_center_captured=True,
+        )
+        self.bot.last_nameplate_seen_at = 0.0
+        monsters = tuple(Detection((x, 90, 20, 20), .99, "test") for x in (20, 120, 220))
+        self.bot.act(self.window, 1., 1., (.5, .5), None, None, None,
+                     400, True, 100., 200, eligible_detections=monsters)
+        self.bot.keyboard.tap.assert_called_once_with("r")
+        self.assertEqual(self.bot.strategy_runtime_state["monster_count"], 3)
+        self.assertFalse(self.bot.player_track.has_nameplate_identity())
+        self.assert_no_direction_or_fallback()
+
+    def test_dragon_can_arm_without_player_templates(self) -> None:
+        self.bot.strategy = get_strategy("dragon_roar")
+        self.bot.armed = False
+        self.bot.integrity_ok = True
+        items = self.bot.config["calibration"]["items"]
+        for key in ("minimap", "player_marker", "combat_region"):
+            items[key] = {"complete": True}
+        for key in ("hp_bar", "mp_bar"):
+            items[key] = {"complete": False}
+        self.assertTrue(refresh_calibrated(self.bot.config))
+        self.bot.config["window"]["topmost_while_armed"] = False
+        self.bot.config["calibration"]["window_size"] = [800, 600]
+        self.bot.config["recognition"].update(
+            platform_center={"x": .5, "y": .5},
+            platform_center_space="minimap", platform_center_captured=True,
+        )
+        self.assertEqual(self.bot.player_templates, [])
+        with patch("mbv.bot.client_window", return_value=self.window), \
+             patch.object(self.bot, "_bind_input_window"), \
+             patch("mbv.bot.focus_game_window") as focus, \
+             patch("mbv.bot.set_window_topmost") as topmost:
+            self.bot._toggle(self.window)
+        self.assertTrue(self.bot.armed)
+        focus.assert_not_called()
+        topmost.assert_not_called()
+        self.bot.keyboard.tap.assert_not_called()
+
+    def test_potion_enable_still_requires_both_bars(self) -> None:
+        self.bot.integrity_ok = True
+        self.bot.notify = MagicMock()
+        for missing in ("hp_bar", "mp_bar"):
+            with self.subTest(missing=missing):
+                self.bot.auto_potion.set_enabled(False)
+                for key in ("hp_bar", "mp_bar"):
+                    self.bot.config["calibration"]["items"][key] = {"complete": key != missing}
+                self.bot._set_auto_potion(self.window, True)
+                self.assertFalse(self.bot.auto_potion.enabled)
+                self.assertIn("需要先采集", self.bot.notify.call_args.args[0])
+                self.bot.keyboard.tap.assert_not_called()
+        self.bot.config["calibration"]["items"]["mp_bar"] = {"complete": True}
+        self.bot._set_auto_potion(self.window, True)
+        self.assertTrue(self.bot.auto_potion.enabled)
+        self.bot.keyboard.tap.assert_not_called()
+
+    def test_real_dragon_missing_or_ambiguous_marker_stops(self) -> None:
+        self.bot.strategy = get_strategy("dragon_roar")
+        for marker, unique in ((None, False), ((.5, .5), False)):
+            with self.subTest(marker=marker):
+                self.bot.live_marker_unambiguous = unique
+                self.act(marker=marker, player=None)
+                self.bot.keyboard.tap.assert_not_called()
+                self.assertEqual(self.bot.state, "MARKER_LOST")
+                self.assert_no_direction_or_fallback()
 
     def test_ambiguous_minimap_marker_blocks_cast(self) -> None:
         self.bot.live_marker_unambiguous = False

@@ -342,10 +342,13 @@ def refresh_calibrated(config: dict[str, Any]) -> bool:
             item_complete(key) for key in ("hp_bar", "mp_bar", "minimap", "player_marker")
         )
         calibration["recognition_region_complete"] = item_complete("combat_region")
-    complete = bool(
-        calibration.get("status_regions_complete")
-        and calibration.get("recognition_region_complete")
-    )
+        # 血蓝条仅供自动喝药使用，不参与挂机基础校准门禁。
+        complete = all(item_complete(key) for key in ("minimap", "player_marker", "combat_region"))
+    else:
+        complete = bool(
+            calibration.get("status_regions_complete")
+            and calibration.get("recognition_region_complete")
+        )
     config["calibrated"] = complete
     return complete
 

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import contextmanager
 from ctypes import wintypes
 import multiprocessing as mp
 import time
 from multiprocessing.connection import Connection
+from typing import Iterator
 
 import numpy as np
+import cv2
 
 from mbv.win32 import user32
 from mbv.window import WindowInfo, client_window
@@ -27,8 +30,53 @@ class BitmapInfoHeader(ctypes.Structure):
     ]
 
 
+@contextmanager
+def _window_dpi_context(hwnd: int) -> Iterator[None]:
+    """只切换截图辅助线程的 DPI 上下文，异常时也恢复，不修改游戏或主 UI。"""
+    try:
+        get_context = user32.GetWindowDpiAwarenessContext
+        set_context = user32.SetThreadDpiAwarenessContext
+    except AttributeError:
+        raise BackgroundCaptureError("系统不支持窗口 DPI 校准，无法安全获取后台画面")
+    get_context.argtypes = [wintypes.HWND]
+    get_context.restype = ctypes.c_void_p
+    set_context.argtypes = [ctypes.c_void_p]
+    set_context.restype = ctypes.c_void_p
+    context = get_context(hwnd)
+    if not context:
+        raise BackgroundCaptureError("无法读取游戏窗口 DPI 上下文")
+    previous = set_context(context)
+    if not previous:
+        raise BackgroundCaptureError("无法切换截图 DPI 上下文")
+    try:
+        yield
+    finally:
+        if not set_context(previous):
+            raise BackgroundCaptureError("无法恢复截图 DPI 上下文")
+
+
 def print_window_frame(hwnd: int) -> np.ndarray:
-    """在隔离进程内调用；PrintWindow 本身没有超时参数。"""
+    """先按游戏原生 DPI 截图，再统一到主进程校准使用的客户区像素尺寸。"""
+    physical = client_window(hwnd, "")
+    if physical.width * physical.height > 16_777_216:
+        raise BackgroundCaptureError("窗口截图尺寸超出支持范围")
+    with _window_dpi_context(hwnd):
+        frame = _print_native_window_frame(hwnd)
+    current = client_window(hwnd, "")
+    if (current.width, current.height) != (physical.width, physical.height):
+        raise BackgroundCaptureError("截图期间窗口尺寸发生变化，请重新校准")
+    height, width = frame.shape[:2]
+    target_width, target_height = physical.width, physical.height
+    # 只接受 DPI 的等比例尺寸变化；不能按非黑色边界裁图或静默拉伸异常画面。
+    if abs(target_width * height - target_height * width) > 2 * max(width, height):
+        raise BackgroundCaptureError("后台截图比例与客户区不一致，请重新校准")
+    if (width, height) != (target_width, target_height):
+        frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_NEAREST)
+    return frame
+
+
+def _print_native_window_frame(hwnd: int) -> np.ndarray:
+    """在隔离进程内、目标 DPI 上下文中调用；PrintWindow 本身没有超时参数。"""
     if not user32.IsWindow(hwnd) or user32.IsIconic(hwnd):
         raise BackgroundCaptureError("游戏窗口已关闭或最小化，请恢复窗口")
     window = client_window(hwnd, "")
@@ -75,7 +123,7 @@ def print_window_frame(hwnd: int) -> np.ndarray:
             previous = None
             raise BackgroundCaptureError("无法选择窗口截图位图")
         ctypes.memset(bits, 0, width * height * 4)
-        # PW_CLIENTONLY | PW_RENDERFULLCONTENT：坐标与原客户区校准一致。
+        # PW_CLIENTONLY | PW_RENDERFULLCONTENT：只读取游戏原生客户区。
         if not user32.PrintWindow(hwnd, memory_dc, 3):
             raise BackgroundCaptureError("客户端不支持窗口截图，或权限不足")
         gdi.GdiFlush()
@@ -148,6 +196,9 @@ class BackgroundCapture:
             success, value = self._connection.recv()
             if not success:
                 raise BackgroundCaptureError(value)
+            if (not isinstance(value, np.ndarray) or value.dtype != np.uint8
+                    or value.shape != (window.height, window.width, 3)):
+                raise BackgroundCaptureError("后台截图尺寸与当前客户区不一致，请重新校准")
             return value
         except (EOFError, OSError) as exc:
             self.close()

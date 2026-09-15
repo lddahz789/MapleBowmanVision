@@ -94,6 +94,39 @@ class PanelLayoutTests(unittest.TestCase):
         self.assertIsNone(self.panel._selected_target)
         self.run.assert_not_called()
 
+    def test_window_picker_distinguishes_same_titles_without_handle_input(self) -> None:
+        panel = self.panel
+        self.assertTrue(self.belongs_to(panel.window_combo, panel._page_bodies["connection"]))
+        self.assertFalse(hasattr(panel, "window_handle_entry"))
+        target = WindowTarget(4660, 456, "同名游戏", "game.exe")
+        other = WindowTarget(4661, 457, "同名游戏", "game.exe")
+        with patch("mbv.panel.window_candidates", return_value=[other, target]):
+            panel._refresh_windows()
+        panel.window_combo.current(1)
+        panel.window_combo.event_generate("<<ComboboxSelected>>")
+        self.assertIn("同名窗口共 2 个", panel.window_details.get())
+        self.assertEqual(panel.window_choice.get(), "同名游戏（窗口 1）")
+        self.assertNotIn("HWND", panel.window_details.get())
+        self.assertNotIn("PID", panel.window_details.get())
+        with patch("mbv.panel.identify_window") as identify:
+            panel.window_identify_button.invoke()
+        identify.assert_called_once_with(target)
+        with patch.object(panel, "_connect_target") as connect:
+            panel.window_connect_button.invoke()
+        connect.assert_called_once_with(target)
+        with patch("mbv.panel.window_candidates", return_value=[target, other]):
+            panel._refresh_windows()
+        self.assertEqual(panel._window_lookup[panel.window_choice.get()], target)
+        with patch("mbv.panel.window_candidates", return_value=[other]):
+            panel._refresh_windows()
+        self.assertEqual(panel.window_choice.get(), "")
+        panel._persist_settings(apply_runtime=False, notify=False, show_error=False)
+        saved = load_config(self.config_path)["window"]
+        self.assertNotIn("hwnd", saved)
+        self.assertNotIn("handle", saved)
+        self.assertEqual(self.root.state(), "withdrawn")
+        self.run.assert_not_called()
+
     def test_optional_skill_clear_button_saves_reloads_and_survives_exit_save(self) -> None:
         panel = self.panel
         for strategy_key in ("stationary_attack", "bowman_dynamic", "dragon_roar"):
@@ -364,7 +397,7 @@ class PanelLayoutTests(unittest.TestCase):
         fields = {
             "strategy.options.dragon_roar.skill_key": "X",
             "strategy.options.dragon_roar.monster_count_threshold": "4",
-            "strategy.options.dragon_roar.cast_interval_seconds": "1.7",
+            "strategy.options.dragon_roar.cast_interval_seconds": "1700",
         }
         for path, value in fields.items():
             entry = panel._strategy_entries[path]
@@ -377,8 +410,8 @@ class PanelLayoutTests(unittest.TestCase):
                 self.assertGreater(entry.winfo_height(), 20)
         buttons = [widget for widget in self.descendants(panel.strategy_settings_body)
                    if isinstance(widget, tk.Button)]
-        for title in ("采集龙咆哮定点", "新增龙咆哮攻击范围"):
-            self.assertTrue(any(str(button.cget("text")).startswith(title) for button in buttons))
+        self.assertFalse(any("采集龙咆哮定点" in str(button.cget("text")) for button in buttons))
+        self.assertFalse(any("龙咆哮攻击范围" in str(button.cget("text")) for button in buttons))
         for path in ("return_tolerance_x", "monster_count_threshold"):
             entry = panel._strategy_entries["strategy.options.dragon_roar." + path]
             label = next(widget for widget in entry.master.winfo_children() if isinstance(widget, tk.Label))
@@ -386,9 +419,12 @@ class PanelLayoutTests(unittest.TestCase):
             self.assertTrue(label.bind("<Configure>"))
             self.assertLessEqual(int(label.cget("wraplength")), label.winfo_reqwidth())
         with patch("mbv.panel.BowmanBot") as create, patch.object(original_bot, "apply_config") as apply:
+            self.assertFalse(panel.capture_keep_debug.get())
+            panel.capture_keep_debug.set(True)
             panel.notebook.select(panel._page_canvases["connection"].master)
             self.assertTrue(panel._persist_settings(apply_runtime=False, notify=False, show_error=True))
             saved = load_config(self.config_path)
+            self.assertTrue(saved["capture_keep_debug"])
             self.assertEqual(saved["strategy"]["active"], "dragon_roar")
             self.assertEqual(saved["strategy"]["options"]["dragon_roar"]["skill_key"], "x")
             self.assertEqual(saved["strategy"]["options"]["dragon_roar"]["monster_count_threshold"], 4)
@@ -396,6 +432,59 @@ class PanelLayoutTests(unittest.TestCase):
             self.assertIs(panel.bot, original_bot)
             create.assert_not_called()
             apply.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_cast_interval_milliseconds_load_save_reload_and_strategy_switch(self) -> None:
+        panel = self.panel
+        config = load_config(self.config_path)
+        config["strategy"]["active"] = "dragon_roar"
+        config["strategy"]["options"]["dragon_roar"]["cast_interval_seconds"] = 1.7
+        save_config(self.config_path, config)
+        panel._load_entries(config)
+        key = "strategy.options.dragon_roar.cast_interval_seconds"
+        entry = panel._strategy_entries[key]
+        self.assertEqual(entry.get(), "1700")
+        label = next(widget for widget in entry.master.winfo_children() if isinstance(widget, tk.Label))
+        self.assertEqual(label.cget("text"), "施放间隔（毫秒）")
+        for value in ("100", "1250", "10000"):
+            entry.delete(0, "end")
+            entry.insert(0, value)
+            self.assertTrue(panel._persist_settings(apply_runtime=False, notify=False, show_error=True))
+            saved = load_config(self.config_path)
+            self.assertEqual(saved["strategy"]["options"]["dragon_roar"]["cast_interval_seconds"], float(value) / 1000)
+            panel._load_entries(saved)
+            entry = panel._strategy_entries[key]
+            self.assertEqual(entry.get(), value)
+        with patch.object(panel.bot, "apply_config"):
+            panel.strategy_name.set("龙咆哮·定点")
+            panel._strategy_changed()
+        self.assertEqual(panel._strategy_entries[key].get(), "10000")
+        self.assertEqual(panel._strategy_entries["strategy.options.dragon_roar.return_jump_interval_seconds"].get(), "0.45")
+        self.errors.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_cast_interval_milliseconds_adjust_and_direct_input_use_seconds_at_runtime(self) -> None:
+        panel = self.panel
+        config = load_config(self.config_path)
+        config["strategy"]["active"] = "dragon_roar"
+        save_config(self.config_path, config)
+        panel._load_entries(config)
+        panel.bot.strategy = panel._selected_strategy()
+        entry = panel._strategy_entries["strategy.options.dragon_roar.cast_interval_seconds"]
+        self.assertEqual(entry.get(), "1000")
+        buttons = [widget for widget in self.descendants(entry.master) if isinstance(widget, tk.Button)]
+        with patch.object(panel.bot, "preview_strategy_setting") as preview:
+            next(widget for widget in buttons if widget.cget("text") == "+").invoke()
+            self.assertEqual(entry.get(), "1100")
+            preview.assert_called_with("cast_interval_seconds", 1.1)
+            with patch("mbv.panel.simpledialog.askfloat", return_value=1250) as prompt:
+                next(widget for widget in buttons if widget.cget("text") == "输入").invoke()
+                self.assertEqual(prompt.call_args.kwargs["minvalue"], 100)
+                self.assertEqual(prompt.call_args.kwargs["maxvalue"], 10000)
+            self.assertEqual(entry.get(), "1250")
+            preview.assert_called_with("cast_interval_seconds", 1.25)
+        self.assertEqual(load_config(self.config_path)["strategy"]["options"]["dragon_roar"]["cast_interval_seconds"], 1.25)
+        self.errors.assert_not_called()
         self.run.assert_not_called()
 
     def test_run_controls_and_verification_toggle_stay_outside_scrolling_pages(self) -> None:

@@ -42,6 +42,8 @@ class StrategySettingField:
     maximum: float | None = 1.0
     capture_key: bool = False
     direct_numeric_input: bool = False
+    # 仅换算面板显示/输入；默认值、步长、边界与运行配置仍使用原单位。
+    display_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)

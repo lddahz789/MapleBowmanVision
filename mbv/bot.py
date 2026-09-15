@@ -485,7 +485,7 @@ class BowmanBot:
             self.notify("当前进程没有按键授权，请从唯一入口 Start.bat 启动。", 6.0)
             return
         if not self.config.get("calibrated"):
-            self.notify("校准未完成，请依次采集状态栏、小地图和战斗识别区域。")
+            self.notify("校准未完成，请采集小地图、玩家标记和战斗识别区域；血蓝条仅自动喝药需要。")
             return
         missing = missing_recognition_data(self.config, self.strategy)
         if missing:
@@ -496,7 +496,7 @@ class BowmanBot:
             missing_text = "、".join(labels.get(key, key) for key in missing)
             self.notify(f"策略“{self.strategy.display_name}”需要先完成：{missing_text}。", 6.0)
             return
-        if not self.player_templates:
+        if not self.player_templates and getattr(self.strategy, "localization_mode", "visual") != "minimap":
             self.notify("尚未采集玩家姓名板模板，请在控制面板点击「采集姓名板」。", 8.0)
             return
         if not self.integrity_ok:
@@ -1689,9 +1689,14 @@ class BowmanBot:
                 )
             )
         )
-        marker_trusted = marker is not None and bool(getattr(self, "live_marker_unambiguous", True))
+        independent_minimap = getattr(self.strategy, "localization_mode", "visual") == "minimap"
+        marker_trusted = marker is not None and bool(getattr(self, "live_marker_unambiguous", not independent_minimap))
+        if independent_minimap:
+            localized = False
+            player_box = chase_box = None
+            self.last_attack_anchor = None
         self._observe_attack_facing_localization(now, localized)
-        self._observe_navigation_localization(now, localized and marker_trusted)
+        self._observe_navigation_localization(now, (localized or independent_minimap) and marker_trusted)
         if not marker_trusted:
             self._reset_attack_facing()
         if getattr(self, "delivery", "foreground") == "hybrid":
@@ -1717,8 +1722,8 @@ class BowmanBot:
             and bool(getattr(self, "live_marker_unambiguous", False))
             and track is not None and track.has_nameplate_identity()
         )
-        minimap_only = not localized and minimap_primary
-        if minimap_only:
+        minimap_only = independent_minimap or (not localized and minimap_primary)
+        if minimap_only and not independent_minimap:
             # 地图坐标只能用于导航。旧屏幕锚点和选敌结果必须全部隔离。
             player_box = target_box = chase_box = None
             eligible_detections = ()
@@ -1794,7 +1799,9 @@ class BowmanBot:
         if decision.action not in {"attack", "cast", "stop", "pickup", "face", "jump_attack"}:
             self._reset_attack_facing()
         self._strategy_localization_gap = 0.0
-        if minimap_only and decision.action not in {"stop", "move", "jump", "down_jump"}:
+        if minimap_only and decision.action not in {"stop", "move", "jump", "down_jump"} and not (
+            independent_minimap and decision.action == "cast"
+        ):
             # 公共门禁：策略扩展也不能在只有地图位置时发攻击、拾取或新短步。
             self._interrupt_step()
             self.stop_move()
@@ -2798,6 +2805,7 @@ class BowmanBot:
                     # 暂停时的全局喝药只需要血蓝条；保留截图循环，但跳过昂贵的战斗模板匹配。
                     lightweight_potion_only = bool(
                         not self.armed and self.auto_potion.enabled
+                        and getattr(self.strategy, "localization_mode", "visual") != "minimap"
                     )
                     # 四路模板检测共用同一份场景特征，避免每帧重复缩放、颜色转换和 Canny。
                     scene = SceneFeatures(combat_img)
@@ -2812,6 +2820,7 @@ class BowmanBot:
                             float(vision["monster_template_threshold"]),
                             float(vision.get("monster_detection_scale", 1.0)),
                             structure_weight=float(vision.get("monster_structure_weight", 0.15)),
+                            mirror_horizontal=True,
                         )
                     raw_monster_count = len(detected_monsters)
                     hold_seconds = float(vision.get("monster_hold_seconds", 0.0))
@@ -2882,7 +2891,7 @@ class BowmanBot:
                     self._localization_frame_diagnostic = None
                     active_player_anchor = (
                         None
-                        if lightweight_potion_only
+                        if lightweight_potion_only or getattr(self.strategy, "localization_mode", "visual") == "minimap"
                         else self._track_player(
                             scene,
                             vision,
@@ -3001,11 +3010,12 @@ class BowmanBot:
                     )
                     stages_ns["action"] = time.perf_counter_ns() - action_started_ns
                     diagnostic_started_ns = time.perf_counter_ns()
-                    self._observe_localization_diagnostics(
-                        scene, minimap_img, now, combat_rect=combat_rect, minimap_rect=minimap_rect,
-                        capture_foreground=capture_foreground,
-                        marker_candidates=marker_observation.candidate_count,
-                    )
+                    if getattr(self.strategy, "localization_mode", "visual") != "minimap":
+                        self._observe_localization_diagnostics(
+                            scene, minimap_img, now, combat_rect=combat_rect, minimap_rect=minimap_rect,
+                            capture_foreground=capture_foreground,
+                            marker_candidates=marker_observation.candidate_count,
+                        )
                     stages_ns["localization_diagnostics"] = time.perf_counter_ns() - diagnostic_started_ns
                     hud_started_ns = time.perf_counter_ns()
                     current_window = client_window(window.hwnd, window.title)
@@ -3154,7 +3164,7 @@ class BowmanBot:
                             f"自动喝药｜{potion_state}｜暂停时仅游戏前台发药键"
                             "｜F8 启动挂机｜F9 / Ctrl+Shift+Q 退出"
                         )
-                    elif not self.player_templates:
+                    elif not self.player_templates and getattr(self.strategy, "localization_mode", "visual") != "minimap":
                         banner = "缺少玩家姓名板模板｜请在控制面板采集姓名板"
                     elif self.input_authorized:
                         if not self.integrity_ok:
@@ -3199,6 +3209,12 @@ class BowmanBot:
                             "close_overlap_threshold": close_overlap_threshold,
                             "close_overlap_span": close_overlap_span,
                             "monster_boxes": monster_boxes,
+                            "monster_count": len(detected_monsters),
+                            "eligible_monster_count": (
+                                len({d.box for d in target_selection.eligible_detections}
+                                    & {d.box for d in detected_monsters})
+                                if target_selection.eligible_detections is not None else None
+                            ),
                             "eligible_monster_boxes": eligible_monster_boxes,
                             "monster_box": monster_box,
                             "chase_box": chase_screen_box,

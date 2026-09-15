@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -12,6 +14,37 @@ import tkinter as tk
 from typing import Any, Callable
 
 from PIL import Image, ImageTk
+
+
+_capture_debug = ContextVar("capture_debug", default=None)
+
+
+@contextmanager
+def capture_debug_preview(state):
+    token = _capture_debug.set(deepcopy(state) if isinstance(state, dict) else None)
+    try:
+        yield
+    finally:
+        _capture_debug.reset(token)
+
+
+def paint_capture_debug(canvas, width, height, transform=None):
+    state = _capture_debug.get()
+    if not state:
+        return
+    before = set(canvas.find_all())
+    RuntimeOverlay._paint_canvas(None, canvas, state, width, height, clear=False)
+    if transform:
+        source, destination = transform
+        x, y, w, h = source
+        dx, dy, dw, dh = destination
+        for item in set(canvas.find_all()) - before:
+            bounds = canvas.bbox(item)
+            if not bounds or bounds[0] < x or bounds[1] < y or bounds[2] > x + w or bounds[3] > y + h:
+                canvas.delete(item)
+                continue
+            canvas.scale(item, x, y, dw / w, dh / h)
+            canvas.move(item, dx - x, dy - y)
 
 
 user32 = ctypes.windll.user32
@@ -319,8 +352,9 @@ class RuntimeOverlay:
         self._paint_canvas(canvas, snapshot, width, height)
         self._last_drawn_state = snapshot
 
-    def _paint_canvas(self, canvas: tk.Canvas, state: dict[str, Any], width: int, height: int) -> None:
-        canvas.delete("all")
+    def _paint_canvas(self, canvas: tk.Canvas, state: dict[str, Any], width: int, height: int, *, clear: bool = True) -> None:
+        if clear:
+            canvas.delete("all")
         font = ("Microsoft YaHei UI", max(12, int(height * 0.016)), "bold")
         small = ("Microsoft YaHei UI", max(11, int(height * 0.014)))
         armed = bool(state.get("armed"))
@@ -418,6 +452,16 @@ class RuntimeOverlay:
                 )
 
         if debug_item_enabled(state, "monster"):
+            count = state.get("monster_count")
+            if count is not None:
+                count_label = f"怪物：{count}"
+                eligible_count = state.get("eligible_monster_count")
+                if eligible_count is not None:
+                    count_label += f"  ·  范围内：{eligible_count}"
+                roi = state.get("combat_roi")
+                cx, cy, cw, ch = _rect(roi, width, height) if roi else (0, 42, width, height - 42)
+                canvas.create_text(cx + 6, min(height - 6, cy + ch - 6), anchor="sw",
+                                   text=count_label, fill="#e1b3ff", font=small)
             eligible_candidates = state.get("eligible_monster_boxes")
             candidate_color = "#727b84" if eligible_candidates is not None else "#b94cff"
             for candidate in state.get("monster_boxes", []):
@@ -559,6 +603,7 @@ def interactive_overlay(
     parent: tk.Misc | None = None,
     vk_map: dict[str, int] | None = None,
     frozen_frame: Any | None = None,
+    debug_transform: Any | None = None,
 ) -> InteractiveResult:
     """直接覆盖游戏进行框选；传入 frozen_frame 时显示该静态游戏帧。"""
     # Windows 会把透明色键像素当成鼠标穿透区。因此交互框选使用两个窗口：
@@ -637,6 +682,7 @@ def interactive_overlay(
         canvas.delete("all")
         if frozen_photo is not None:
             canvas.create_image(0, 0, anchor="nw", image=frozen_photo)
+        paint_capture_debug(canvas, window.width, window.height, debug_transform)
         canvas.create_rectangle(0, 0, window.width, 42, fill="#151515", outline="")
         if mode == "key":
             suffix = "请按下要绑定的键，Esc 取消"

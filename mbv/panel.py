@@ -32,7 +32,9 @@ from mbv.calibrate import (
 )
 from mbv.config import load_config, save_config, template_counts
 from mbv.input import input_delivery, vk_for
-from mbv.overlay import RuntimeOverlay, _exclude_from_capture, _top_level_hwnd, prevent_window_activate
+from mbv.local_monster_dialog import LocalMonsterDialog
+from mbv.paths import profile_key_from_config
+from mbv.overlay import RuntimeOverlay, _exclude_from_capture, _top_level_hwnd, prevent_window_activate, capture_debug_preview
 from mbv.performance import format_performance_summary
 from mbv.panel_theme import (
     ACCENT, ACCENT_HOVER, ACCENT_SOFT, ARMED, BG, BORDER, BUTTON_ACTIVE, BUTTON_BG,
@@ -54,6 +56,8 @@ from mbv.template_store import (
 )
 from mbv.window import (
     WindowTarget,
+    identify_window,
+    window_choice_labels,
     resolve_window_target,
     selected_window,
     validate_window_target,
@@ -171,6 +175,7 @@ class ControlPanel:
         self.monster_category_summary = tk.StringVar(value="")
         self._monster_category_lookup: dict[str, str] = {UNCATEGORIZED_LABEL: ""}
         self.debug_boxes = tk.BooleanVar(value=self.bot.calibration_overlay_visible)
+        self.capture_keep_debug = tk.BooleanVar(value=bool(config.get("capture_keep_debug", False)))
         self.auto_potion_enabled = tk.BooleanVar(value=False)
         self.standalone_potion = self.auto_potion_enabled
         self.verification_alert_enabled = tk.BooleanVar(value=bool(config["verification_alert"]["enabled"]))
@@ -242,13 +247,22 @@ class ControlPanel:
         heading = tk.Frame(frame, bg=PANEL)
         heading.pack(fill="x", padx=6, pady=(3, 5))
         tk.Label(heading, text="作用窗口", bg=PANEL, fg=FG, font=FONT_SECTION).pack(side="left")
+        tk.Label(frame, text="选择窗口名字；同名窗口加编号，点击“定位窗口”闪烁对应窗口。",
+                 bg=PANEL, fg=MUTED, font=FONT_SMALL, anchor="w", wraplength=360,
+                 justify="left").pack(fill="x", padx=12, pady=(0, 6))
         row = tk.Frame(frame, bg=PANEL)
         row.pack(fill="x", padx=12)
         self.window_combo = ttk.Combobox(row, textvariable=self.window_choice, state="readonly", font=FONT)
         self.window_combo.pack(side="left", fill="x", expand=True)
         disable_combobox_mousewheel(self.window_combo)
+        self.window_combo.bind("<<ComboboxSelected>>", self._show_window_details)
         self.window_refresh_button = self._compact_button(row, "刷新", self._refresh_windows)
         self.window_refresh_button.pack(side="left", padx=(6, 0))
+        self.window_details = tk.StringVar(value="请选择一个窗口。")
+        details = tk.Label(frame, textvariable=self.window_details, bg=PANEL, fg=MUTED,
+                           font=FONT_SMALL, anchor="w", justify="left")
+        details.pack(fill="x", padx=12, pady=(6, 0))
+        details.bind("<Configure>", lambda event: details.configure(wraplength=max(200, event.width)))
         actions = tk.Frame(frame, bg=PANEL)
         actions.pack(fill="x", padx=12, pady=(6, 0))
         self.window_connect_button = self._compact_button(actions, "连接", self._connect_window, accent=True)
@@ -256,6 +270,8 @@ class ControlPanel:
         self.window_disconnect_button = self._compact_button(actions, "断开", self._disconnect_window)
         self.window_disconnect_button.configure(state="disabled")
         self.window_disconnect_button.pack(side="left", padx=(6, 0))
+        self.window_identify_button = self._compact_button(actions, "定位窗口", self._identify_window)
+        self.window_identify_button.pack(side="left", padx=(6, 0))
         tk.Label(actions, text="连接后仍需手动启动挂机", bg=PANEL, fg=MUTED,
                  font=FONT_SMALL).pack(side="left", padx=10)
         hint = tk.Label(frame, textvariable=self.window_hint, bg=PANEL, fg=MUTED, font=FONT_SMALL,
@@ -270,28 +286,50 @@ class ControlPanel:
         except Exception as exc:
             self.window_hint.set(f"读取窗口失败：{exc}。可以稍后点击刷新。")
             return
-        self._window_lookup = {
-            f"{index}. {target.title} · {Path(target.process_path).name or '未知程序'}": target
-            for index, target in enumerate(candidates, 1)
-        }
+        self._window_lookup = window_choice_labels(candidates)
         self.window_combo.configure(values=list(self._window_lookup))
         preferred = previous or self._selected_target
         label = next((label for label, target in self._window_lookup.items()
                       if preferred is not None and target.hwnd == preferred.hwnd
                       and target.pid == preferred.pid), "")
-        if not label:
+        if not label and preferred is None:
             label = next((label for label, target in self._window_lookup.items()
                           if target.score >= 100), "")
         self.window_choice.set(label)
+        self._show_window_details()
         if not self._selected_target and not self._stopping_session:
             self.window_hint.set(self._connection_message if candidates else
                                  "尚未找到可选窗口。先打开目标程序，再点击刷新；可以先修改配置。")
         self._refresh_window_controls()
 
+    def _show_window_details(self, _event: Any = None) -> None:
+        target = self._window_lookup.get(self.window_choice.get())
+        if target is None:
+            self.window_details.set("请选择一个窗口；原窗口关闭后需重新选择，不自动替换同名窗口。")
+            return
+        same_title = sum(item.title == target.title for item in self._window_lookup.values())
+        self.window_details.set(f"同名窗口共 {same_title} 个，先定位确认，再连接。" if same_title > 1
+                                else "点击定位窗口，可闪烁对应标题栏和任务栏。")
+
+    def _identify_window(self) -> None:
+        if self.busy or self._closing or self._stopping_session:
+            return
+        target = self._window_lookup.get(self.window_choice.get())
+        if target is None:
+            self.window_hint.set("请先选择要定位的窗口。")
+            return
+        try:
+            identify_window(target)
+        except (OSError, RuntimeError) as exc:
+            self.window_hint.set(f"无法定位窗口：{exc}")
+            return
+        self.window_hint.set(f"正在闪烁：{self.window_choice.get()}；不会切换连接或启动挂机。")
+
     def _refresh_window_controls(self) -> None:
         waiting = self._stopping_session or self._closing
         self.window_combo.configure(state="disabled" if waiting else "readonly")
         self.window_refresh_button.configure(state="disabled" if waiting else "normal")
+        self.window_identify_button.configure(state="disabled" if waiting or not self._window_lookup else "normal")
         self.window_connect_button.configure(
             state="disabled" if waiting or not self._window_lookup else "normal",
             text="切换" if self._selected_target else "连接",
@@ -306,6 +344,11 @@ class ControlPanel:
         target = self._window_lookup.get(self.window_choice.get())
         if target is None:
             self.window_hint.set("请先在下拉框中选择实际作用窗口。")
+            return
+        self._connect_target(target)
+
+    def _connect_target(self, target: WindowTarget) -> None:
+        if self.busy or self._closing or self._stopping_session:
             return
         try:
             resolve_window_target(target)
@@ -349,7 +392,9 @@ class ControlPanel:
             self.worker_errors.clear()
             self._selected_target = target
             self._pending_target = None
-            self._connection_message = f"已连接：{target.title}；保持原校准，启动挂机仍需点击按钮或按 F8。"
+            name = next((label for label, item in self._window_lookup.items()
+                         if (item.hwnd, item.pid) == (target.hwnd, target.pid)), target.title or '无标题窗口')
+            self._connection_message = f"已连接：{name}；保持原校准，启动挂机仍需点击按钮或按 F8。"
             self.window_hint.set(self._connection_message)
             self.worker = threading.Thread(target=self._run_bot, name="MapleVisionWorker", daemon=False)
             self.worker.start()
@@ -479,7 +524,7 @@ class ControlPanel:
         connection = self._page_bodies["connection"]
         self._page_intro(connection, "连接游戏窗口", "原配置作为默认值；刷新列表后选择实际作用窗口。")
         self._build_window_selector(connection)
-        self._page_intro(self._content, "从区域校准开始", "先采集基础区域，再添加怪物与人物模板。")
+        self._page_intro(self._content, "从区域校准开始", "先采集小地图、玩家标记与战斗区；血蓝条仅自动喝药需要。")
         counts_label = tk.Label(self._content, textvariable=self.counts, bg=BG, fg=MUTED,
                                 font=FONT_SMALL, anchor="w", justify="left")
         counts_label.pack(fill="x", padx=14, pady=(0, 5))
@@ -487,15 +532,18 @@ class ControlPanel:
 
         self._section("基础区域")
         capture = self._last_body
+        tk.Checkbutton(capture, text="截图时保留 Debug 框（仅预览，不写入素材）",
+                       variable=self.capture_keep_debug, command=self._schedule_settings_save,
+                       bg=PANEL, fg=FG, font=FONT_SMALL).pack(anchor="w", padx=8, pady=4)
         self._capture_item_row(
             capture,
-            "血条区域",
+            "血条区域（喝药可选）",
             "hp_bar",
             lambda: self._capture_status_item("hp_bar", "血条区域"),
         )
         self._capture_item_row(
             capture,
-            "蓝条区域",
+            "蓝条区域（喝药可选）",
             "mp_bar",
             lambda: self._capture_status_item("mp_bar", "蓝条区域"),
         )
@@ -596,6 +644,8 @@ class ControlPanel:
             "管理怪物模板",
             lambda: self._manage_templates("monster"),
         ).pack(side="left", fill="x", expand=True, padx=(2, 0))
+        self._compact_button(capture, "本地资源库：搜索怪物并添加", self._import_local_monsters).pack(
+            fill="x", padx=8, pady=2)
         monster_debug_button = self._compact_button(
             capture,
             "怪物框：开",
@@ -1570,6 +1620,8 @@ class ControlPanel:
         self._loading_settings = True
         try:
             strategy = active_strategy(config)
+            if hasattr(self, "capture_keep_debug"):
+                self.capture_keep_debug.set(bool(config.get("capture_keep_debug", False)))
             self.profession_name.set(strategy.profession)
             self.strategy_name.set(strategy.display_name)
             self._refresh_strategy_choices()
@@ -1578,10 +1630,7 @@ class ControlPanel:
                 value = self._nested(config, key)
                 entry.delete(0, "end")
                 entry.insert(0, str(value))
-            for key, entry in self._strategy_entries.items():
-                value = self._nested(config, key)
-                entry.delete(0, "end")
-                entry.insert(0, str(value))
+            self._load_strategy_entry_values(config, strategy)
             for key, variable in self._strategy_toggles.items():
                 variable.set(bool(self._nested(config, key)))
             for key, entry in self._targeting_entries.items():
@@ -1614,6 +1663,15 @@ class ControlPanel:
         if key is None:
             raise RuntimeError("请选择职业策略")
         return get_strategy(key)
+
+    def _load_strategy_entry_values(self, config: dict[str, Any], strategy: Any) -> None:
+        fields = {f"strategy.options.{strategy.key}.{field.path}": field for field in strategy.setting_fields}
+        for key, entry in self._strategy_entries.items():
+            value = self._nested(config, key)
+            multiplier = fields[key].display_multiplier
+            text = format(float(value) * multiplier, ".12g") if multiplier != 1.0 else str(value)
+            entry.delete(0, "end")
+            entry.insert(0, text)
 
     def _render_strategy_settings(self, config: dict[str, Any]) -> None:
         for item in list_strategies():
@@ -1649,9 +1707,9 @@ class ControlPanel:
                 prefix + field.path,
                 field.label,
                 entries=self._strategy_entries,
-                adjust_step=field.step,
-                minimum=field.minimum,
-                maximum=field.maximum,
+                adjust_step=field.step * field.display_multiplier if field.step is not None else None,
+                minimum=field.minimum * field.display_multiplier if field.minimum is not None else None,
+                maximum=field.maximum * field.display_multiplier if field.maximum is not None else None,
                 capture=field.capture_key,
                 on_clear=(lambda dotted=prefix + field.path: self._clear_strategy_key(dotted))
                 if field.capture_key and strategy.default_settings.get(field.path) == "" else None,
@@ -1901,9 +1959,7 @@ class ControlPanel:
             save_config(self.config_path, config)
             self.bot.apply_config(config)
             self._render_strategy_settings(config)
-            for key, entry in self._strategy_entries.items():
-                entry.delete(0, "end")
-                entry.insert(0, str(self._nested(config, key)))
+            self._load_strategy_entry_values(config, strategy)
             for key, variable in self._strategy_toggles.items():
                 variable.set(bool(self._nested(config, key)))
         except Exception as exc:
@@ -1911,7 +1967,8 @@ class ControlPanel:
 
     def _preview_strategy_setting(self, path: str, text: str) -> None:
         strategy = self._selected_strategy()
-        value = float(text)
+        field = next(field for field in strategy.setting_fields if field.path == path)
+        value = float(text) / field.display_multiplier
         config = load_config(self.config_path)
         self._nested(config, f"strategy.options.{strategy.key}.{path}", value)
         # 微调按钮是无焦点控件；每次点击直接持久化，避免用户重启后丢失。
@@ -2028,7 +2085,8 @@ class ControlPanel:
         config = load_config(self.config_path)
         counts = template_counts(config)
         calibration = config.get("calibration", {})
-        status_ready = "状态区✓" if calibration.get("status_regions_complete") else "状态区待采"
+        map_ready = all(self._item_complete(config, key) for key in ("minimap", "player_marker"))
+        status_ready = "小地图✓" if map_ready else "小地图待采"
         recognition_ready = "识别区✓" if calibration.get("recognition_region_complete") else "识别区待采"
         center_ready = "平台安全点✓" if config["recognition"].get("platform_center_captured") else "平台安全点待采"
         self.counts.set(
@@ -2181,6 +2239,28 @@ class ControlPanel:
             )
 
         self._run_tool("分类删除", action, requires_window=False)
+
+    def _import_local_monsters(self) -> None:
+        if self.busy or self._closing or self._stopping_session:
+            return
+        config = load_config(self.config_path)
+        if profile_key_from_config(config) != "newmaple":
+            messagebox.showinfo("本地资源库", "此资源库来自 NewMaple，请使用 NewMaple 档案导入，避免混用经典服素材。", parent=self.root)
+            return
+        category = self._selected_monster_category()
+
+        def save_settings(settings: dict) -> None:
+            fresh = load_config(self.config_path)
+            fresh["local_monster_library"] = settings
+            save_config(self.config_path, fresh)
+
+        def action() -> None:
+            dialog = LocalMonsterDialog(self.root, self.bot.template_roots, category,
+                                        config.get("local_monster_library", {}),
+                                        disable_combobox_mousewheel, save_settings)
+            self.root.wait_window(dialog.dialog)
+
+        self._run_tool("本地怪物素材导入", action, requires_window=False)
 
     def _manage_templates(self, family: str = "monster") -> None:
         if self.busy:
@@ -2626,7 +2706,9 @@ class ControlPanel:
             self.bot.suspend_vision()
             # 校准函数各自重新 load_config；作用窗口仅在本次调用链中精确传递。
             scope = selected_window(self._selected_target) if requires_window else nullcontext()
-            with scope:
+            keep_debug = getattr(self, "capture_keep_debug", None)
+            debug_state = getattr(self.overlay, "_last_state", None) if keep_debug is not None and keep_debug.get() else None
+            with scope, capture_debug_preview(debug_state):
                 action()
             self.bot.reload_from_disk(self.config_path)
             self._refresh_counts()
@@ -2897,10 +2979,16 @@ class ControlPanel:
                     if key.startswith("keys.") or (is_buff_key and value):
                         vk_for(value)
                 self._nested(config, key, value)
+            if hasattr(self, "capture_keep_debug"):
+                config["capture_keep_debug"] = bool(self.capture_keep_debug.get())
             for slot, variable in getattr(self, "buff_enabled", {}).items():
                 self._nested(config, f"buffs.{slot}.enabled", bool(variable.get()))
             strategy = self._selected_strategy()
             config["strategy"]["active"] = strategy.key
+            strategy_fields = {
+                f"strategy.options.{strategy.key}.{field.path}": field
+                for field in strategy.setting_fields
+            }
             strategy_key_paths = {
                 f"strategy.options.{strategy.key}.{field.path}"
                 for field in strategy.setting_fields
@@ -2910,7 +2998,7 @@ class ControlPanel:
                 raw = entry.get().strip()
                 current = self._nested(config, key)
                 if isinstance(current, (int, float)) and not isinstance(current, bool):
-                    value = float(raw)
+                    value = float(raw) / strategy_fields[key].display_multiplier
                 else:
                     value = raw.lower() if key in strategy_key_paths else raw
                     if key in strategy_key_paths and value:

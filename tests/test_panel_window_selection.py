@@ -49,8 +49,10 @@ class PanelWindowSelectionTests(unittest.TestCase):
         panel.window_choice = MagicMock()
         panel.window_choice.get.return_value = "1. 同名游戏"
         panel.window_combo = MagicMock()
+        panel.window_details = MagicMock()
         panel.window_hint = MagicMock()
         panel.window_refresh_button = MagicMock()
+        panel.window_identify_button = MagicMock()
         panel.window_connect_button = MagicMock()
         panel.window_disconnect_button = MagicMock()
         panel.status = MagicMock()
@@ -112,6 +114,44 @@ class PanelWindowSelectionTests(unittest.TestCase):
         self.assertIn("同名游戏", panel.window_choice.set.call_args.args[0])
         self.assertIsNone(panel.worker)
         panel.bot.run.assert_not_called()
+
+    def test_empty_list_does_not_connect(self) -> None:
+        panel = self.panel()
+        panel._window_lookup = {}
+        panel._start_session = MagicMock()
+        panel._connect_window()
+        panel._start_session.assert_not_called()
+        panel._refresh_window_controls()
+        self.assertEqual(panel.window_connect_button.configure.call_args.kwargs["state"], "disabled")
+
+    def test_invalid_selection_never_falls_back_or_stops_current_session(self) -> None:
+        panel = self.panel(connected=True)
+        panel._stop_session = MagicMock()
+        panel._start_session = MagicMock()
+        with patch("mbv.panel.resolve_window_target", side_effect=RuntimeError("错误句柄")):
+            panel._connect_window()
+        panel._stop_session.assert_not_called()
+        panel._start_session.assert_not_called()
+        panel._persist_settings.assert_not_called()
+        self.assertIn("错误句柄", panel.window_hint.set.call_args.args[0])
+
+    def test_same_title_selection_switch_reuses_safe_session_stop(self) -> None:
+        panel = self.panel(connected=True)
+        other = WindowTarget(303, 404, "同名游戏", "game.exe")
+        panel._stop_session = MagicMock()
+        panel._window_lookup[panel.window_choice.get()] = other
+        with patch("mbv.panel.resolve_window_target"):
+            panel._connect_window()
+        panel._stop_session.assert_called_once_with(other)
+
+    def test_selection_connect_is_blocked_while_stopping(self) -> None:
+        panel = self.panel(connected=True)
+        panel._stopping_session = True
+        with patch("mbv.panel.resolve_window_target") as resolve:
+            panel._connect_window()
+            resolve.assert_not_called()
+        panel._refresh_window_controls()
+        panel.window_combo.configure.assert_called_with(state="disabled")
 
     def test_same_window_with_changed_preference_score_does_not_restart(self) -> None:
         panel = self.panel(connected=True)

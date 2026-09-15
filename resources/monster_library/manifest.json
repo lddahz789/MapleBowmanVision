@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "scope": "Mob stand/move/fly frames only",
+  "monsters": 1652,
+  "frames": 18172,
+  "unique_images": 8262,
+  "image_bytes": 107591024,
+  "datasets": {
+    "BetaData": 1,
+    "Data": 1651
+  },
+  "skipped": [
+    {
+      "source": "Data/Mob/8210014.img",
+      "reason": "ValueError"
+    },
+    {
+      "source": "Data/Mob/8820008.img",
+      "reason": "ValueError"
+    },
+    {
+      "source": "Data/Mob/9420541.img",
+      "reason": "ValueError"
+    },
+    {
+      "source": "Data/Mob/9420546.img",
+      "reason": "ValueError"
+    },
+    {
+      "source": "Data/Mob/9500336.img",
+      "reason": "ValueError"
+    },
+    {
+      "source": "Data/Mob/9500364.img",
+      "reason": "ValueError"
+    },
+    {
+      "source": "Data/Mob/9999998.img",
+      "reason": "ValueError"
+    }
+  ]
+}

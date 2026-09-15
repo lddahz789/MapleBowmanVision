@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -155,6 +156,21 @@ class Template:
         default=None, init=False, repr=False, compare=False
     )
     _gray_cache: dict[float, np.ndarray] = field(default_factory=dict, repr=False, compare=False)
+    _mirrored_template: Template | None = field(default=None, init=False, repr=False, compare=False)
+
+    def mirrored(self) -> Template:
+        """水平镜像仅在内存生成一次；沿用素材名，保持分类、过滤和去重语义。"""
+        if self._mirrored_template is None:
+            mask = self.foreground_mask
+            if mask is None:
+                mask = template_foreground_mask(self.image)
+            anchor = self.anchor_offset
+            if anchor is not None:
+                anchor = (self.image.shape[1] - 1 - anchor[0], anchor[1])
+            self._mirrored_template = Template(
+                self.name, cv2.flip(self.image, 1), cv2.flip(mask, 1), anchor,
+            )
+        return self._mirrored_template
 
     def scaled_gray(self, scale: float) -> np.ndarray:
         if scale not in self._gray_cache:
@@ -503,6 +519,10 @@ def load_templates(directory: Path = ASSET_DIR, *, recursive: bool = False) -> l
             continue
         if decoded is None:
             continue
+        # 本地库导入文件始终保存原尺寸；仅加载时放大，重载不会累乘。
+        # 完整匹配导入命名协议，避免影响普通截图素材。
+        if re.fullmatch(r"local-.+-[0-9]+-[0-9a-f]{64}\.png", path.name):
+            decoded = cv2.resize(decoded, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_NEAREST)
         alpha = decoded[:, :, 3] if decoded.ndim == 3 and decoded.shape[2] == 4 else None
         image = decoded[:, :, :3] if decoded.ndim == 3 and decoded.shape[2] == 4 else decoded
         if image is not None and image.shape[0] >= 4 and image.shape[1] >= 4:
@@ -714,11 +734,13 @@ def find_detections(
     search_roi: tuple[int, int, int, int] | None = None,
     nms_across_templates: bool = True,
     achromatic_fallback: bool = False,
+    mirror_horizontal: bool = False,
 ) -> tuple[list[Detection], float, str | None]:
     """返回画面中的全部模板目标，并通过 NMS 合并同一目标的重复框。
 
     scene 可传 SceneFeatures，让同一帧的多组检测（怪物、姓名板、头部、称号）复用场景特征。
     search_roi 使用原场景像素坐标；局部匹配结果仍返回原场景坐标。
+    mirror_horizontal 仅怪物识别显式开启；双向候选合并后统一 NMS。
     """
     if not templates:
         return [], -1.0, None
@@ -741,10 +763,15 @@ def find_detections(
             "kind": features.match_diagnostic_kind, "scale": scale,
             "threshold": threshold, "roi": clipped_roi,
             "structure_weight": structure_weight, "template_count": len(templates),
+            "mirror_horizontal": mirror_horizontal,
             "best_matches": [], "skipped_size": 0,
         }
         features.match_diagnostics.append(diagnostic)
-    for template in templates:
+    matching_templates = (
+        [variant for template in templates for variant in (template, template.mirrored())]
+        if mirror_horizontal else templates
+    )
+    for template in matching_templates:
         image, mask, template_opponent = template.scaled_features(scale)
         th, tw = image.shape[:2]
         if th > source.shape[0] or tw > source.shape[1] or th < 4 or tw < 4:

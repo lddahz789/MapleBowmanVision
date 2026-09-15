@@ -1,6 +1,10 @@
 {
   "version": 1,
   "profile": "newmaple",
+  "local_monster_library": {
+    "root": "resources/monster_library",
+    "dataset": "Data"
+  },
   "calibrated": false,
   "diagnostics": {"player_localization": true},
   "verification_alert": {

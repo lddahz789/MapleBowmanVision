@@ -26,9 +26,9 @@ class DragonRoarStrategyTests(unittest.TestCase):
         self.monsters = (monster(140, 40), monster(200, 100), monster(260, 160))
         self.settings = {**deepcopy(self.strategy.default_settings),
                          "skill_key": "r", "attack_regions": [region()]}
-        self.recognition = {"dragon_roar_point": {"x": 0.5, "y": 0.5},
-                            "dragon_roar_point_space": "minimap",
-                            "dragon_roar_point_captured": True}
+        self.recognition = {"platform_center": {"x": 0.5, "y": 0.5},
+                            "platform_center_space": "minimap",
+                            "platform_center_captured": True}
         self.context = StrategyActionContext(
             marker=(0.5, 0.5), player_box=(190, 100, 20, 1), player_anchor=(200.0, 100.0),
             target_box=self.monsters[1].box, chase_box=None, combat_width=400, combat_height=200,
@@ -58,12 +58,19 @@ class DragonRoarStrategyTests(unittest.TestCase):
         self.assertFalse(registered.allow_player_lost_recovery)
         fields = {field.recognition_key: field for field in registered.capture_fields}
         self.assertTrue(all(field.required for field in fields.values()))
-        self.assertEqual(fields["dragon_roar_point"].coordinate_space, "minimap")
-        self.assertEqual(fields["dragon_roar_point"].capture_kind, "point")
-        self.assertTrue(fields["dragon_roar_attack_regions"].multiple)
-        self.assertEqual(fields["dragon_roar_attack_regions"].settings_path, "attack_regions")
+        self.assertEqual(fields, {})
+        self.assertEqual(registered.required_recognition_data, ("platform_center",))
+        self.assertNotIn("dragon_roar_attack_regions", fields)
+        self.assertEqual(registered.localization_mode, "minimap")
         self.assertEqual(registered.default_settings["skill_key"], "")
         self.assertEqual(registered.default_settings["attack_regions"], [])
+
+    def test_old_dragon_point_never_overrides_platform_center(self):
+        recognition = {**self.recognition, "dragon_roar_point": {"x": .9, "y": .9},
+                       "dragon_roar_point_captured": True, "dragon_roar_point_space": "minimap"}
+        self.assertEqual(self.decide(recognition=recognition).action, "cast")
+        recognition["platform_center_captured"] = False
+        self.assertEqual(self.decide(recognition=recognition).action, "stop")
 
     def test_numeric_fields_are_editable_with_explicit_bounds(self):
         fields = {field.path: field for field in self.strategy.setting_fields}
@@ -116,7 +123,7 @@ class DragonRoarStrategyTests(unittest.TestCase):
         config = {"strategy": {"active": "dragon_roar", "options": {}}}
         normalize_strategy_config(config)
         self.assertCountEqual(missing_recognition_data(config, self.strategy),
-                              ("dragon_roar_point", "dragon_roar_attack_regions"))
+                              ("platform_center",))
         config["recognition"] = deepcopy(self.recognition)
         config["strategy"]["options"]["dragon_roar"]["attack_regions"] = [region()]
         self.assertEqual(missing_recognition_data(config, self.strategy), ())
@@ -137,22 +144,22 @@ class DragonRoarStrategyTests(unittest.TestCase):
         self.assertEqual(selected.eligible_candidate_count, 3)
         self.assertEqual(selected.eligible_detections, self.monsters)
 
-    def test_disjoint_ranges_union_without_counting_gap(self):
+    def test_old_relative_ranges_do_not_restrict_fixed_combat_region(self):
         settings = {**self.settings, "attack_regions": [
             region(offset_x=-0.25, w=0.15), region(id="right", offset_x=0.10, w=0.15)]}
         selected = self.strategy.select_targets(replace(self.selection, settings=settings))
-        self.assertEqual(selected.eligible_detections, (self.monsters[0], self.monsters[2]))
+        self.assertEqual(selected.eligible_detections, self.monsters)
 
     def test_region_edges_are_inclusive_and_use_monster_center(self):
-        detections = [monster(100), monster(300), monster(200, 0), monster(200, 200),
-                      monster(99), monster(301), monster(200, -1), monster(200, 201)]
+        detections = [monster(0), monster(400), monster(200, 0), monster(200, 200),
+                      monster(-1), monster(401), monster(200, -1), monster(200, 201)]
         selected = self.strategy.select_targets(replace(self.selection, detections=detections))
         self.assertEqual(selected.eligible_detections, tuple(detections[:4]))
 
-    def test_regions_follow_stable_anchor_and_not_raw_nameplate_height(self):
+    def test_fixed_region_does_not_follow_player_anchor(self):
         selected = self.strategy.select_targets(replace(self.selection,
             player_anchor=(300.0, 100.0), player_raw_box=(190, 999, 20, 50)))
-        self.assertEqual(selected.eligible_detections, self.monsters[1:])
+        self.assertEqual(selected.eligible_detections, self.monsters)
 
     def test_stale_hold_is_never_selected_or_counted(self):
         selected = self.strategy.select_targets(replace(self.selection, detections_fresh=False))
@@ -163,24 +170,25 @@ class DragonRoarStrategyTests(unittest.TestCase):
         self.assertEqual(decision.state, "DRAGON_WAITING_MONSTERS")
         self.assertEqual(decision.runtime_state["monster_count"], 0)
 
-    def test_selection_requires_player_stable_anchor_and_scene(self):
+    def test_selection_ignores_player_but_requires_scene(self):
         for changes in ({"player_box": None}, {"player_anchor": None},
                         {"player_anchor": (float("nan"), 100)}, {"scene_width": 0},
                         {"scene_height": 0}):
             with self.subTest(changes=changes):
                 selected = self.strategy.select_targets(replace(self.selection, **changes))
-                self.assertEqual(selected.eligible_detections, ())
+                self.assertEqual(selected.eligible_detections,
+                                 () if 'scene_width' in changes or 'scene_height' in changes else self.monsters)
 
-    def test_missing_disabled_or_obsolete_regions_stop_and_do_not_select(self):
+    def test_missing_disabled_or_obsolete_relative_regions_are_ignored(self):
         for regions in ([], [region(enabled=False)], [region(space="combat")],
                         [region(w=0)], [region(h=float("nan"))]):
             settings = {**self.settings, "attack_regions": regions}
             with self.subTest(regions=regions):
                 selected = self.strategy.select_targets(replace(self.selection, settings=settings))
-                self.assertEqual(selected.eligible_detections, ())
+                self.assertEqual(selected.eligible_detections, self.monsters)
                 decision = self.decide(settings=settings, marker=(0.7, 0.5))
-                self.assertEqual(decision.action, "stop")
-                self.assertEqual(decision.state, "DRAGON_RANGE_UNCALIBRATED")
+                self.assertEqual(decision.action, "move")
+                self.assertEqual(decision.state, "DRAGON_RETURN_LEFT")
 
     def test_strict_monster_threshold_requires_three_when_value_is_two(self):
         for count in range(4):
@@ -223,16 +231,16 @@ class DragonRoarStrategyTests(unittest.TestCase):
     def test_decision_rechecks_range_and_does_not_trust_target_box_alone(self):
         result = self.decide(eligible_detections=())
         self.assertEqual(result.action, "stop")
-        result = self.decide(eligible_detections=(monster(50), monster(350), monster(400)))
+        result = self.decide(eligible_detections=(monster(-50), monster(450), monster(500)))
         self.assertEqual(result.runtime_state["monster_count"], 0)
         self.assertEqual(result.action, "stop")
 
     def test_point_requires_capture_flag_minimap_space_and_valid_coordinates(self):
-        invalid = [{}, {"dragon_roar_point_captured": False},
-                   {"dragon_roar_point_space": "combat"},
-                   {"dragon_roar_point": {"x": float("nan"), "y": 0.5}},
-                   {"dragon_roar_point": {"x": 0.5, "y": 1.1}},
-                   {"dragon_roar_point": {"x": True, "y": 0.5}}]
+        invalid = [{}, {"platform_center_captured": False},
+                   {"platform_center_space": "combat"},
+                   {"platform_center": {"x": float("nan"), "y": 0.5}},
+                   {"platform_center": {"x": 0.5, "y": 1.1}},
+                   {"platform_center": {"x": True, "y": 0.5}}]
         for changes in invalid:
             recognition = {} if not changes else {**self.recognition, **changes}
             result = self.decide(recognition=recognition)
@@ -246,11 +254,11 @@ class DragonRoarStrategyTests(unittest.TestCase):
             self.assertEqual(result.state, "MARKER_LOST")
             self.assertEqual(result.action, "stop")
 
-    def test_missing_visual_without_minimap_only_authority_stops(self):
+    def test_missing_visual_does_not_block_map_return(self):
         for changes in ({"player_box": None}, {"player_anchor": None}):
             result = self.decide(marker=(0.8, 0.5), **changes)
-            self.assertEqual(result.state, "PLAYER_SCREEN_LOST")
-            self.assertEqual(result.action, "stop")
+            self.assertEqual(result.state, "DRAGON_RETURN_LEFT")
+            self.assertEqual(result.action, "move")
 
     def test_horizontal_return_preempts_skill_even_when_key_missing(self):
         for marker, direction in (((0.6, 0.5), "left"), ((0.4, 0.5), "right")):
@@ -295,15 +303,15 @@ class DragonRoarStrategyTests(unittest.TestCase):
         self.assertEqual(result.action, "move")
         self.assertEqual(result.direction, "left")
 
-    def test_minimap_only_can_return_but_never_casts_or_counts_targets(self):
+    def test_minimap_only_can_return_and_cast_at_point_without_visual_identity(self):
         changes = {"minimap_only": True, "player_box": None, "player_anchor": None}
         for marker, action in (((0.6, 0.5), "move"), ((0.5, 0.6), "jump"),
-                               ((0.5, 0.4), "down_jump"), ((0.5, 0.5), "stop")):
+                               ((0.5, 0.4), "down_jump"), ((0.5, 0.5), "cast")):
             result = self.decide(marker=marker, **changes)
             self.assertEqual(result.action, action)
-            self.assertEqual(result.runtime_state["monster_count"], 0)
-            self.assertIsNone(result.attack_key)
-        self.assertEqual(self.decide(**changes).state, "MINIMAP_WAITING_VISUAL")
+            self.assertEqual(result.runtime_state["monster_count"], 3)
+            self.assertEqual(result.attack_key, "r" if action == "cast" else None)
+        self.assertEqual(self.decide(**changes).state, "DRAGON_ROAR")
 
     def test_missing_minimap_only_marker_stops(self):
         result = self.decide(marker=None, minimap_only=True, player_box=None, player_anchor=None)

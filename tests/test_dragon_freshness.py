@@ -70,6 +70,7 @@ class DragonRoarFrameFreshnessTests(unittest.TestCase):
         def detect(scene, templates, *_args, **kwargs):
             nonlocal frame_index
             is_filter = kwargs.get("max_detections") == 32
+            self.assertEqual(bool(kwargs.get("mirror_horizontal", False)), not is_filter)
             if is_filter:
                 detections = frame_filters[frame_index]
             else:
@@ -156,15 +157,27 @@ class DragonRoarFrameFreshnessTests(unittest.TestCase):
         self.assertNotIn("有效索敌区", texts)
         self.assertNotIn("箭雨施法范围", texts)
 
+    def test_paused_potion_mode_still_detects_monsters_without_player_tracking(self):
+        self.bot.armed = False
+        self.bot.auto_potion.set_enabled(True)
+        self.run_frames([self.monsters])
+        self.bot._track_player.assert_not_called()
+        self.assertEqual(self.observed[0][1].eligible_candidate_count, 3)
+
     def test_actual_loop_distinguishes_held_empty_frame_from_new_detections(self):
         new_monster = Detection((280, 140, 20, 20), 0.96, "slime/monster.png")
         self.run_frames([self.monsters, [], [new_monster]])
         contexts = [item[0] for item in self.observed]
         selections = [item[1] for item in self.observed]
+        self.bot._track_player.assert_not_called()
+        self.assertTrue(all(context.player_box is None and context.player_anchor is None
+                            for context in contexts))
         self.assertEqual([context.detections_fresh for context in contexts], [True, False, True])
         # 第二帧确实进入了旧 hold 分支，不是候选先被清空造成的偶然通过。
         self.assertEqual(contexts[1].detections, self.monsters)
         self.assertEqual([result.eligible_candidate_count for result in selections], [3, 0, 1])
+        self.assertEqual([state["monster_count"] for state in self.hud_states], [3, 0, 1])
+        self.assertEqual([state["eligible_monster_count"] for state in self.hud_states], [3, 0, 1])
         self.assertEqual(selections[1].eligible_detections, ())
         self.assertIsNone(selections[1].target)
         self.assertEqual(selections[2].eligible_detections, (new_monster,))

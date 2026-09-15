@@ -338,6 +338,7 @@ def capture_player_marker(config_path: Path, parent: Any = None) -> tuple[int, i
         guide_rect=preview_rect,
         parent=parent,
         frozen_frame=preview_frame,
+        debug_transform=(minimap_rect, preview_rect),
     )
     if result.cancelled or result.point is None:
         raise RuntimeError("已取消小地图玩家标记采集")
@@ -421,6 +422,7 @@ def capture_minimap_point(config_path: Path, recognition_key: str, prompt: str,
         guide_rect=preview_rect,
         parent=parent,
         frozen_frame=preview_frame,
+        debug_transform=(minimap_rect, preview_rect),
     )
     if result.cancelled or result.point is None:
         raise RuntimeError("已取消小地图点位采集")
@@ -505,6 +507,7 @@ def calibrate(config_path: Path, parent: Any = None) -> None:
         preview_rect,
         parent=parent,
         frozen_frame=preview_frame,
+        debug_transform=(minimap_rect, preview_rect),
     )
     if point_result.cancelled or point_result.point is None:
         raise RuntimeError("已取消玩家标记颜色选择")
@@ -575,6 +578,7 @@ def capture_recognition_region(config_path: Path, parent: Any = None) -> dict[st
         guide_rect=preview_rect,
         parent=parent,
         frozen_frame=preview_frame,
+        debug_transform=(minimap_rect, preview_rect),
     )
     if center_result.cancelled or center_result.point is None:
         raise RuntimeError("已取消平台中心采集")
@@ -647,6 +651,7 @@ def capture_strategy_area(
         guide_rect=display_rect,
         parent=parent,
         frozen_frame=display_frame,
+        debug_transform=(source_rect, display_rect) if space == MINIMAP_REGION_SPACE else None,
     )
     if result.cancelled or result.rectangle is None:
         raise RuntimeError("已取消安全输出位置框选")

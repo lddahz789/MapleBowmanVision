@@ -6,7 +6,6 @@ from typing import Any, Iterable
 
 from mbv.strategies.base import (
     StrategyActionContext,
-    StrategyCaptureField,
     StrategyDecision,
     StrategySettingField,
     TargetSelection,
@@ -18,7 +17,6 @@ from mbv.strategies.regions import normalize_target_regions
 from mbv.vision import (
     Detection,
     MINIMAP_REGION_SPACE,
-    player_relative_region_rect,
     point_in_attack_rect,
 )
 
@@ -31,15 +29,6 @@ def _valid_position(value: Any) -> bool:
     )
 
 
-def _valid_anchor(value: Any) -> bool:
-    return (
-        isinstance(value, (tuple, list))
-        and len(value) == 2
-        and all(isinstance(item, (int, float)) and not isinstance(item, bool)
-                and math.isfinite(item) for item in value)
-    )
-
-
 def _outside(delta: float, tolerance: float) -> bool:
     # 小地图归一化值的浮点误差不应把恰好位于容差边缘的点判为越界。
     return abs(delta) > tolerance + 1e-9
@@ -47,15 +36,13 @@ def _outside(delta: float, tolerance: float) -> bool:
 
 def _range_candidates(
     detections: Iterable[Detection],
-    anchor: tuple[float, float] | None,
     width: int,
     height: int,
-    regions: list[dict[str, Any]],
 ) -> tuple[Detection, ...]:
-    if not _valid_anchor(anchor) or width <= 0 or height <= 0:
+    if width <= 0 or height <= 0:
         return ()
-    rects = [player_relative_region_rect(anchor, width, height, region)
-             for region in regions if region["enabled"]]
+    # 怪物检测输入已裁为固定战斗识别区，不再依赖角色屏幕锚点。
+    rects = [(0, 0, width, height)]
     eligible: list[Detection] = []
     seen_boxes: set[tuple[int, int, int, int]] = set()
     # 公共视觉层已做模板去重。这里只枚举一次候选，不按区域累加怪物数；
@@ -76,40 +63,23 @@ class DragonRoarStrategy:
     display_name = "龙咆哮·定点"
     profession = "战士·龙骑士"
     description = (
-        "原地统计框选攻击范围内本帧怪物，数量严格超过阈值才施放龙咆哮，不转向、不追怪。"
-        "偏离独立小地图定点后优先回位；仅小地图定位时只回位或等待，回位超时后需暂停重启。"
+        "只用唯一实时小地图标记定位，固定战斗识别区内本帧怪物数量严格超过阈值才施放龙咆哮。"
+        "不需要姓名牌或头部；沿用平台安全点，偏离先回位，标记丢失停止，回位超时后需暂停重启。"
     )
+    localization_mode = "minimap"
     allow_player_lost_recovery = False
-    required_recognition_data: tuple[str, ...] = ()
+    required_recognition_data: tuple[str, ...] = ("platform_center",)
     toggle_fields = ()
     choice_fields = ()
-    capture_fields = (
-        StrategyCaptureField(
-            recognition_key="dragon_roar_point",
-            button_label="采集龙咆哮定点",
-            prompt="在放大的小地图上点击龙咆哮定点；请选择可以正常走回或跳回的位置",
-            debug_label="龙咆哮定点",
-            coordinate_space=MINIMAP_REGION_SPACE,
-            capture_kind="point",
-            required=True,
-        ),
-        StrategyCaptureField(
-            recognition_key="dragon_roar_attack_regions",
-            button_label="新增龙咆哮攻击范围",
-            prompt="框选龙咆哮可攻击范围，随角色移动但不随面向翻转；回车确认",
-            debug_label="龙咆哮攻击范围",
-            settings_path="attack_regions",
-            multiple=True,
-            required=True,
-        ),
-    )
+    capture_fields = ()
     setting_fields = (
         StrategySettingField("skill_key", "龙咆哮技能键（空=不施放）",
                              step=None, minimum=None, maximum=None, capture_key=True),
         StrategySettingField("monster_count_threshold", "怪物数量超过此值才施放",
                              step=1, minimum=0, maximum=23, direct_numeric_input=True),
-        StrategySettingField("cast_interval_seconds", "施放间隔秒",
-                             step=0.1, minimum=0.1, maximum=10.0, direct_numeric_input=True),
+        StrategySettingField("cast_interval_seconds", "施放间隔（毫秒）",
+                             step=0.1, minimum=0.1, maximum=10.0, direct_numeric_input=True,
+                             display_multiplier=1000.0),
         StrategySettingField("return_tolerance_x", "定点水平容差（小地图比例）",
                              step=0.005, minimum=0.005, maximum=0.5, direct_numeric_input=True),
         StrategySettingField("return_tolerance_y", "定点垂直容差（小地图比例）",
@@ -143,15 +113,14 @@ class DragonRoarStrategy:
 
     def select_targets(self, context: TargetSelectionContext) -> TargetSelection:
         eligible: tuple[Detection, ...] = ()
-        if context.detections_fresh and context.player_box is not None:
+        if context.detections_fresh:
             eligible = _range_candidates(
-                context.detections, context.player_anchor, context.scene_width, context.scene_height,
-                normalize_target_regions(context.settings.get("attack_regions")),
+                context.detections, context.scene_width, context.scene_height,
             )
-        # 代表目标仅用于显示；施法依据整个区域并集的实时数量，不依赖面向。
+        # 代表目标仅用于显示；施法依据固定战斗区的实时数量，不依赖面向。
         target = min(eligible, key=lambda item: math.hypot(
-            item.box[0] + item.box[2] / 2.0 - context.player_anchor[0],
-            item.box[1] + item.box[3] / 2.0 - context.player_anchor[1],
+            item.box[0] + item.box[2] / 2.0 - context.scene_width / 2,
+            item.box[1] + item.box[3] / 2.0 - context.scene_height / 2,
         ), default=None)
         return TargetSelection(target=target, chase_target=None,
                                eligible_candidate_count=len(eligible), eligible_detections=eligible,
@@ -163,10 +132,8 @@ class DragonRoarStrategy:
         state = dict(context.runtime_state)
         state.setdefault("phase", "idle")
         state["navigation_active"] = True
-        regions = settings["attack_regions"]
-        eligible = () if context.minimap_only or context.player_box is None else _range_candidates(
-            context.eligible_detections, context.player_anchor, context.combat_width,
-            context.combat_height, regions,
+        eligible = _range_candidates(
+            context.eligible_detections, context.combat_width, context.combat_height,
         )
         state["monster_count"] = len(eligible)
 
@@ -175,19 +142,15 @@ class DragonRoarStrategy:
 
         if state["phase"] == "blocked":
             return decision("stop", "DRAGON_RETURN_BLOCKED")
-        point = context.recognition.get("dragon_roar_point")
-        if (not context.recognition.get("dragon_roar_point_captured")
-                or context.recognition.get("dragon_roar_point_space") != MINIMAP_REGION_SPACE
+        point = context.recognition.get("platform_center")
+        if (not context.recognition.get("platform_center_captured")
+                or context.recognition.get("platform_center_space") != MINIMAP_REGION_SPACE
                 or not valid_point(point)):
             return decision("stop", "DRAGON_POINT_UNCALIBRATED")
-        if not any(region["enabled"] for region in regions):
+        if context.combat_width <= 0 or context.combat_height <= 0:
             return decision("stop", "DRAGON_RANGE_UNCALIBRATED")
         if not _valid_position(context.marker):
             return decision("stop", "MARKER_LOST")
-        if not context.minimap_only and (
-            context.player_box is None or not _valid_anchor(context.player_anchor)
-        ):
-            return decision("stop", "PLAYER_SCREEN_LOST")
 
         marker_x, marker_y = context.marker
         dx, dy = marker_x - point["x"], marker_y - point["y"]
@@ -221,8 +184,6 @@ class DragonRoarStrategy:
             state["phase"] = "idle"
             state.pop("return_started_at", None)
 
-        if context.minimap_only:
-            return decision("stop", "MINIMAP_WAITING_VISUAL")
         skill_key = settings["skill_key"]
         if not skill_key:
             return decision("stop", "DRAGON_SKILL_UNBOUND")

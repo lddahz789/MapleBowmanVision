@@ -21,17 +21,15 @@ from mbv.window import WindowInfo
 
 
 STRATEGY = "dragon_roar"
-POINT = "dragon_roar_point"
+POINT = "platform_center"
 
 
 class DragonRoarCaptureTests(unittest.TestCase):
     def setUp(self):
         self.config = load_config(ROOT / "config.example.json")
         self.strategy = get_strategy(STRATEGY)
-        self.range_field = next(
-            field for field in self.strategy.capture_fields if field.settings_path == "attack_regions"
-        )
-        self.region_key = self.range_field.recognition_key
+        # Legacy relative regions remain saved, but are no longer a capture dependency.
+        self.region_key = "dragon_roar_attack_regions"
         self.window = WindowInfo(123, "MockMaple", 0, 0, 1000, 500)
         self.frozen = np.zeros((500, 1000, 3), dtype=np.uint8)
         self.config["regions"]["minimap"] = {"x": .02, "y": .04, "w": .2, "h": .2}
@@ -91,7 +89,7 @@ class DragonRoarCaptureTests(unittest.TestCase):
         self.assertEqual(saved["recognition"][POINT + "_space"], "minimap")
         self.assertTrue(saved["recognition"][POINT + "_captured"])
         self.assertTrue(saved["calibration"]["items"][POINT]["complete"])
-        self.assertEqual(saved["recognition"]["platform_center"], original_center)
+        self.assertNotEqual(saved["recognition"]["platform_center"], original_center)
 
     def test_cancelled_or_outside_point_does_not_replace_saved_capture(self):
         preview = np.ones_like(self.frozen)
@@ -125,7 +123,7 @@ class DragonRoarCaptureTests(unittest.TestCase):
         self.assertFalse(saved["calibration"]["items"][POINT]["complete"])
         self.assertEqual(saved["strategy"]["options"][STRATEGY]["attack_regions"], original_regions)
 
-    def test_combat_recapture_clears_attack_regions_but_preserves_minimap_point(self):
+    def test_combat_recapture_preserves_minimap_point_and_inert_legacy_regions(self):
         selected = MagicMock(cancelled=False, rectangle=(20, 30, 900, 400))
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.json"
@@ -138,8 +136,9 @@ class DragonRoarCaptureTests(unittest.TestCase):
         self.assertTrue(saved["recognition"][POINT + "_captured"])
         self.assertTrue(saved["calibration"]["items"][POINT]["complete"])
         self.assertEqual(saved["recognition"][POINT + "_space"], "minimap")
-        self.assertEqual(saved["strategy"]["options"][STRATEGY]["attack_regions"], [])
-        self.assertFalse(saved["calibration"]["items"][self.region_key]["complete"])
+        self.assertEqual(saved["strategy"]["options"][STRATEGY]["attack_regions"],
+                         self.config["strategy"]["options"][STRATEGY]["attack_regions"])
+        self.assertEqual(saved["regions"]["combat"], {"x": .02, "y": .06, "w": .9, "h": .8})
 
     def test_aspect_ratio_change_invalidates_point_and_ranges(self):
         calibrate._prepare_window_calibration(
@@ -147,7 +146,7 @@ class DragonRoarCaptureTests(unittest.TestCase):
         )
         self.assertFalse(self.config["recognition"][POINT + "_captured"])
         self.assertFalse(self.config["calibration"]["items"][POINT]["complete"])
-        self.assertEqual(self.config["strategy"]["options"][STRATEGY]["attack_regions"], [])
+        self.assertEqual(len(self.config["strategy"]["options"][STRATEGY]["attack_regions"]), 1)
 
     def test_proportional_resize_preserves_point_and_ranges(self):
         calibrate._prepare_window_calibration(
